@@ -92,7 +92,7 @@ end
 local Config = {
     Aimbot = {
         Enabled = false,
-        ActivationMode = "Always",      -- "Always" | "Hold" | "Mobile Button"
+        ActivationMode = "GUI Toggle",  -- "GUI Toggle" | "Hold"
         TargetPart = "Head",            -- "Head" | "Chest" | "HumanoidRootPart" | "Closest"
         Smoothness = 6,                 -- 1 (instant) .. 20 (smooth)
         Prediction = 0.08,              -- 0.00 .. 0.30 seconds lead time
@@ -147,7 +147,7 @@ local Config = {
         Visible = true,
         ActiveTab = "Aimbot",
         SelectedColorKey = "Visible",
-        ShowMobileAimButton = false,
+        ShowMobileAimButton = true,
         MobileAimLocked = false,
     },
 }
@@ -169,6 +169,7 @@ local State = {
     LocalHumanoid = nil,
     LocalRootPart = nil,
     LocalAlive = false,
+    LastLocalPos = nil,
     Camera = Workspace.CurrentCamera,
     CurrentAimTarget = nil,
     IsHoldingAim = false,
@@ -212,10 +213,10 @@ EspContainer.Parent = OverlayGui
 local HighlightContainer = Instance.new("Folder")
 HighlightContainer.Name = "TEAM_AKI_Highlights"
 local okHighlightParent = pcall(function()
-    HighlightContainer.Parent = CoreGui
+    HighlightContainer.Parent = getSafeGuiParent()
 end)
 if not okHighlightParent or not HighlightContainer.Parent then
-    HighlightContainer.Parent = Workspace
+    HighlightContainer.Parent = OverlayGui
 end
 
 local DrawingSupported = false
@@ -534,6 +535,9 @@ local function createRegistryVisualBundle()
         HealthBg = hpBack,
         HealthFill = hpFill,
         AlertArrow = arrowHolder,
+        IsGuiAlive = function()
+            return guiRoot ~= nil and guiRoot.Parent ~= nil
+        end,
         HideAll = function()
             hideGui()
             hideDrawing()
@@ -922,14 +926,36 @@ local function destroyHighlight(entry)
     end
 end
 
+local function attachRemoteHumanoidDeath(entry)
+    local hum = entry.Humanoid
+    if not hum or not hum.Parent or entry.DiedHookedHumanoid == hum then
+        return
+    end
+    entry.DiedHookedHumanoid = hum
+    table.insert(entry.CharConns, hum.Died:Connect(function()
+        if State.CurrentAimTarget == entry.Player then
+            State.CurrentAimTarget = nil
+        end
+        destroyHighlight(entry)
+        if entry.Visuals then
+            entry.Visuals:HideAll()
+        end
+        if not State.Unloaded then
+            ScheduleReload("RemotePlayerDied:" .. entry.Player.Name, false)
+        end
+    end))
+end
+
 local function clearCharacterFromEntry(entry)
     entry.Character = nil
     entry.Humanoid = nil
+    entry.DiedHookedHumanoid = nil
     entry.RootPart = nil
     entry.Head = nil
     entry.Torso = nil
     entry.LastTrackedPart = nil
     entry.LastTrackedPos = nil
+    entry.LastKnownWorldPos = nil
     entry.EstimatedVel = Vector3.zero
     entry.FrameVisualCache = nil
     clearTable(entry.RigParts)
@@ -956,6 +982,10 @@ local function bindCharacterToEntry(entry, character)
 
     entry.Character = character
     cacheCharacterParts(entry, character)
+    attachRemoteHumanoidDeath(entry)
+    if entry.RootPart and entry.RootPart.Parent then
+        entry.LastKnownWorldPos = entry.RootPart.Position
+    end
 
     local function onDescendantChanged(desc)
         if entry.Character == character and character.Parent and not State.Unloaded then
@@ -970,20 +1000,11 @@ local function bindCharacterToEntry(entry, character)
     table.insert(entry.CharConns, character.AncestryChanged:Connect(function(_, newParent)
         if not newParent then
             clearCharacterFromEntry(entry)
+            if not State.Unloaded then
+                ScheduleReload("RemoteCharRemoved:" .. entry.Player.Name, false)
+            end
         end
     end))
-
-    if entry.Humanoid then
-        table.insert(entry.CharConns, entry.Humanoid.Died:Connect(function()
-            if State.CurrentAimTarget == entry.Player then
-                State.CurrentAimTarget = nil
-            end
-            destroyHighlight(entry)
-            if entry.Visuals then
-                entry.Visuals:HideAll()
-            end
-        end))
-    end
 end
 
 local function destroyPlayerEntry(player)
@@ -1022,6 +1043,7 @@ local function registerPlayerEntry(player)
         Player = player,
         Character = nil,
         Humanoid = nil,
+        DiedHookedHumanoid = nil,
         RootPart = nil,
         Head = nil,
         Torso = nil,
@@ -1038,6 +1060,7 @@ local function registerPlayerEntry(player)
         LastScanTime = 0,
         LastTrackedPart = nil,
         LastTrackedPos = nil,
+        LastKnownWorldPos = nil,
         EstimatedVel = Vector3.zero,
         FrameVisualCache = nil,
         FrameVisualId = -1,
@@ -1072,6 +1095,7 @@ local function clearLocalCharacterState()
     State.LocalHumanoid = nil
     State.LocalRootPart = nil
     State.LocalAlive = false
+    State.LastLocalPos = nil
     State.CurrentAimTarget = nil
 
     for _, c in ipairs(State.LocalConns) do
@@ -1093,6 +1117,9 @@ local function bindLocalCharacter(character)
     State.LocalHumanoid = character:FindFirstChildOfClass("Humanoid")
     State.LocalRootPart = character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart
     State.LocalAlive = true
+    if State.LocalRootPart and State.LocalRootPart.Parent then
+        State.LastLocalPos = State.LocalRootPart.Position
+    end
 
     local function attachHumanoidDeath(hum)
         State.LocalHumanoid = hum
@@ -1126,7 +1153,7 @@ local function bindLocalCharacter(character)
     end))
 end
 
--- Full Reload: resets stale entries without flashing healthy players unless hardReset == true
+-- Full Reload & 1s Reconciliation: refreshes characters, parts, team detection, and healed visuals
 ReloadAllSystems = function(reason, hardReset)
     if State.Unloaded then
         return
@@ -1134,11 +1161,11 @@ ReloadAllSystems = function(reason, hardReset)
 
     State.ReloadCount = State.ReloadCount + 1
     State.LastReloadReason = reason or "Event"
-    State.CurrentAimTarget = nil
     State.Camera = Workspace.CurrentCamera
     State.LastTeamScan = -1
 
     if hardReset then
+        State.CurrentAimTarget = nil
         local existing = {}
         for player in pairs(Registry) do
             table.insert(existing, player)
@@ -1180,12 +1207,26 @@ ReloadAllSystems = function(reason, hardReset)
                 entry = Registry[player]
             end
             if entry then
+                if not entry.Visuals or not entry.Visuals:IsGuiAlive() then
+                    if entry.Visuals then
+                        entry.Visuals:Destroy()
+                    end
+                    local rebuilt = createRegistryVisualBundle()
+                    entry.Visuals = rebuilt
+                    entry.BoxLines = rebuilt.BoxLines
+                    entry.TracerLine = rebuilt.TracerLine
+                    entry.HealthBg = rebuilt.HealthBg
+                    entry.HealthFill = rebuilt.HealthFill
+                    entry.AlertArrow = rebuilt.AlertArrow
+                end
+
                 local liveChar = resolveCharacterForPlayer(player)
                 if liveChar and liveChar.Parent then
                     if entry.Character ~= liveChar then
                         bindCharacterToEntry(entry, liveChar)
                     else
                         cacheCharacterParts(entry, liveChar)
+                        attachRemoteHumanoidDeath(entry)
                     end
                 elseif entry.Character ~= nil then
                     clearCharacterFromEntry(entry)
@@ -1255,39 +1296,7 @@ end
 ReloadAllSystems("InitialBootstrap", true)
 
 local function runPeriodicSafetySync()
-    local seen = {}
-    local needsReload = false
-
-    for _, player in ipairs(Players:GetPlayers()) do
-        if player ~= LocalPlayer then
-            seen[player] = true
-            local entry = Registry[player]
-            if not entry then
-                needsReload = true
-                break
-            end
-            local liveChar = resolveCharacterForPlayer(player)
-            if liveChar and entry.Character ~= liveChar then
-                needsReload = true
-                break
-            elseif (not liveChar) and entry.Character ~= nil then
-                clearCharacterFromEntry(entry)
-            end
-        end
-    end
-
-    if not needsReload then
-        for player in pairs(Registry) do
-            if not seen[player] then
-                needsReload = true
-                break
-            end
-        end
-    end
-
-    if needsReload then
-        ReloadAllSystems("PeriodicSafetySync", false)
-    end
+    ReloadAllSystems("Periodic1sRenderSync", false)
 end
 
 -- ============================================================================
@@ -1470,16 +1479,15 @@ local function isEntryAlive(entry)
         return false
     end
 
-    if char:GetAttribute("Alive") == false or entry.Player:GetAttribute("Alive") == false then
-        return false
-    end
-
     local hum = entry.Humanoid
     if hum and hum.Parent then
         if hum.Health <= 0 or hum:GetState() == Enum.HumanoidStateType.Dead then
             return false
         end
     else
+        if char:GetAttribute("Alive") == false or entry.Player:GetAttribute("Alive") == false then
+            return false
+        end
         local hp = char:GetAttribute("Health") or char:GetAttribute("HP")
         if type(hp) == "number" and hp <= 0 then
             return false
@@ -1936,12 +1944,10 @@ addConnection(UserInputService.InputEnded:Connect(function(input)
 end))
 
 local function isAimbotInputActive()
-    if Config.Aimbot.ActivationMode == "Always" then
-        return true
-    elseif Config.Aimbot.ActivationMode == "Mobile Button" then
-        return Config.UI.MobileAimLocked
+    if Config.Aimbot.ActivationMode == "Hold" then
+        return State.IsHoldingAim
     end
-    return State.IsHoldingAim
+    return Config.Aimbot.Enabled
 end
 
 local function getAimPartForEntry(entry, camera, screenCenter)
@@ -2144,14 +2150,27 @@ RunService:BindToRenderStep(RENDER_STEP_NAME, Enum.RenderPriority.Camera.Value +
         return
     end
 
-    -- 1.0s periodic safety sync
+    -- 1.0s periodic full player re-sync/re-render
     local now = os.clock()
     if (now - State.LastSafetySync) >= SAFETY_SYNC_INTERVAL then
         State.LastSafetySync = now
         pcall(runPeriodicSafetySync)
     end
 
-    -- Fast per-frame player & character guarantee so zero spawned players are ever missed
+    -- Detect LocalPlayer teleport (TP) and immediately re-sync all targets
+    local localRoot = State.LocalRootPart
+    if localRoot and localRoot.Parent then
+        local curLocalPos = localRoot.Position
+        if State.LastLocalPos and (curLocalPos - State.LastLocalPos).Magnitude >= 35 then
+            State.LastLocalPos = curLocalPos
+            State.CurrentAimTarget = nil
+            pcall(ReloadAllSystems, "LocalTeleportDetected", false)
+        else
+            State.LastLocalPos = curLocalPos
+        end
+    end
+
+    -- Fast per-frame player, respawn & teleport guarantee so zero spawned players are ever missed
     for _, player in ipairs(Players:GetPlayers()) do
         if player ~= LocalPlayer then
             local entry = Registry[player]
@@ -2171,6 +2190,19 @@ RunService:BindToRenderStep(RENDER_STEP_NAME, Enum.RenderPriority.Camera.Value +
                     then
                         entry.NeedsRescan = false
                         cacheCharacterParts(entry, liveChar)
+                        attachRemoteHumanoidDeath(entry)
+                    elseif entry.RootPart and entry.RootPart.Parent then
+                        local curPos = entry.RootPart.Position
+                        if entry.LastKnownWorldPos and (curPos - entry.LastKnownWorldPos).Magnitude >= 35 then
+                            entry.LastKnownWorldPos = curPos
+                            entry.EstimatedVel = Vector3.zero
+                            entry.LastTrackedPos = nil
+                            entry.FrameVisualCache = nil
+                            cacheCharacterParts(entry, liveChar)
+                            ScheduleReload("RemoteTeleport:" .. player.Name, false)
+                        else
+                            entry.LastKnownWorldPos = curPos
+                        end
                     end
                 elseif entry.Character ~= nil then
                     clearCharacterFromEntry(entry)
@@ -2970,13 +3002,14 @@ end
 
 -- 1. AIMBOT TAB
 local AimbotPage = TabPages["Aimbot"]
-addToggle(AimbotPage, 1, "Enable Aimbot", "Master toggle for camera target lock", function()
+addToggle(AimbotPage, 1, "Enable Aimbot", "Master toggle synced with Aim Lock GUI button", function()
     return Config.Aimbot.Enabled
 end, function(v)
     Config.Aimbot.Enabled = v
+    Config.UI.MobileAimLocked = v
 end)
 
-addSelector(AimbotPage, 2, "Activation Mode", {"Always", "Hold", "Mobile Button"}, function()
+addSelector(AimbotPage, 2, "Activation Mode", {"GUI Toggle", "Hold"}, function()
     return Config.Aimbot.ActivationMode
 end, function(v)
     Config.Aimbot.ActivationMode = v
@@ -3396,32 +3429,39 @@ end, function(v)
     Config.Resolver.TeamCheckMode = v
 end, true)
 
-addSelector(SettingsPage, 2, "ESP Render Engine", {"ScreenGui", "Drawing"}, function()
-    return Config.ESP.RenderEngine
-end, function(v)
-    Config.ESP.RenderEngine = v
-end, false)
+local settingsOrder = 2
+if DrawingSupported then
+    addSelector(SettingsPage, settingsOrder, "ESP Render Engine", {"ScreenGui", "Drawing"}, function()
+        return Config.ESP.RenderEngine
+    end, function(v)
+        Config.ESP.RenderEngine = v
+    end, false)
+    settingsOrder = settingsOrder + 1
+end
 
-addToggle(SettingsPage, 3, "Workspace Container Scan", "Scans custom Players / Characters / Entities folders", function()
+addToggle(SettingsPage, settingsOrder, "Workspace Container Scan", "Scans custom Players / Characters / Entities folders", function()
     return Config.Resolver.CustomContainerScan
 end, function(v)
     Config.Resolver.CustomContainerScan = v
     ScheduleReload("CustomContainerScanToggle", false)
 end)
+settingsOrder = settingsOrder + 1
 
-addToggle(SettingsPage, 4, "Ignore Transparent Glass & Water", "Allows raycast wall check through glass/water", function()
+addToggle(SettingsPage, settingsOrder, "Ignore Transparent Glass & Water", "Allows raycast wall check through glass/water", function()
     return Config.ESP.IgnoreGlassWater
 end, function(v)
     Config.ESP.IgnoreGlassWater = v
 end)
+settingsOrder = settingsOrder + 1
 
-addToggle(SettingsPage, 5, "Show Mobile Aim Lock Pill", "Displays floating touch button for aim lock", function()
+addToggle(SettingsPage, settingsOrder, "Show Aim Lock GUI Button", "Displays floating draggable Aim Lock ON/OFF button", function()
     return Config.UI.ShowMobileAimButton
 end, function(v)
     Config.UI.ShowMobileAimButton = v
 end)
+settingsOrder = settingsOrder + 1
 
-addSlider(SettingsPage, 6, "Max Render Distance", 200, 3500, 50, function(v)
+addSlider(SettingsPage, settingsOrder, "Max Render Distance", 200, 3500, 50, function(v)
     return string.format("%dm", math.round(v))
 end, function()
     return Config.ESP.MaxDistance
@@ -3429,16 +3469,18 @@ end, function(v)
     Config.ESP.MaxDistance = v
     Config.Aimbot.MaxDistance = v
 end)
+settingsOrder = settingsOrder + 1
 
-addSlider(SettingsPage, 7, "360° Alert Ring Radius", 80, 280, 5, function(v)
+addSlider(SettingsPage, settingsOrder, "360° Alert Ring Radius", 80, 280, 5, function(v)
     return string.format("%d px", math.round(v))
 end, function()
     return Config.ESP.AlertRingRadius
 end, function(v)
     Config.ESP.AlertRingRadius = v
 end)
+settingsOrder = settingsOrder + 1
 
-local ActionCard = createCardRow(SettingsPage, 54, 8)
+local ActionCard = createCardRow(SettingsPage, 54, settingsOrder)
 local ActionGrid = Instance.new("UIGridLayout")
 ActionGrid.CellSize = UDim2.new(0.333, -6, 1, 0)
 ActionGrid.CellPadding = UDim2.fromOffset(8, 0)
@@ -3521,18 +3563,18 @@ ToggleStroke.Color = Palette.ActiveGlow
 
 local MobileAimBtn = Instance.new("TextButton")
 MobileAimBtn.Name = "TEAM_AKI_MobileAim"
-MobileAimBtn.AnchorPoint = Vector2.new(1, 0.5)
-MobileAimBtn.Position = UDim2.new(1, -18, 0.42, 0)
-MobileAimBtn.Size = UDim2.fromOffset(112, 38)
+MobileAimBtn.AnchorPoint = Vector2.new(0, 0.5)
+MobileAimBtn.Position = UDim2.new(0, 18, 0.25, 48)
+MobileAimBtn.Size = UDim2.fromOffset(132, 38)
 MobileAimBtn.BackgroundColor3 = Palette.GlassBase
 MobileAimBtn.BackgroundTransparency = 0.22
 MobileAimBtn.Font = Enum.Font.GothamBold
-MobileAimBtn.Text = "AIM: OFF"
+MobileAimBtn.Text = "AIM LOCK: OFF"
 MobileAimBtn.TextSize = 12
 MobileAimBtn.TextColor3 = Palette.TextSilver
 MobileAimBtn.AutoButtonColor = false
 MobileAimBtn.BorderSizePixel = 0
-MobileAimBtn.Visible = false
+MobileAimBtn.Visible = true
 MobileAimBtn.ZIndex = 20
 MobileAimBtn.Parent = MainGui
 
@@ -3543,10 +3585,12 @@ AimBtnCorner.Parent = MobileAimBtn
 local AimBtnStroke = applyGlassStroke(MobileAimBtn, 1.4, 0.45)
 
 local function refreshMobileAimStyle()
-    local locked = Config.UI.MobileAimLocked
-    MobileAimBtn.Text = locked and "AIM: LOCKED" or "AIM: OFF"
+    local locked = Config.Aimbot.Enabled
+    Config.UI.MobileAimLocked = locked
+    MobileAimBtn.Text = locked and "AIM LOCK: ON" or "AIM LOCK: OFF"
     tween(MobileAimBtn, 0.15, {
         TextColor3 = locked and Palette.ActiveGlow or Palette.TextSilver,
+        BackgroundColor3 = locked and Color3.fromRGB(16, 32, 38) or Palette.GlassBase,
     })
     tween(AimBtnStroke, 0.15, {
         Color = locked and Palette.ActiveGlow or Palette.GlassEdge,
@@ -3554,9 +3598,11 @@ local function refreshMobileAimStyle()
 end
 
 syncMobileAimVisibility = function()
-    MobileAimBtn.Visible = Config.UI.ShowMobileAimButton or (Config.Aimbot.ActivationMode == "Mobile Button")
+    MobileAimBtn.Visible = Config.UI.ShowMobileAimButton
     refreshMobileAimStyle()
 end
+
+syncMobileAimVisibility()
 
 local function makeDraggableButton(btn, onTap)
     local activeInput = nil
@@ -3580,11 +3626,19 @@ local function makeDraggableButton(btn, onTap)
                 local delta = (input.Position - dragStart) / scale
                 movedDist = delta.Magnitude
                 if movedDist > 6 then
+                    local nextX = startPos.X.Offset + delta.X
+                    local nextY = startPos.Y.Offset + delta.Y
+                    local cam = Workspace.CurrentCamera
+                    if cam then
+                        local vp = cam.ViewportSize / scale
+                        nextX = math.clamp(nextX, -vp.X * 0.9, vp.X * 0.9)
+                        nextY = math.clamp(nextY, -vp.Y * 0.9, vp.Y * 0.9)
+                    end
                     btn.Position = UDim2.new(
                         startPos.X.Scale,
-                        startPos.X.Offset + delta.X,
+                        nextX,
                         startPos.Y.Scale,
-                        startPos.Y.Offset + delta.Y
+                        nextY
                     )
                 end
             end
@@ -3640,8 +3694,16 @@ makeDraggableButton(MobileToggle, function()
 end)
 
 makeDraggableButton(MobileAimBtn, function()
-    Config.UI.MobileAimLocked = not Config.UI.MobileAimLocked
-    refreshMobileAimStyle()
+    local nextState = not Config.Aimbot.Enabled
+    Config.Aimbot.Enabled = nextState
+    Config.UI.MobileAimLocked = nextState
+    if nextState and Config.Aimbot.ActivationMode == "Hold" then
+        Config.Aimbot.ActivationMode = "GUI Toggle"
+    end
+    for _, sync in ipairs(SyncCallbacks) do
+        pcall(sync)
+    end
+    SyncDependentSettings(false)
 end)
 
 MinimizeBtn.Activated:Connect(function()
@@ -3656,6 +3718,12 @@ end))
 
 ForceReloadBtn.Activated:Connect(function()
     ReloadAllSystems("ManualButton", true)
+    ForceReloadBtn.Text = "Reloaded!"
+    task.delay(0.8, function()
+        if not State.Unloaded and ForceReloadBtn and ForceReloadBtn.Parent then
+            ForceReloadBtn.Text = "Reload All"
+        end
+    end)
 end)
 
 ResetBtn.Activated:Connect(function()
@@ -3671,11 +3739,19 @@ ResetBtn.Activated:Connect(function()
     for k, v in pairs(DefaultConfig.Colors) do
         Config.Colors[k] = v
     end
+    Config.UI.ShowMobileAimButton = true
+    Config.UI.MobileAimLocked = false
     for _, sync in ipairs(SyncCallbacks) do
         pcall(sync)
     end
     refreshColorControls()
     SyncDependentSettings(true, "ResetDefaults")
+    ResetBtn.Text = "Reset!"
+    task.delay(0.8, function()
+        if not State.Unloaded and ResetBtn and ResetBtn.Parent then
+            ResetBtn.Text = "Reset Defaults"
+        end
+    end)
 end)
 
 local function unloadScript()
