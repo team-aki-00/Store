@@ -112,7 +112,7 @@ local Config = {
     },
     TriggerBot = {
         Enabled = false,
-        FireMode = "Safe Auto",         -- "Safe Auto" | "Tool Only" | "Shoot Btn" | "Mouse1 (PC)"
+        FireMode = "Mouse",             -- Unified client-safe Mouse fire request (never switches mobile to PC mode)
         TargetFilter = "Any Part",      -- "Any Part" | "Head & Chest" | "Head Only"
         HoldToFire = false,             -- true = hold trigger while locked; false = timed tap shots
         ReactionDelay = 0.03,           -- 0.00 .. 0.30 seconds
@@ -198,9 +198,10 @@ local State = {
     LastTriggerFire = 0,
     TriggerHolding = false,
     TriggerMouseHeld = false,
+    TriggerFakeMouseHeld = false,
     TriggerVimHeld = false,
     TriggerToolRef = nil,
-    CachedShootButton = nil,
+    LastTriggerMousePos = Vector2.zero,
     ColorListeners = {},
     FrameIndex = 0,
     LastRenderTick = 0,
@@ -883,11 +884,21 @@ local SAFETY_SYNC_INTERVAL = 1.0
 local ScheduleReload
 local ReloadAllSystems
 
+local function hasInstanceParts(inst)
+    if not inst then
+        return false
+    end
+    if inst:IsA("BasePart") then
+        return true
+    end
+    return inst:FindFirstChildWhichIsA("BasePart", true) ~= nil
+end
+
 local function isCandidateModelForPlayer(model, player)
-    if not model or not model:IsA("Model") or not model:IsDescendantOf(Workspace) then
+    if not model or (not model:IsA("Model") and not model:IsA("BasePart")) or not model:IsDescendantOf(Workspace) then
         return false, false
     end
-    if not model:FindFirstChildWhichIsA("BasePart", true) then
+    if not hasInstanceParts(model) then
         return false, false
     end
 
@@ -913,7 +924,7 @@ local function isCandidateModelForPlayer(model, player)
     end
 
     local hum = model:FindFirstChildOfClass("Humanoid")
-    local isAlive = (hum == nil) or (hum.Health > 0) or (model:GetAttribute("Alive") == true)
+    local isAlive = (hum == nil) or (hum.MaxHealth <= 0) or (hum.Health > 0) or (model:GetAttribute("Alive") == true)
     return true, isAlive
 end
 
@@ -933,7 +944,7 @@ local function scanContainerForPlayer(container, player)
         end
     end
     for _, child in ipairs(container:GetChildren()) do
-        if child:IsA("Model") then
+        if child:IsA("Model") or child:IsA("BasePart") then
             local ok, alive = isCandidateModelForPlayer(child, player)
             if ok then
                 if alive then
@@ -949,7 +960,7 @@ end
 local function resolveCharacterForPlayer(player, allowDeepScan)
     local directChar = player.Character
     if directChar and directChar.Parent and directChar:IsDescendantOf(Workspace) then
-        if directChar:FindFirstChildWhichIsA("BasePart", true) then
+        if hasInstanceParts(directChar) then
             return directChar
         end
     end
@@ -969,19 +980,22 @@ local function resolveCharacterForPlayer(player, allowDeepScan)
     end
 
     local wsDirect = Workspace:FindFirstChild(player.Name) or Workspace:FindFirstChild(player.DisplayName)
-    if wsDirect and wsDirect:IsA("Model") and (wsDirect:FindFirstChildOfClass("Humanoid") or wsDirect.PrimaryPart or wsDirect:FindFirstChild("HumanoidRootPart") or wsDirect:FindFirstChild("Head")) then
-        return wsDirect
+    if wsDirect then
+        local okDirect = isCandidateModelForPlayer(wsDirect, player)
+        if okDirect then
+            return wsDirect
+        end
     end
 
     if allowDeepScan then
         for _, child in ipairs(Workspace:GetChildren()) do
-            if child:IsA("Folder") or child:IsA("Model") then
+            if child:IsA("Folder") or child:IsA("Model") or child:IsA("BasePart") then
                 if child ~= directChar then
                     local okSelf, aliveSelf = isCandidateModelForPlayer(child, player)
                     if okSelf and aliveSelf then
                         return child
                     end
-                    if #child:GetChildren() <= 200 then
+                    if (child:IsA("Folder") or child:IsA("Model")) and #child:GetChildren() <= 200 then
                         local nested = scanContainerForPlayer(child, player)
                         if nested then
                             return nested
@@ -1001,66 +1015,148 @@ end
 
 local function cacheCharacterParts(entry, character)
     local rigParts = {}
+    local seenRigParts = {}
+    local bones = {}
+    local allBodyParts = {}
     local targetCandidates = {}
     local largestTorso = nil
     local largestVol = 0
+    local highestPart = nil
+    local highestY = -math.huge
+    local lowestPart = nil
+    local lowestY = math.huge
 
-    for _, desc in ipairs(character:GetDescendants()) do
-        if desc:IsA("BasePart") then
-            local n = desc.Name
-            if n == "Head" then
-                targetCandidates.Head = desc
-            elseif n == "UpperTorso" then
-                targetCandidates.UpperTorso = desc
-            elseif n == "Torso" or n == "Chest" then
-                targetCandidates.Torso = desc
-            elseif n == "HumanoidRootPart" or n == "RootPart" then
-                targetCandidates.HumanoidRootPart = desc
-            elseif n == "LeftFoot" or n == "RightFoot" or n == "Left Leg" or n == "Right Leg" then
-                targetCandidates.Foot = targetCandidates.Foot or desc
-            end
+    local function processPart(desc)
+        if not desc:IsA("BasePart") then
+            return
+        end
+        if desc:FindFirstAncestorOfClass("Tool") then
+            return
+        end
 
-            if RIG_PART_NAMES[n] then
+        table.insert(allBodyParts, desc)
+        local n = desc.Name
+        local nl = string.lower(n)
+
+        if n == "Head" then
+            targetCandidates.Head = desc
+        elseif not targetCandidates.Head and (nl == "fakehead" or nl == "headhitbox" or nl == "skull" or nl == "face" or nl == "visor" or nl == "helmet" or string.find(nl, "head", 1, true)) then
+            targetCandidates.Head = desc
+        end
+
+        if n == "UpperTorso" then
+            targetCandidates.UpperTorso = desc
+        elseif n == "Torso" or n == "Chest" then
+            targetCandidates.Torso = desc
+        elseif not targetCandidates.Torso and (nl == "lowertorso" or nl == "body" or nl == "upperbody" or nl == "core" or nl == "spine" or nl == "pelvis" or nl == "hull" or nl == "chassis" or nl == "main" or string.find(nl, "torso", 1, true) or string.find(nl, "chest", 1, true)) then
+            targetCandidates.Torso = desc
+        end
+
+        if n == "HumanoidRootPart" or n == "RootPart" then
+            targetCandidates.HumanoidRootPart = desc
+        elseif not targetCandidates.HumanoidRootPart and (nl == "root" or nl == "center" or nl == "primary" or nl == "hitbox" or nl == "base") then
+            targetCandidates.HumanoidRootPart = desc
+        end
+
+        if n == "LeftFoot" or n == "RightFoot" or n == "Left Leg" or n == "Right Leg" then
+            targetCandidates.Foot = targetCandidates.Foot or desc
+        elseif not targetCandidates.Foot and (string.find(nl, "foot", 1, true) or string.find(nl, "leg", 1, true) or string.find(nl, "wheel", 1, true) or string.find(nl, "hoof", 1, true)) then
+            targetCandidates.Foot = desc
+        end
+
+        local inAccessory = desc:FindFirstAncestorOfClass("Accessory") ~= nil
+        local isVisibleBodyPart = (desc.Transparency < 1) and (not inAccessory)
+        if RIG_PART_NAMES[n] or isVisibleBodyPart then
+            if not seenRigParts[desc] then
+                seenRigParts[desc] = true
                 table.insert(rigParts, desc)
             end
+        end
 
-            if desc.Transparency < 1 and not desc:FindFirstAncestorOfClass("Accessory") then
+        if isVisibleBodyPart then
+            local s = desc.Size
+            local vol = s.X * s.Y * s.Z
+            if vol > largestVol then
+                largestVol = vol
+                largestTorso = desc
+            end
+            local py = desc.Position.Y
+            if py > highestY then
+                highestY = py
+                highestPart = desc
+            end
+            if py < lowestY then
+                lowestY = py
+                lowestPart = desc
+            end
+        end
+    end
+
+    if character:IsA("BasePart") then
+        processPart(character)
+    end
+    for _, desc in ipairs(character:GetDescendants()) do
+        if desc:IsA("BasePart") then
+            processPart(desc)
+        elseif desc:IsA("Bone") then
+            table.insert(bones, desc)
+        end
+    end
+
+    -- Support custom morphs whose visible geometry lives inside Accessories or uses non-standard transparent root shells
+    if #rigParts == 0 or (#rigParts == 1 and rigParts[1] == targetCandidates.HumanoidRootPart and #allBodyParts > 1) then
+        for _, desc in ipairs(allBodyParts) do
+            if desc.Transparency < 1 and not seenRigParts[desc] then
+                seenRigParts[desc] = true
+                table.insert(rigParts, desc)
                 local s = desc.Size
                 local vol = s.X * s.Y * s.Z
                 if vol > largestVol then
                     largestVol = vol
                     largestTorso = desc
                 end
+                local py = desc.Position.Y
+                if py > highestY then
+                    highestY = py
+                    highestPart = desc
+                end
+                if py < lowestY then
+                    lowestY = py
+                    lowestPart = desc
+                end
             end
         end
     end
 
     if #rigParts == 0 then
-        for _, desc in ipairs(character:GetDescendants()) do
-            if desc:IsA("BasePart") and desc.Transparency < 1 and not desc:FindFirstAncestorOfClass("Accessory") then
+        for _, desc in ipairs(allBodyParts) do
+            if not seenRigParts[desc] then
+                seenRigParts[desc] = true
                 table.insert(rigParts, desc)
             end
         end
     end
-    if #rigParts == 0 then
-        for _, desc in ipairs(character:GetDescendants()) do
-            if desc:IsA("BasePart") then
-                table.insert(rigParts, desc)
-            end
-        end
+
+    if #rigParts == 0 and character:IsA("BasePart") then
+        table.insert(rigParts, character)
     end
 
     entry.RigParts = rigParts
+    entry.Bones = bones
     entry.TargetCandidates = targetCandidates
     entry.Humanoid = character:FindFirstChildOfClass("Humanoid")
-    entry.Head = targetCandidates.Head
-    entry.Torso = targetCandidates.UpperTorso or targetCandidates.Torso or largestTorso or targetCandidates.HumanoidRootPart
+    local primaryProp = character:IsA("Model") and character.PrimaryPart or nil
+    entry.Torso = targetCandidates.UpperTorso or targetCandidates.Torso or largestTorso or targetCandidates.HumanoidRootPart or primaryProp or rigParts[1]
+    entry.Head = targetCandidates.Head or highestPart or entry.Torso
+    if not targetCandidates.Foot then
+        targetCandidates.Foot = lowestPart
+    end
     entry.RootPart = targetCandidates.HumanoidRootPart
+        or primaryProp
         or entry.Torso
         or entry.Head
-        or character.PrimaryPart
         or rigParts[1]
-        or character:FindFirstChildWhichIsA("BasePart", true)
+        or (character:IsA("BasePart") and character or character:FindFirstChildWhichIsA("BasePart", true))
     entry.LastScanTime = os.clock()
 end
 
@@ -1084,7 +1180,7 @@ local function deepWorkspaceScanForMissingPlayers(missingPlayers)
     end
 
     for _, desc in ipairs(Workspace:GetDescendants()) do
-        if desc:IsA("Model") and desc ~= State.LocalCharacter then
+        if (desc:IsA("Model") or desc:IsA("BasePart")) and desc ~= State.LocalCharacter then
             for plr in pairs(remaining) do
                 local ok, alive = isCandidateModelForPlayer(desc, plr)
                 if ok then
@@ -1149,6 +1245,7 @@ local function clearCharacterFromEntry(entry)
     entry.EstimatedVel = Vector3.zero
     entry.FrameVisualCache = nil
     clearTable(entry.RigParts)
+    clearTable(entry.Bones)
     clearTable(entry.TargetCandidates)
 
     for _, c in ipairs(entry.CharConns) do
@@ -1238,6 +1335,7 @@ local function registerPlayerEntry(player)
         Head = nil,
         Torso = nil,
         RigParts = {},
+        Bones = {},
         TargetCandidates = {},
         BoxLines = bundle.BoxLines,
         TracerLine = bundle.TracerLine,
@@ -1603,8 +1701,13 @@ local function playerHasLivingWorkspaceChar(plr)
             if not customAlive then
                 return false
             end
+        elseif not hum then
+            local hpVal = ch:FindFirstChild("Health") or ch:FindFirstChild("HP")
+            if hpVal and (hpVal:IsA("NumberValue") or hpVal:IsA("IntValue")) and hpVal.Value <= 0 then
+                return false
+            end
         end
-        return ch:FindFirstChildWhichIsA("BasePart", true) ~= nil
+        return hasInstanceParts(ch)
     end
     local entry = Registry[plr]
     return entry ~= nil and entry.Character ~= nil and entry.Character.Parent ~= nil and entry.RootPart ~= nil
@@ -1737,6 +1840,14 @@ local function getCharacterHealth(entry)
 
     local char = entry.Character
     if char then
+        local hpVal = char:FindFirstChild("Health") or char:FindFirstChild("HP")
+        local maxVal = char:FindFirstChild("MaxHealth") or char:FindFirstChild("MaxHP")
+        if hpVal and (hpVal:IsA("NumberValue") or hpVal:IsA("IntValue")) then
+            local maxHp = (maxVal and (maxVal:IsA("NumberValue") or maxVal:IsA("IntValue")) and maxVal.Value > 0) and maxVal.Value or 100
+            local hp = math.clamp(hpVal.Value, 0, maxHp)
+            return hp, maxHp, math.clamp(hp / maxHp, 0, 1)
+        end
+
         local attrHp = char:GetAttribute("Health")
         if attrHp == nil then attrHp = char:GetAttribute("HP") end
         local attrMax = char:GetAttribute("MaxHealth")
@@ -1770,6 +1881,10 @@ local function isEntryAlive(entry)
         end
     else
         if char:GetAttribute("Alive") == false or entry.Player:GetAttribute("Alive") == false then
+            return false
+        end
+        local hpVal = char:FindFirstChild("Health") or char:FindFirstChild("HP")
+        if hpVal and (hpVal:IsA("NumberValue") or hpVal:IsA("IntValue")) and hpVal.Value <= 0 then
             return false
         end
         local hp = char:GetAttribute("Health") or char:GetAttribute("HP")
@@ -1948,12 +2063,13 @@ local function computeScreenBox(camera, entry, rootVP, worldDist)
     local maxX, maxY = -math.huge, -math.huge
     local anyInFront = false
     local rootPos = entry.RootPart and entry.RootPart.Position
+    local maxSpread = math.max(24, (entry.Humanoid and entry.Humanoid.HipHeight or 2) * 8)
 
     local parts = entry.RigParts
     local validParts = 0
     if #parts > 0 then
         for _, part in ipairs(parts) do
-            if part and part.Parent and (not rootPos or (part.Position - rootPos).Magnitude <= 18) then
+            if part and part.Parent and (not rootPos or (part.Position - rootPos).Magnitude <= maxSpread) then
                 validParts = validParts + 1
                 local cf = part.CFrame
                 local half = part.Size * 0.5
@@ -1976,12 +2092,43 @@ local function computeScreenBox(camera, entry, rootVP, worldDist)
         end
     end
 
+    -- Support skinned-mesh custom rigs deformed via Bone instances
+    if entry.Bones and #entry.Bones > 0 then
+        for _, bone in ipairs(entry.Bones) do
+            if bone and bone.Parent then
+                local okBone, bPos = pcall(function()
+                    return bone.TransformedWorldCFrame.Position
+                end)
+                if okBone and bPos and (not rootPos or (bPos - rootPos).Magnitude <= maxSpread) then
+                    local vp = camera:WorldToViewportPoint(bPos)
+                    if vp.Z > 0 then
+                        anyInFront = true
+                        if vp.X < minX then minX = vp.X end
+                        if vp.Y < minY then minY = vp.Y end
+                        if vp.X > maxX then maxX = vp.X end
+                        if vp.Y > maxY then maxY = vp.Y end
+                    end
+                end
+            end
+        end
+    end
+
     if validParts == 0 and entry.Character then
-        local ok, cf, size = pcall(function()
-            return entry.Character:GetBoundingBox()
-        end)
-        if ok and cf and size then
-            local half = Vector3.new(math.min(size.X, 12), math.min(size.Y, 14), math.min(size.Z, 12)) * 0.5
+        local cf, size
+        if entry.Character:IsA("BasePart") then
+            cf = entry.Character.CFrame
+            size = entry.Character.Size
+        elseif entry.Character:IsA("Model") then
+            local ok, mcf, msize = pcall(function()
+                return entry.Character:GetBoundingBox()
+            end)
+            if ok then
+                cf = mcf
+                size = msize
+            end
+        end
+        if cf and size then
+            local half = Vector3.new(math.min(size.X, 18), math.min(size.Y, 20), math.min(size.Z, 18)) * 0.5
             for sx = -1, 1, 2 do
                 for sy = -1, 1, 2 do
                     for sz = -1, 1, 2 do
@@ -2268,6 +2415,9 @@ local function getAimPartForEntry(entry, camera, screenCenter)
             cands.HumanoidRootPart,
             entry.RootPart,
         }
+        for _, rp in ipairs(entry.RigParts) do
+            table.insert(partsToCheck, rp)
+        end
         for _, part in ipairs(partsToCheck) do
             if part and part.Parent then
                 local vp, onScreen = camera:WorldToViewportPoint(part.Position)
@@ -2415,7 +2565,11 @@ local function updateAimbot(camera, screenCenter, dt)
     leadTime = leadTime + getLocalPingSeconds()
 
     local velocity = resolveTargetVelocity(chosenEntry, chosenPart, dt)
-    local predictedPos = chosenPart.Position + (velocity * leadTime)
+    local aimBasePos = chosenPart.Position
+    if Config.Aimbot.TargetPart == "Head" and chosenPart == chosenEntry.RootPart and not chosenEntry.TargetCandidates.Head and chosenPart.Size.Y >= 2.2 then
+        aimBasePos = aimBasePos + Vector3.new(0, math.min(chosenPart.Size.Y * 0.28, 1.8), 0)
+    end
+    local predictedPos = aimBasePos + (velocity * leadTime)
     local targetCFrame = CFrame.lookAt(camPos, predictedPos)
 
     local smoothness = math.clamp(Config.Aimbot.Smoothness, 1, 20)
@@ -2428,161 +2582,170 @@ local function updateAimbot(camera, screenCenter, dt)
     end
 end
 
--- Advanced Trigger Bot Engine (Mobile-Safe Tool & Shoot-Button Signals — never steals thumbstick touch)
-local function fireButtonSignalList(signalObj)
-    if not signalObj then
-        return false
+-- Mouse-Only Client Trigger Bot (Sends client MouseButton1 / Mouse.Button1Down requests without switching mobile to PC mode)
+local CORE_INPUT_BLOCK_PATTERNS = {
+    "playermodule",
+    "controlmodule",
+    "cameramodule",
+    "inputcategorizer",
+    "touchgui",
+    "coregui",
+    "corepackages",
+    "robloxgui",
+    "topbar",
+    "bubblechat",
+    "playerlist",
+    "team_aki",
+}
+
+local function isBlockedCoreInputConnection(conn)
+    if not conn then
+        return true
     end
-    if type(firesignal) == "function" then
-        local ok = pcall(firesignal, signalObj)
-        if ok then
-            return true
+    if conn.Enabled == false then
+        return true
+    end
+    local fn = conn.Function
+    if type(fn) ~= "function" then
+        return true
+    end
+    if type(iscclosure) == "function" and iscclosure(fn) then
+        return true
+    end
+
+    local srcInfo = ""
+    if debug and type(debug.info) == "function" then
+        local okSrc, s = pcall(debug.info, fn, "s")
+        if okSrc and type(s) == "string" then
+            srcInfo = string.lower(s)
         end
     end
-    if type(getconnections) == "function" then
-        local ok, conns = pcall(getconnections, signalObj)
-        if ok and type(conns) == "table" and #conns > 0 then
-            for _, conn in ipairs(conns) do
-                pcall(function()
-                    if type(conn.Fire) == "function" then
-                        conn:Fire()
-                    elseif type(conn.Function) == "function" then
-                        conn.Function()
-                    end
-                end)
+
+    local scriptPath = ""
+    if type(getfenv) == "function" then
+        local okEnv, env = pcall(getfenv, fn)
+        if okEnv and type(env) == "table" and typeof(env.script) == "Instance" then
+            local okName, fullName = pcall(function()
+                return env.script:GetFullName()
+            end)
+            if okName and type(fullName) == "string" then
+                scriptPath = string.lower(fullName)
             end
+        end
+    end
+
+    local combined = srcInfo .. "|" .. scriptPath
+    for _, pattern in ipairs(CORE_INPUT_BLOCK_PATTERNS) do
+        if string.find(combined, pattern, 1, true) then
             return true
         end
     end
     return false
 end
 
-local function isGuiButtonVisibleOnScreen(btn)
-    if not btn or not btn:IsA("GuiButton") or not btn.Visible then
-        return false
-    end
-    local anc = btn.Parent
-    while anc and anc:IsA("GuiObject") do
-        if not anc.Visible then
+local function createFakeMouseInput(screenCenter, isBegin)
+    local pos = screenCenter or Vector2.new(640, 360)
+    return {
+        UserInputType = Enum.UserInputType.MouseButton1,
+        UserInputState = isBegin and Enum.UserInputState.Begin or Enum.UserInputState.End,
+        KeyCode = Enum.KeyCode.Unknown,
+        Position = Vector3.new(pos.X, pos.Y, 0),
+        Delta = Vector3.zero,
+        IsModifierKeyDown = function()
             return false
-        end
-        anc = anc.Parent
-    end
-    local sg = btn:FindFirstAncestorOfClass("ScreenGui")
-    if not sg or not sg.Enabled then
-        return false
-    end
-    local sgName = sg.Name
-    if sgName == "TouchGui" or string.sub(sgName, 1, 8) == "TEAM_AKI" then
-        return false
-    end
-    local sz = btn.AbsoluteSize
-    return sz.X >= 18 and sz.Y >= 18
+        end,
+        IsA = function(_, className)
+            return className == "InputObject" or className == "Instance"
+        end,
+    }
 end
 
-local function scoreShootButtonCandidate(btn)
-    local bName = string.lower(btn.Name or "")
-    local labelText = ""
-    if btn:IsA("TextButton") then
-        labelText = string.lower(btn.Text or "")
-    else
-        local tl = btn:FindFirstChildWhichIsA("TextLabel", true)
-        if tl then
-            labelText = string.lower(tl.Text or "")
-        end
+local function dispatchClientMouseSignal(signalObj, fakeInput)
+    if not signalObj or type(getconnections) ~= "function" then
+        return false
+    end
+    local ok, conns = pcall(getconnections, signalObj)
+    if not ok or type(conns) ~= "table" or #conns == 0 then
+        return false
     end
 
-    if string.find(bName, "switch", 1, true)
-        or string.find(bName, "reload", 1, true)
-        or string.find(bName, "aim", 1, true)
-        or string.find(bName, "scope", 1, true)
-        or string.find(bName, "jump", 1, true)
-        or string.find(bName, "crouch", 1, true)
-        or string.find(bName, "edit", 1, true)
-        or string.find(labelText, "switch", 1, true)
-        or string.find(labelText, "reload", 1, true)
-        or string.find(labelText, "aim", 1, true)
-    then
-        return 0
-    end
-
-    local score = 0
-    if bName == "shoot" or bName == "fire" or bName == "shootbutton" or bName == "firebutton" then
-        score = score + 100
-    elseif string.find(bName, "shoot", 1, true) or string.find(bName, "fire", 1, true) or string.find(bName, "attack", 1, true) then
-        score = score + 70
-    end
-    if labelText == "shoot" or labelText == "fire" then
-        score = score + 100
-    elseif string.find(labelText, "shoot", 1, true) or string.find(labelText, "fire", 1, true) then
-        score = score + 65
-    end
-    return score
-end
-
-local function findMobileShootButton()
-    local cached = State.CachedShootButton
-    if cached and cached.Parent and isGuiButtonVisibleOnScreen(cached) then
-        return cached
-    end
-
-    local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-    if not pg then
-        State.CachedShootButton = nil
-        return nil
-    end
-
-    local bestBtn = nil
-    local bestScore = 0
-    for _, inst in ipairs(pg:GetDescendants()) do
-        if inst:IsA("GuiButton") and isGuiButtonVisibleOnScreen(inst) then
-            local sc = scoreShootButtonCandidate(inst)
-            if sc > bestScore then
-                bestScore = sc
-                bestBtn = inst
+    local firedAny = false
+    for _, conn in ipairs(conns) do
+        if not isBlockedCoreInputConnection(conn) then
+            local invoked = pcall(conn.Function, fakeInput, false)
+            if invoked then
+                firedAny = true
             end
         end
     end
-
-    State.CachedShootButton = bestBtn
-    return bestBtn
+    return firedAny
 end
 
-local function fireShootButtonSignals(btn, holdMode)
-    if not btn or not btn.Parent then
+local function firePlayerMouseSignal(signalName)
+    local okMouse, pm = pcall(function()
+        return LocalPlayer:GetMouse()
+    end)
+    if not okMouse or not pm then
         return false
     end
-    local fired = false
-    if fireButtonSignalList(btn.MouseButton1Down) then
-        fired = true
+    local okSig, sig = pcall(function()
+        return pm[signalName]
+    end)
+    if not okSig or not sig then
+        return false
     end
-    if fireButtonSignalList(btn.Activated) then
-        fired = true
+
+    if type(firesignal) == "function" then
+        local okFire = pcall(firesignal, sig)
+        if okFire then
+            return true
+        end
     end
-    if fireButtonSignalList(btn.MouseButton1Click) then
-        fired = true
-    end
-    if fired and not holdMode then
-        task.delay(0.03, function()
-            if btn and btn.Parent then
-                fireButtonSignalList(btn.MouseButton1Up)
+    if type(getconnections) == "function" then
+        local okConns, conns = pcall(getconnections, sig)
+        if okConns and type(conns) == "table" and #conns > 0 then
+            local firedAny = false
+            for _, conn in ipairs(conns) do
+                if not isBlockedCoreInputConnection(conn) then
+                    local okCall = pcall(function()
+                        if type(conn.Fire) == "function" then
+                            conn:Fire()
+                        elseif type(conn.Function) == "function" then
+                            conn.Function()
+                        end
+                    end)
+                    if okCall then
+                        firedAny = true
+                    end
+                end
             end
-        end)
+            return firedAny
+        end
     end
-    return fired
+    return false
+end
+
+local function toolHasActivatedConnections(tool)
+    if not tool or type(getconnections) ~= "function" then
+        return false
+    end
+    local ok, conns = pcall(getconnections, tool.Activated)
+    return ok and type(conns) == "table" and #conns > 0
 end
 
 releaseTriggerFire = function()
+    if State.TriggerFakeMouseHeld then
+        State.TriggerFakeMouseHeld = false
+        firePlayerMouseSignal("Button1Up")
+        dispatchClientMouseSignal(UserInputService.InputEnded, createFakeMouseInput(State.LastTriggerMousePos, false))
+    end
+
     if State.TriggerToolRef and State.TriggerToolRef.Parent then
         pcall(function()
             State.TriggerToolRef:Deactivate()
         end)
     end
     State.TriggerToolRef = nil
-
-    if State.TriggerHolding and State.CachedShootButton and State.CachedShootButton.Parent then
-        fireButtonSignalList(State.CachedShootButton.MouseButton1Up)
-    end
 
     if State.TriggerMouseHeld then
         State.TriggerMouseHeld = false
@@ -2591,60 +2754,41 @@ releaseTriggerFire = function()
         end
     end
 
-    if State.TriggerVimHeld then
-        State.TriggerVimHeld = false
-        if VirtualInputManager then
-            pcall(function()
-                local cam = State.Camera or Workspace.CurrentCamera
-                local vp = cam and cam.ViewportSize or Vector2.new(640, 360)
-                VirtualInputManager:SendMouseButtonEvent(vp.X * 0.5, vp.Y * 0.5, 0, false, game, 1)
-            end)
-        end
-    end
-
+    State.TriggerVimHeld = false
     State.TriggerHolding = false
 end
 
 local function triggerOnceOrPress(screenCenter, holdMode)
-    local mode = Config.TriggerBot.FireMode
     local isTouchDevice = UserInputService.TouchEnabled
     local localChar = State.LocalCharacter or LocalPlayer.Character
     local equippedTool = localChar and localChar:FindFirstChildOfClass("Tool") or nil
     local fired = false
 
-    -- 1) Tool:Activate() is safe on all platforms and never touches UI or thumbstick input
-    if (mode == "Safe Auto" or mode == "Auto" or mode == "Tool Only") and equippedTool then
-        local ok = pcall(function()
+    State.LastTriggerMousePos = screenCenter or Vector2.new(640, 360)
+
+    -- 1) Send pure-Luau PlayerMouse Button1Down (never changes UserInputService input type on mobile)
+    if firePlayerMouseSignal("Button1Down") then
+        fired = true
+    end
+
+    -- 2) Send filtered UserInputService.InputBegan MouseButton1 strictly to game weapon scripts (never PlayerModule/InputCategorizer)
+    if dispatchClientMouseSignal(UserInputService.InputBegan, createFakeMouseInput(State.LastTriggerMousePos, true)) then
+        fired = true
+    end
+
+    -- 3) Activate equipped Tool if it has Tool.Activated handlers or if no Luau mouse listeners existed
+    if equippedTool and (toolHasActivatedConnections(equippedTool) or not fired) then
+        local okTool = pcall(function()
             equippedTool:Activate()
         end)
-        if ok then
+        if okTool then
             State.TriggerToolRef = equippedTool
             fired = true
-            if not holdMode then
-                task.delay(0.03, function()
-                    if equippedTool and equippedTool.Parent and not State.TriggerHolding then
-                        pcall(function()
-                            equippedTool:Deactivate()
-                        end)
-                    end
-                end)
-            end
         end
     end
 
-    -- 2) Mobile Shoot GUI button signals (fires existing Shoot/Fire button handlers cleanly, zero screen clicks!)
-    if mode == "Shoot Btn" or ((mode == "Safe Auto" or mode == "Auto") and isTouchDevice) then
-        local shootBtn = findMobileShootButton()
-        if shootBtn and fireShootButtonSignals(shootBtn, holdMode) then
-            fired = true
-        end
-    end
-
-    -- 3) Mouse1 / VirtualInput ONLY allowed on non-touch PC or when explicitly selected as "Mouse1 (PC)"
-    local allowDesktopMouse = (mode == "Mouse1 (PC)" or mode == "Mouse1" or mode == "VirtualInput")
-        or ((mode == "Safe Auto" or mode == "Auto") and (not isTouchDevice))
-
-    if allowDesktopMouse and (mode ~= "Tool Only" and mode ~= "Shoot Btn") then
+    -- 4) Only use hardware mouse1press/mouse1click on true non-touch PCs; NEVER on touchscreen phones (prevents PC-mode lock)
+    if (not isTouchDevice) and (not fired) then
         if holdMode and type(mouse1press) == "function" then
             pcall(mouse1press)
             State.TriggerMouseHeld = true
@@ -2662,24 +2806,30 @@ local function triggerOnceOrPress(screenCenter, holdMode)
                 end
             end)
             fired = true
-        elseif VirtualInputManager then
-            pcall(function()
-                VirtualInputManager:SendMouseButtonEvent(screenCenter.X, screenCenter.Y, 0, true, game, 1)
-                if holdMode then
-                    State.TriggerVimHeld = true
-                else
-                    task.delay(0.025, function()
-                        pcall(function()
-                            VirtualInputManager:SendMouseButtonEvent(screenCenter.X, screenCenter.Y, 0, false, game, 1)
-                        end)
-                    end)
-                end
-            end)
-            fired = true
         end
     end
 
-    State.TriggerHolding = holdMode and fired
+    if holdMode and fired then
+        State.TriggerFakeMouseHeld = true
+        State.TriggerHolding = true
+    else
+        State.TriggerHolding = false
+        if fired then
+            local endCenter = State.LastTriggerMousePos
+            local toolToRelease = equippedTool
+            task.delay(0.028, function()
+                if not State.TriggerHolding then
+                    firePlayerMouseSignal("Button1Up")
+                    dispatchClientMouseSignal(UserInputService.InputEnded, createFakeMouseInput(endCenter, false))
+                    if toolToRelease and toolToRelease.Parent then
+                        pcall(function()
+                            toolToRelease:Deactivate()
+                        end)
+                    end
+                end
+            end)
+        end
+    end
 end
 
 local function partMatchesTriggerFilter(part, entry)
@@ -2687,19 +2837,22 @@ local function partMatchesTriggerFilter(part, entry)
     if filter == "Any Part" then
         return true
     end
-    local n = part.Name
+    local n = string.lower(part.Name)
     if filter == "Head Only" then
-        return part == entry.Head or n == "Head"
+        return part == entry.Head or string.find(n, "head", 1, true) ~= nil or string.find(n, "skull", 1, true) ~= nil
     end
     -- "Head & Chest"
     return part == entry.Head
         or part == entry.Torso
-        or n == "Head"
-        or n == "UpperTorso"
-        or n == "LowerTorso"
-        or n == "Torso"
-        or n == "Chest"
-        or n == "HumanoidRootPart"
+        or part == entry.RootPart
+        or string.find(n, "head", 1, true) ~= nil
+        or string.find(n, "torso", 1, true) ~= nil
+        or string.find(n, "chest", 1, true) ~= nil
+        or string.find(n, "body", 1, true) ~= nil
+        or string.find(n, "core", 1, true) ~= nil
+        or string.find(n, "spine", 1, true) ~= nil
+        or string.find(n, "hull", 1, true) ~= nil
+        or n == "humanoidrootpart"
 end
 
 local function findEntryForHitPart(hitPart)
@@ -4033,7 +4186,7 @@ end)
 
 -- 2. TRIGGER BOT TAB
 local TriggerPage = TabPages["Trigger"]
-addToggle(TriggerPage, 1, "Enable Trigger Bot", "Auto-fires when valid enemy crosses reticle", function()
+addToggle(TriggerPage, 1, "Enable Trigger Bot", "Sends client Mouse fire requests without switching to PC mode", function()
     return Config.TriggerBot.Enabled
 end, function(v)
     Config.TriggerBot.Enabled = v
@@ -4046,19 +4199,13 @@ end, function(v)
     Config.TriggerBot.TargetFilter = v
 end, false)
 
-addSelector(TriggerPage, 3, "Fire Method", {"Safe Auto", "Tool Only", "Shoot Btn", "Mouse1 (PC)"}, function()
-    return Config.TriggerBot.FireMode
-end, function(v)
-    Config.TriggerBot.FireMode = v
-end, false)
-
-addToggle(TriggerPage, 4, "Hold Fire While Locked", "Hold trigger continuously vs timed burst taps", function()
+addToggle(TriggerPage, 3, "Hold Fire While Locked", "Hold mouse trigger continuously vs timed taps", function()
     return Config.TriggerBot.HoldToFire
 end, function(v)
     Config.TriggerBot.HoldToFire = v
 end)
 
-addSlider(TriggerPage, 5, "Crosshair Tolerance", 0, 28, 1, function(v)
+addSlider(TriggerPage, 4, "Crosshair Tolerance", 0, 28, 1, function(v)
     local n = math.round(v)
     return (n == 0) and "0 px (Exact)" or string.format("%d px", n)
 end, function()
@@ -4067,7 +4214,7 @@ end, function(v)
     Config.TriggerBot.CrosshairTolerance = math.round(v)
 end)
 
-addSlider(TriggerPage, 6, "Reaction Delay", 0.00, 0.30, 0.01, function(v)
+addSlider(TriggerPage, 5, "Reaction Delay", 0.00, 0.30, 0.01, function(v)
     return string.format("%.2fs", v)
 end, function()
     return Config.TriggerBot.ReactionDelay
@@ -4075,7 +4222,7 @@ end, function(v)
     Config.TriggerBot.ReactionDelay = v
 end)
 
-addSlider(TriggerPage, 7, "Shot Cooldown", 0.02, 0.60, 0.01, function(v)
+addSlider(TriggerPage, 6, "Shot Cooldown", 0.02, 0.60, 0.01, function(v)
     return string.format("%.2fs", v)
 end, function()
     return Config.TriggerBot.ShotCooldown
@@ -4083,19 +4230,19 @@ end, function(v)
     Config.TriggerBot.ShotCooldown = v
 end)
 
-addToggle(TriggerPage, 8, "Trigger Team Check", "Never shoots teammates (FFA-safe Auto mode)", function()
+addToggle(TriggerPage, 7, "Trigger Team Check", "Never shoots teammates (FFA-safe Auto mode)", function()
     return Config.TriggerBot.TeamCheck
 end, function(v)
     Config.TriggerBot.TeamCheck = v
 end)
 
-addToggle(TriggerPage, 9, "Trigger Visible Check", "Blocks shots when enemy is behind walls", function()
+addToggle(TriggerPage, 8, "Trigger Visible Check", "Blocks shots when enemy is behind walls", function()
     return Config.TriggerBot.VisibleCheck
 end, function(v)
     Config.TriggerBot.VisibleCheck = v
 end)
 
-addToggle(TriggerPage, 10, "Show Crosshair Indicator", "Center reticle dot pulses mint when target locked", function()
+addToggle(TriggerPage, 9, "Show Crosshair Indicator", "Center reticle dot pulses mint when target locked", function()
     return Config.TriggerBot.ShowIndicator
 end, function(v)
     Config.TriggerBot.ShowIndicator = v
