@@ -99,7 +99,7 @@ local Config = {
         ProjectileSpeed = 0,            -- 0 = pure lead time; >0 adds Distance / Speed
         PingCompensation = false,
         FOVRadius = 135,                -- pixels
-        FOVThickness = 1.8,             -- 1 .. 5 pixels
+        FOVThickness = 2.0,             -- 1 .. 10 pixels
         ShowFOV = true,
         TeamCheck = true,
         VisibleCheck = true,
@@ -111,12 +111,12 @@ local Config = {
         RenderEngine = "ScreenGui",     -- "ScreenGui" (100% reliable mobile) | "Drawing"
         BoxESP = true,
         BoxStyle = "Corner",            -- "Corner" | "Full"
-        BoxThickness = 1.8,             -- 1 .. 5 pixels
+        BoxThickness = 2.0,             -- 1 .. 10 pixels
         HealthBar = true,
         ShowHealthPercent = true,
         TracerESP = true,
         TracerOrigin = "Bottom",        -- "Bottom" | "Center" | "Top"
-        LineThickness = 1.5,            -- 1 .. 5 pixels
+        LineThickness = 2.0,            -- 1 .. 10 pixels
         Alert360 = true,
         Alert360VisibleOnly = false,
         AlertRingRadius = 155,
@@ -175,6 +175,7 @@ local State = {
     IsHoldingAim = false,
     ColorListeners = {},
     FrameIndex = 0,
+    LastRenderTick = 0,
     ReloadCount = 0,
     ReloadToken = 0,
     LastSafetySync = 0,
@@ -210,10 +211,24 @@ local EspContainer = Instance.new("Folder")
 EspContainer.Name = "ESP_Elements"
 EspContainer.Parent = OverlayGui
 
+local function getHighlightParent()
+    local okCore = pcall(function()
+        return CoreGui.Name
+    end)
+    if okCore then
+        return CoreGui
+    end
+    local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if pg then
+        return pg
+    end
+    return OverlayGui
+end
+
 local HighlightContainer = Instance.new("Folder")
 HighlightContainer.Name = "TEAM_AKI_Highlights"
 local okHighlightParent = pcall(function()
-    HighlightContainer.Parent = getSafeGuiParent()
+    HighlightContainer.Parent = getHighlightParent()
 end)
 if not okHighlightParent or not HighlightContainer.Parent then
     HighlightContainer.Parent = OverlayGui
@@ -660,7 +675,7 @@ local function createRegistryVisualBundle()
 
             if state.ShowBox then
                 local x, y, w, h = state.BX, state.BY, state.BW, state.BH
-                local t = math.max(state.BoxThickness, 1)
+                local t = math.max(math.round(state.BoxThickness), 1)
                 local col = state.BoxColor
 
                 if state.BoxStyle == "Full" then
@@ -668,7 +683,7 @@ local function createRegistryVisualBundle()
                     fullBoxFrame.Position = UDim2.fromOffset(x, y)
                     fullBoxFrame.Size = UDim2.fromOffset(w, h)
                     fullBoxStroke.Color = col
-                    fullBoxStroke.Thickness = t
+                    fullBoxStroke.Thickness = math.max(state.BoxThickness, 1)
                     for i = 1, 8 do cornerSegs[i].Visible = false end
                 else
                     fullBoxFrame.Visible = false
@@ -738,9 +753,10 @@ local function createRegistryVisualBundle()
             if state.ShowTracer then
                 local delta = state.TracerTo - state.TracerFrom
                 local mid = (state.TracerFrom + state.TracerTo) * 0.5
+                local lineT = math.max(math.round(state.LineThickness), 1)
                 tracerFrame.Visible = true
                 tracerFrame.Position = UDim2.fromOffset(mid.X, mid.Y)
-                tracerFrame.Size = UDim2.fromOffset(math.max(delta.Magnitude, 1), math.max(state.LineThickness, 1))
+                tracerFrame.Size = UDim2.fromOffset(math.max(delta.Magnitude, 1), lineT)
                 tracerFrame.Rotation = math.deg(math.atan2(delta.Y, delta.X))
                 tracerFrame.BackgroundColor3 = state.TracerColor
             else
@@ -815,11 +831,16 @@ local ReloadAllSystems
 
 local function resolveCharacterForPlayer(player)
     local directChar = player.Character
-    if directChar and directChar.Parent then
-        return directChar
+    if directChar and directChar.Parent and directChar:IsDescendantOf(Workspace) then
+        if directChar:FindFirstChildWhichIsA("BasePart", true) then
+            return directChar
+        end
     end
 
     if not Config.Resolver.CustomContainerScan then
+        if directChar and directChar.Parent then
+            return directChar
+        end
         return nil
     end
 
@@ -831,13 +852,13 @@ local function resolveCharacterForPlayer(player)
         local container = Workspace:FindFirstChild(folderName)
         if container then
             local byName = container:FindFirstChild(targetName) or container:FindFirstChild(targetDisplay)
-            if byName and byName:IsA("Model") then
+            if byName and byName:IsA("Model") and byName:FindFirstChildWhichIsA("BasePart", true) then
                 return byName
             end
             for _, child in ipairs(container:GetChildren()) do
                 if child:IsA("Model") then
                     local uid = child:GetAttribute("UserId") or child:GetAttribute("PlayerId") or child:GetAttribute("OwnerId")
-                    if uid == targetUserId then
+                    if uid == targetUserId and child:FindFirstChildWhichIsA("BasePart", true) then
                         return child
                     end
                 end
@@ -845,9 +866,13 @@ local function resolveCharacterForPlayer(player)
         end
     end
 
-    local wsChild = Workspace:FindFirstChild(targetName)
+    local wsChild = Workspace:FindFirstChild(targetName) or Workspace:FindFirstChild(targetDisplay)
     if wsChild and wsChild:IsA("Model") and (wsChild:FindFirstChildOfClass("Humanoid") or wsChild.PrimaryPart or wsChild:FindFirstChild("HumanoidRootPart") or wsChild:FindFirstChild("Head")) then
         return wsChild
+    end
+
+    if directChar and directChar.Parent and directChar:IsDescendantOf(Workspace) then
+        return directChar
     end
 
     return nil
@@ -1164,6 +1189,19 @@ ReloadAllSystems = function(reason, hardReset)
     State.Camera = Workspace.CurrentCamera
     State.LastTeamScan = -1
 
+    if not OverlayGui.Parent then
+        OverlayGui.Parent = getSafeGuiParent()
+    end
+    OverlayGui.Enabled = true
+    if not HighlightContainer.Parent then
+        local okHL = pcall(function()
+            HighlightContainer.Parent = getHighlightParent()
+        end)
+        if not okHL or not HighlightContainer.Parent then
+            HighlightContainer.Parent = OverlayGui
+        end
+    end
+
     if hardReset then
         State.CurrentAimTarget = nil
         local existing = {}
@@ -1318,9 +1356,17 @@ local NON_COMBAT_TEAM_NAMES = {
     lobby = true,
     spectator = true,
     spectators = true,
+    spectating = true,
     afk = true,
     waiting = true,
+    ["waiting room"] = true,
+    intermission = true,
+    menu = true,
+    queue = true,
+    loading = true,
+    spawn = true,
     dead = true,
+    ghost = true,
     ffa = true,
     ["free for all"] = true,
     players = true,
@@ -1340,7 +1386,20 @@ local function isCombatTeam(teamObj)
     return not NON_COMBAT_TEAM_NAMES[lowerName]
 end
 
--- Detects whether this server actually has >= 2 distinct combat teams (prevents FFA false teammate filtering!)
+local function playerHasLivingWorkspaceChar(plr)
+    local ch = plr and plr.Character
+    if ch and ch.Parent and ch:IsDescendantOf(Workspace) then
+        local hum = ch:FindFirstChildOfClass("Humanoid")
+        if hum and hum.Health <= 0 then
+            return false
+        end
+        return ch:FindFirstChildWhichIsA("BasePart", true) ~= nil
+    end
+    local entry = Registry[plr]
+    return entry ~= nil and entry.Character ~= nil and entry.Character.Parent ~= nil and entry.RootPart ~= nil
+end
+
+-- Detects whether this server actually has >= 2 distinct combat teams among active players (never hides everyone!)
 local function refreshDetectedTeamScheme()
     local now = os.clock()
     if State.LastTeamScan >= 0 and (now - State.LastTeamScan) < 0.75 then
@@ -1356,28 +1415,30 @@ local function refreshDetectedTeamScheme()
     local attrCount = 0
 
     for _, plr in ipairs(Players:GetPlayers()) do
-        if isCombatTeam(plr.Team) and not plr.Neutral then
-            if not distinctTeams[plr.Team] then
-                distinctTeams[plr.Team] = true
-                teamCount = teamCount + 1
+        if playerHasLivingWorkspaceChar(plr) then
+            if isCombatTeam(plr.Team) and not plr.Neutral then
+                if not distinctTeams[plr.Team] then
+                    distinctTeams[plr.Team] = true
+                    teamCount = teamCount + 1
+                end
             end
-        end
-        if not plr.Neutral and (plr.Team == nil or isCombatTeam(plr.Team)) then
-            local colKey = plr.TeamColor.Name
-            if not distinctColors[colKey] then
-                distinctColors[colKey] = true
-                colorCount = colorCount + 1
+            if not plr.Neutral and (plr.Team == nil or isCombatTeam(plr.Team)) then
+                local colKey = plr.TeamColor.Name
+                if not distinctColors[colKey] then
+                    distinctColors[colKey] = true
+                    colorCount = colorCount + 1
+                end
             end
-        end
-        local attr = readTeamAttribute(plr)
-        if attr == nil and plr.Character then
-            attr = readTeamAttribute(plr.Character)
-        end
-        if attr ~= nil then
-            local ak = tostring(attr)
-            if not distinctAttrs[ak] then
-                distinctAttrs[ak] = true
-                attrCount = attrCount + 1
+            local attr = readTeamAttribute(plr)
+            if attr == nil and plr.Character then
+                attr = readTeamAttribute(plr.Character)
+            end
+            if attr ~= nil and tostring(attr) ~= "" then
+                local ak = tostring(attr)
+                if not distinctAttrs[ak] then
+                    distinctAttrs[ak] = true
+                    attrCount = attrCount + 1
+                end
             end
         end
     end
@@ -1389,11 +1450,32 @@ local function refreshDetectedTeamScheme()
     elseif colorCount >= 2 and #Teams:GetTeams() >= 2 then
         State.DetectedTeamScheme = "TeamColor"
     else
-        -- Free-for-all or single-team lobby: never hide enemies as teammates
         State.DetectedTeamScheme = "FFA"
     end
 
     return State.DetectedTeamScheme
+end
+
+local function rawSchemeTeammateCheck(scheme, player, entry)
+    if scheme == "Team" then
+        if isCombatTeam(LocalPlayer.Team) and isCombatTeam(player.Team) and not LocalPlayer.Neutral and not player.Neutral then
+            return LocalPlayer.Team == player.Team
+        end
+        return false
+    elseif scheme == "TeamColor" then
+        if not LocalPlayer.Neutral and not player.Neutral then
+            return LocalPlayer.TeamColor == player.TeamColor
+        end
+        return false
+    elseif scheme == "Attribute" then
+        local lAttr = readTeamAttribute(LocalPlayer) or readTeamAttribute(State.LocalCharacter or LocalPlayer.Character)
+        local tAttr = readTeamAttribute(player) or readTeamAttribute((entry and entry.Character) or player.Character)
+        if lAttr ~= nil and tAttr ~= nil then
+            return lAttr == tAttr
+        end
+        return false
+    end
+    return false
 end
 
 local function isTeammate(player, entry)
@@ -1420,30 +1502,34 @@ local function isTeammate(player, entry)
         return false
     end
 
-    -- "Auto" FFA-aware mode
+    -- "Auto" FFA-aware mode with Zero-Enemy safety invariant
     local scheme = refreshDetectedTeamScheme()
     if scheme == "FFA" then
         return false
-    elseif scheme == "Team" then
-        if isCombatTeam(LocalPlayer.Team) and isCombatTeam(player.Team) and not LocalPlayer.Neutral and not player.Neutral then
-            return LocalPlayer.Team == player.Team
-        end
-        return false
-    elseif scheme == "TeamColor" then
-        if not LocalPlayer.Neutral and not player.Neutral then
-            return LocalPlayer.TeamColor == player.TeamColor
-        end
-        return false
-    elseif scheme == "Attribute" then
-        local lAttr = readTeamAttribute(LocalPlayer) or readTeamAttribute(State.LocalCharacter or LocalPlayer.Character)
-        local tAttr = readTeamAttribute(player) or readTeamAttribute((entry and entry.Character) or player.Character)
-        if lAttr ~= nil and tAttr ~= nil then
-            return lAttr == tAttr
-        end
+    end
+
+    local matched = rawSchemeTeammateCheck(scheme, player, entry)
+    if not matched then
         return false
     end
 
-    return false
+    -- Safety invariant: if this scheme would hide 100% of living opponents in Workspace, it's an FFA lobby -> render all!
+    local hasAnyLivingEnemy = false
+    for otherPlayer, otherEntry in pairs(Registry) do
+        if otherPlayer ~= LocalPlayer and otherEntry.Character and otherEntry.Character.Parent and otherEntry.RootPart then
+            if not rawSchemeTeammateCheck(scheme, otherPlayer, otherEntry) then
+                hasAnyLivingEnemy = true
+                break
+            end
+        end
+    end
+
+    if not hasAnyLivingEnemy then
+        State.DetectedTeamScheme = "FFA"
+        return false
+    end
+
+    return true
 end
 
 local function getCharacterHealth(entry)
@@ -1481,7 +1567,7 @@ local function isEntryAlive(entry)
 
     local hum = entry.Humanoid
     if hum and hum.Parent then
-        if hum.Health <= 0 or hum:GetState() == Enum.HumanoidStateType.Dead then
+        if hum.Health <= 0 then
             return false
         end
     else
@@ -1663,12 +1749,13 @@ local function computeScreenBox(camera, entry, rootVP, worldDist)
     local minX, minY = math.huge, math.huge
     local maxX, maxY = -math.huge, -math.huge
     local anyInFront = false
+    local rootPos = entry.RootPart and entry.RootPart.Position
 
     local parts = entry.RigParts
     local validParts = 0
     if #parts > 0 then
         for _, part in ipairs(parts) do
-            if part and part.Parent then
+            if part and part.Parent and (not rootPos or (part.Position - rootPos).Magnitude <= 18) then
                 validParts = validParts + 1
                 local cf = part.CFrame
                 local half = part.Size * 0.5
@@ -1696,7 +1783,7 @@ local function computeScreenBox(camera, entry, rootVP, worldDist)
             return entry.Character:GetBoundingBox()
         end)
         if ok and cf and size then
-            local half = size * 0.5
+            local half = Vector3.new(math.min(size.X, 12), math.min(size.Y, 14), math.min(size.Z, 12)) * 0.5
             for sx = -1, 1, 2 do
                 for sy = -1, 1, 2 do
                     for sz = -1, 1, 2 do
@@ -1719,7 +1806,10 @@ local function computeScreenBox(camera, entry, rootVP, worldDist)
         local pad = 3
         local w = math.max((maxX - minX) + pad * 2, 8)
         local h = math.max((maxY - minY) + pad * 2, 12)
-        return true, minX - pad, minY - pad, w, h
+        local vpSize = camera.ViewportSize
+        if w <= vpSize.X * 1.4 and h <= vpSize.Y * 1.4 then
+            return true, minX - pad, minY - pad, w, h
+        end
     end
 
     -- Fallback proportional 2D box anchored around RootPart projection
@@ -2133,16 +2223,13 @@ end
 -- ============================================================================
 local RENDER_STEP_NAME = "TEAM_AKI_RenderStep"
 
-pcall(function()
-    RunService:UnbindFromRenderStep(RENDER_STEP_NAME)
-end)
-
-RunService:BindToRenderStep(RENDER_STEP_NAME, Enum.RenderPriority.Camera.Value + 1, function(dt)
+local function onRenderStepFrame(dt)
     if State.Unloaded then
         return
     end
 
     State.FrameIndex = State.FrameIndex + 1
+    State.LastRenderTick = os.clock()
 
     local camera = Workspace.CurrentCamera
     State.Camera = camera
@@ -2151,7 +2238,7 @@ RunService:BindToRenderStep(RENDER_STEP_NAME, Enum.RenderPriority.Camera.Value +
     end
 
     -- 1.0s periodic full player re-sync/re-render
-    local now = os.clock()
+    local now = State.LastRenderTick
     if (now - State.LastSafetySync) >= SAFETY_SYNC_INTERVAL then
         State.LastSafetySync = now
         pcall(runPeriodicSafetySync)
@@ -2214,7 +2301,7 @@ RunService:BindToRenderStep(RENDER_STEP_NAME, Enum.RenderPriority.Camera.Value +
     local viewportSize = camera.ViewportSize
     local screenCenter = Vector2.new(viewportSize.X * 0.5, viewportSize.Y * 0.5)
 
-    local showFov = Config.Aimbot.ShowFOV and Config.Aimbot.Enabled
+    local showFov = Config.Aimbot.ShowFOV
     local useDrawingFov = shouldUseDrawing() and DrawingFOV ~= nil
 
     if DrawingFOV then
@@ -2225,6 +2312,7 @@ RunService:BindToRenderStep(RENDER_STEP_NAME, Enum.RenderPriority.Camera.Value +
                 DrawingFOV.Radius = Config.Aimbot.FOVRadius
                 DrawingFOV.Thickness = Config.Aimbot.FOVThickness
                 DrawingFOV.Color = Config.Colors.FOV
+                DrawingFOV.Transparency = Config.Aimbot.Enabled and 0.92 or 0.65
             end
         end)
     end
@@ -2234,12 +2322,41 @@ RunService:BindToRenderStep(RENDER_STEP_NAME, Enum.RenderPriority.Camera.Value +
         local diameter = Config.Aimbot.FOVRadius * 2
         FOVRingFrame.Size = UDim2.fromOffset(diameter, diameter)
         FOVStroke.Color = Config.Colors.FOV
-        FOVStroke.Thickness = Config.Aimbot.FOVThickness
+        FOVStroke.Thickness = math.max(Config.Aimbot.FOVThickness, 1)
+        FOVStroke.Transparency = Config.Aimbot.Enabled and 0.15 or 0.45
     end
 
-    pcall(updateAimbot, camera, screenCenter, dt)
-    pcall(updateAllESP, camera, viewportSize, screenCenter)
-end)
+    updateAimbot(camera, screenCenter, dt)
+    updateAllESP(camera, viewportSize, screenCenter)
+end
+
+local function bindMainRenderLoop()
+    pcall(function()
+        RunService:UnbindFromRenderStep(RENDER_STEP_NAME)
+    end)
+    RunService:BindToRenderStep(RENDER_STEP_NAME, Enum.RenderPriority.Camera.Value + 50, function(dt)
+        pcall(onRenderStepFrame, dt)
+    end)
+end
+
+State.LastRenderTick = os.clock()
+bindMainRenderLoop()
+
+-- Heartbeat watchdog: guarantees RenderStep & 1.0s full sync NEVER stop after death/respawn/TP
+addConnection(RunService.Heartbeat:Connect(function()
+    if State.Unloaded then
+        return
+    end
+    local now = os.clock()
+    if (now - State.LastRenderTick) >= 0.5 then
+        State.LastRenderTick = now
+        bindMainRenderLoop()
+    end
+    if (now - State.LastSafetySync) >= SAFETY_SYNC_INTERVAL then
+        State.LastSafetySync = now
+        pcall(runPeriodicSafetySync)
+    end
+end))
 
 -- ============================================================================
 -- [SECTION 9] ADAPTIVE DEEP GLASSMORPHIC UI SHELL (TEAM AKI)
@@ -2798,7 +2915,7 @@ local function addSlider(parent, order, title, minVal, maxVal, step, formatFn, g
     local label = Instance.new("TextLabel")
     label.BackgroundTransparency = 1
     label.Position = UDim2.fromOffset(0, 0)
-    label.Size = UDim2.new(0.68, 0, 0, 18)
+    label.Size = UDim2.new(1, -124, 0, 18)
     label.Font = Enum.Font.GothamMedium
     label.Text = title
     label.TextSize = 13
@@ -2808,17 +2925,51 @@ local function addSlider(parent, order, title, minVal, maxVal, step, formatFn, g
     label.ZIndex = 5
     label.Parent = row
 
+    local minusBtn = Instance.new("TextButton")
+    minusBtn.AnchorPoint = Vector2.new(1, 0)
+    minusBtn.Position = UDim2.new(1, -94, 0, 0)
+    minusBtn.Size = UDim2.fromOffset(22, 18)
+    minusBtn.BackgroundColor3 = Palette.SurfaceSoft
+    minusBtn.Font = Enum.Font.GothamBold
+    minusBtn.Text = "-"
+    minusBtn.TextSize = 13
+    minusBtn.TextColor3 = Palette.TextHeader
+    minusBtn.AutoButtonColor = false
+    minusBtn.BorderSizePixel = 0
+    minusBtn.ZIndex = 6
+    minusBtn.Parent = row
+    local mc = Instance.new("UICorner")
+    mc.CornerRadius = UDim.new(0, 5)
+    mc.Parent = minusBtn
+
     local valueLabel = Instance.new("TextLabel")
     valueLabel.BackgroundTransparency = 1
     valueLabel.AnchorPoint = Vector2.new(1, 0)
-    valueLabel.Position = UDim2.new(1, 0, 0, 0)
-    valueLabel.Size = UDim2.fromOffset(96, 18)
+    valueLabel.Position = UDim2.new(1, -26, 0, 0)
+    valueLabel.Size = UDim2.fromOffset(64, 18)
     valueLabel.Font = Enum.Font.Code
-    valueLabel.TextSize = 12
+    valueLabel.TextSize = 11.5
     valueLabel.TextColor3 = Palette.ActiveGlow
-    valueLabel.TextXAlignment = Enum.TextXAlignment.Right
+    valueLabel.TextXAlignment = Enum.TextXAlignment.Center
     valueLabel.ZIndex = 5
     valueLabel.Parent = row
+
+    local plusBtn = Instance.new("TextButton")
+    plusBtn.AnchorPoint = Vector2.new(1, 0)
+    plusBtn.Position = UDim2.new(1, 0, 0, 0)
+    plusBtn.Size = UDim2.fromOffset(22, 18)
+    plusBtn.BackgroundColor3 = Palette.SurfaceSoft
+    plusBtn.Font = Enum.Font.GothamBold
+    plusBtn.Text = "+"
+    plusBtn.TextSize = 13
+    plusBtn.TextColor3 = Palette.TextHeader
+    plusBtn.AutoButtonColor = false
+    plusBtn.BorderSizePixel = 0
+    plusBtn.ZIndex = 6
+    plusBtn.Parent = row
+    local pc = Instance.new("UICorner")
+    pc.CornerRadius = UDim.new(0, 5)
+    pc.Parent = plusBtn
 
     local trackHitbox = Instance.new("TextButton")
     trackHitbox.BackgroundTransparency = 1
@@ -2878,22 +3029,36 @@ local function addSlider(parent, order, title, minVal, maxVal, step, formatFn, g
     sync()
     table.insert(SyncCallbacks, sync)
 
+    local function applyValue(raw)
+        local stepped = math.round((raw - minVal) / step) * step + minVal
+        local clamped = math.clamp(stepped, minVal, maxVal)
+        setter(clamped)
+        sync()
+    end
+
+    minusBtn.Activated:Connect(function()
+        applyValue(getter() - step)
+    end)
+
+    plusBtn.Activated:Connect(function()
+        applyValue(getter() + step)
+    end)
+
     local activeInput = nil
 
     local function updateFromInput(posX)
         local absPos = track.AbsolutePosition.X
         local absSize = math.max(track.AbsoluteSize.X, 1)
         local ratio = math.clamp((posX - absPos) / absSize, 0, 1)
-        local raw = minVal + (maxVal - minVal) * ratio
-        local stepped = math.round(raw / step) * step
-        local clamped = math.clamp(stepped, minVal, maxVal)
-        setter(clamped)
-        sync()
+        applyValue(minVal + (maxVal - minVal) * ratio)
     end
 
     trackHitbox.InputBegan:Connect(function(input)
         if not activeInput and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
             activeInput = input
+            if parent:IsA("ScrollingFrame") then
+                parent.ScrollingEnabled = false
+            end
             updateFromInput(input.Position.X)
         end
     end)
@@ -2909,6 +3074,9 @@ local function addSlider(parent, order, title, minVal, maxVal, step, formatFn, g
     addConnection(UserInputService.InputEnded:Connect(function(input)
         if input == activeInput then
             activeInput = nil
+            if parent:IsA("ScrollingFrame") then
+                parent.ScrollingEnabled = true
+            end
         end
     end))
 
@@ -3180,7 +3348,7 @@ end)
 -- 3. COLORS & THICKNESS TAB
 local ColorsPage = TabPages["Colors & Thickness"]
 
-addSlider(ColorsPage, 1, "FOV Circle Thickness", 1.0, 5.0, 0.2, function(v)
+addSlider(ColorsPage, 1, "FOV Circle Thickness", 1.0, 10.0, 0.5, function(v)
     return string.format("%.1f px", v)
 end, function()
     return Config.Aimbot.FOVThickness
@@ -3188,7 +3356,7 @@ end, function(v)
     Config.Aimbot.FOVThickness = v
 end)
 
-addSlider(ColorsPage, 2, "ESP Line Thickness", 1.0, 5.0, 0.2, function(v)
+addSlider(ColorsPage, 2, "ESP Line Thickness", 1.0, 10.0, 0.5, function(v)
     return string.format("%.1f px", v)
 end, function()
     return Config.ESP.LineThickness
@@ -3196,7 +3364,7 @@ end, function(v)
     Config.ESP.LineThickness = v
 end)
 
-addSlider(ColorsPage, 3, "ESP Box Thickness", 1.0, 5.0, 0.2, function(v)
+addSlider(ColorsPage, 3, "ESP Box Thickness", 1.0, 10.0, 0.5, function(v)
     return string.format("%.1f px", v)
 end, function()
     return Config.ESP.BoxThickness
