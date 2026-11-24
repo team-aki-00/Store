@@ -1,4 +1,3 @@
---!strict
 --[[
     ============================================================================
       TEAM AKI — Adaptive Glassmorphic Combat & Visual Suite
@@ -7,51 +6,80 @@
     ============================================================================
 ]]
 
+-- Wait for game data model if injected early at startup
+if not game:IsLoaded() then
+    pcall(function()
+        game.Loaded:Wait()
+    end)
+end
+
 -- ============================================================================
 -- [SECTION 1] CLEANUP OF PREVIOUS INSTANCE & ENVIRONMENT SHIMS
 -- ============================================================================
-local globalEnv: {[string]: any} = (typeof(getgenv) == "function" and getgenv()) or _G
+local globalEnv = (type(getgenv) == "function" and getgenv()) or _G
 
-if typeof(globalEnv.TEAM_AKI_UNLOAD) == "function" then
+if type(globalEnv.TEAM_AKI_UNLOAD) == "function" then
     pcall(globalEnv.TEAM_AKI_UNLOAD)
 end
 
-local clonerefFn = (typeof(cloneref) == "function" and cloneref) or function(obj: Instance)
+local clonerefFn = (type(cloneref) == "function" and cloneref) or function(obj)
     return obj
 end
 
-local function getService(name: string): any
+local function getService(name)
     return clonerefFn(game:GetService(name))
 end
 
-local Players: Players = getService("Players")
-local RunService: RunService = getService("RunService")
-local UserInputService: UserInputService = getService("UserInputService")
-local TweenService: TweenService = getService("TweenService")
-local Workspace: Workspace = getService("Workspace")
-local CoreGui: CoreGui = getService("CoreGui")
-local Teams: Teams = getService("Teams")
+local Players = getService("Players")
+local RunService = getService("RunService")
+local UserInputService = getService("UserInputService")
+local TweenService = getService("TweenService")
+local Workspace = getService("Workspace")
+local CoreGui = getService("CoreGui")
+local Teams = getService("Teams")
 
-local LocalPlayer: Player = Players.LocalPlayer
+local LocalPlayer = Players.LocalPlayer
 while not LocalPlayer do
     Players.PlayerAdded:Wait()
     LocalPlayer = Players.LocalPlayer
 end
 
-local function getSafeGuiParent(): Instance
-    if typeof(gethui) == "function" then
+local function shallowClone(tbl)
+    local copy = {}
+    for k, v in pairs(tbl) do
+        copy[k] = v
+    end
+    return copy
+end
+
+local function clearTable(tbl)
+    for k in pairs(tbl) do
+        tbl[k] = nil
+    end
+end
+
+local function getSafeGuiParent()
+    if type(gethui) == "function" then
         local ok, hui = pcall(gethui)
         if ok and typeof(hui) == "Instance" then
             return hui
         end
     end
-    local okCore, _ = pcall(function()
+    local okCore = pcall(function()
         return CoreGui.Name
     end)
     if okCore then
         return CoreGui
     end
     return LocalPlayer:WaitForChild("PlayerGui")
+end
+
+local function protectGui(gui)
+    if type(syn) == "table" and type(syn.protect_gui) == "function" then
+        pcall(syn.protect_gui, gui)
+    elseif type(protect_gui) == "function" then
+        pcall(protect_gui, gui)
+    end
 end
 
 -- ============================================================================
@@ -79,8 +107,8 @@ local Config = {
         AlertRingRadius = 155,
         HighlightESP = true,
         TeamCheck = true,
-        VisibleCheck = false,      -- If true, hides ESP for targets behind walls; if false, tints by visibility
-        ColorByVisibility = true,  -- Uses VisibleColor / HiddenColor when unobstructed/obstructed
+        VisibleCheck = false,      -- If true, hides ESP behind walls; if false, tints by visibility
+        ColorByVisibility = true,  -- Uses Visible / Hidden colors dynamically
         ShowNameDistance = true,
         MaxDistance = 1500,
         BoxThickness = 1.6,
@@ -105,21 +133,21 @@ local Config = {
 }
 
 local DefaultConfig = {
-    Aimbot = table.clone(Config.Aimbot),
-    ESP = table.clone(Config.ESP),
-    Colors = table.clone(Config.Colors),
+    Aimbot = shallowClone(Config.Aimbot),
+    ESP = shallowClone(Config.ESP),
+    Colors = shallowClone(Config.Colors),
 }
 
 local State = {
     Unloaded = false,
-    Connections = {} :: {RBXScriptConnection},
-    TrackedPlayers = {} :: {[Player]: any},
-    CurrentAimTarget = nil :: Player?,
+    Connections = {},
+    TrackedPlayers = {},
+    CurrentAimTarget = nil,
     IsHoldingAim = false,
-    ColorListeners = {} :: {() -> ()},
+    ColorListeners = {},
 }
 
-local function addConnection(conn: RBXScriptConnection): RBXScriptConnection
+local function addConnection(conn)
     table.insert(State.Connections, conn)
     return conn
 end
@@ -139,27 +167,34 @@ OverlayGui.IgnoreGuiInset = true
 OverlayGui.ResetOnSpawn = false
 OverlayGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 OverlayGui.DisplayOrder = 999
+protectGui(OverlayGui)
 OverlayGui.Parent = getSafeGuiParent()
 
 local EspContainer = Instance.new("Folder")
 EspContainer.Name = "ESP_Elements"
 EspContainer.Parent = OverlayGui
 
+-- Highlight instances require CoreGui or Workspace ancestry to render reliably across executors
 local HighlightContainer = Instance.new("Folder")
-HighlightContainer.Name = "Highlights"
-HighlightContainer.Parent = OverlayGui
+HighlightContainer.Name = "TEAM_AKI_Highlights"
+local okHighlightParent = pcall(function()
+    HighlightContainer.Parent = CoreGui
+end)
+if not okHighlightParent or not HighlightContainer.Parent then
+    HighlightContainer.Parent = Workspace
+end
 
--- Probe whether native executor Drawing API works reliably
+-- Probe whether native executor Drawing API works reliably (supports both table & userdata)
 local DrawingSupported = false
 do
-    local ok, testObj = pcall(function()
-        if typeof(Drawing) == "table" and typeof(Drawing.new) == "function" then
+    local ok, result = pcall(function()
+        if Drawing and type(Drawing.new) == "function" then
             local sq = Drawing.new("Square")
-            if sq then
+            if sq ~= nil then
                 sq.Visible = false
-                if typeof(sq.Remove) == "function" then
+                if type(sq.Remove) == "function" then
                     sq:Remove()
-                elseif typeof(sq.Destroy) == "function" then
+                elseif type(sq.Destroy) == "function" then
                     sq:Destroy()
                 end
                 return true
@@ -167,23 +202,23 @@ do
         end
         return false
     end)
-    DrawingSupported = ok and testObj == true
+    DrawingSupported = ok and result == true
 end
 
-local function safeDestroyDrawing(obj: any)
+local function safeDestroyDrawing(obj)
     if not obj then
         return
     end
     pcall(function()
-        if typeof(obj.Remove) == "function" then
+        if type(obj.Remove) == "function" then
             obj:Remove()
-        elseif typeof(obj.Destroy) == "function" then
+        elseif type(obj.Destroy) == "function" then
             obj:Destroy()
         end
     end)
 end
 
--- ScreenGui fallback helpers for executors without Drawing or partial Drawing support
+-- ScreenGui fallback primitives (used automatically if Drawing API is unavailable or fails)
 local function createFallbackBox()
     local frame = Instance.new("Frame")
     frame.BackgroundTransparency = 1
@@ -197,16 +232,10 @@ local function createFallbackBox()
     stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
     stroke.Parent = frame
 
-    local outline = Instance.new("Frame")
-    outline.BackgroundTransparency = 1
-    outline.Size = UDim2.fromScale(1, 1)
-    outline.Parent = frame
-
     return {
-        _isGui = true,
         Frame = frame,
         Stroke = stroke,
-        Set = function(self: any, visible: boolean, x: number, y: number, w: number, h: number, color: Color3, thickness: number)
+        Set = function(self, visible, x, y, w, h, color, thickness)
             self.Frame.Visible = visible
             if visible then
                 self.Frame.Position = UDim2.fromOffset(x, y)
@@ -215,7 +244,7 @@ local function createFallbackBox()
                 self.Stroke.Thickness = thickness
             end
         end,
-        Destroy = function(self: any)
+        Destroy = function(self)
             pcall(function()
                 self.Frame:Destroy()
             end)
@@ -231,9 +260,8 @@ local function createFallbackLine()
     frame.Parent = EspContainer
 
     return {
-        _isGui = true,
         Frame = frame,
-        Set = function(self: any, visible: boolean, fromPos: Vector2, toPos: Vector2, color: Color3, thickness: number)
+        Set = function(self, visible, fromPos, toPos, color, thickness)
             self.Frame.Visible = visible
             if visible then
                 local delta = toPos - fromPos
@@ -245,7 +273,7 @@ local function createFallbackLine()
                 self.Frame.BackgroundColor3 = color
             end
         end,
-        Destroy = function(self: any)
+        Destroy = function(self)
             pcall(function()
                 self.Frame:Destroy()
             end)
@@ -257,7 +285,7 @@ local function createFallbackLabel()
     local label = Instance.new("TextLabel")
     label.BackgroundTransparency = 1
     label.AnchorPoint = Vector2.new(0.5, 1)
-    label.Size = UDim2.fromOffset(180, 18)
+    label.Size = UDim2.fromOffset(200, 18)
     label.Font = Enum.Font.GothamMedium
     label.TextSize = 12
     label.TextColor3 = Color3.new(1, 1, 1)
@@ -267,17 +295,16 @@ local function createFallbackLabel()
     label.Parent = EspContainer
 
     return {
-        _isGui = true,
         Label = label,
-        Set = function(self: any, visible: boolean, x: number, y: number, text: string, color: Color3)
+        Set = function(self, visible, x, y, text, color)
             self.Label.Visible = visible
             if visible then
-                self.Label.Position = UDim2.fromOffset(x, y)
+                self.Label.Position = UDim2.fromOffset(x, y - 2)
                 self.Label.Text = text
                 self.Label.TextColor3 = color
             end
         end,
-        Destroy = function(self: any)
+        Destroy = function(self)
             pcall(function()
                 self.Label:Destroy()
             end)
@@ -310,11 +337,10 @@ local function createFallbackArrow()
     rightArm.Parent = holder
 
     return {
-        _isGui = true,
         Holder = holder,
         Left = leftArm,
         Right = rightArm,
-        Set = function(self: any, visible: boolean, tipPos: Vector2, angleRad: number, color: Color3)
+        Set = function(self, visible, tipPos, angleRad, color)
             self.Holder.Visible = visible
             if visible then
                 self.Holder.Position = UDim2.fromOffset(tipPos.X, tipPos.Y)
@@ -323,7 +349,7 @@ local function createFallbackArrow()
                 self.Right.BackgroundColor3 = color
             end
         end,
-        Destroy = function(self: any)
+        Destroy = function(self)
             pcall(function()
                 self.Holder:Destroy()
             end)
@@ -335,21 +361,25 @@ local function createBoxWrapper()
     if DrawingSupported then
         local ok, sq = pcall(Drawing.new, "Square")
         if ok and sq then
-            sq.Visible = false
-            sq.Filled = false
-            sq.Thickness = Config.ESP.BoxThickness
+            pcall(function()
+                sq.Visible = false
+                sq.Filled = false
+                sq.Thickness = Config.ESP.BoxThickness
+            end)
             return {
                 _obj = sq,
-                Set = function(self: any, visible: boolean, x: number, y: number, w: number, h: number, color: Color3, thickness: number)
-                    self._obj.Visible = visible
-                    if visible then
-                        self._obj.Position = Vector2.new(x, y)
-                        self._obj.Size = Vector2.new(w, h)
-                        self._obj.Color = color
-                        self._obj.Thickness = thickness
-                    end
+                Set = function(self, visible, x, y, w, h, color, thickness)
+                    pcall(function()
+                        self._obj.Visible = visible
+                        if visible then
+                            self._obj.Position = Vector2.new(x, y)
+                            self._obj.Size = Vector2.new(w, h)
+                            self._obj.Color = color
+                            self._obj.Thickness = thickness
+                        end
+                    end)
                 end,
-                Destroy = function(self: any)
+                Destroy = function(self)
                     safeDestroyDrawing(self._obj)
                 end,
             }
@@ -362,20 +392,24 @@ local function createLineWrapper()
     if DrawingSupported then
         local ok, ln = pcall(Drawing.new, "Line")
         if ok and ln then
-            ln.Visible = false
-            ln.Thickness = Config.ESP.TracerThickness
+            pcall(function()
+                ln.Visible = false
+                ln.Thickness = Config.ESP.TracerThickness
+            end)
             return {
                 _obj = ln,
-                Set = function(self: any, visible: boolean, fromPos: Vector2, toPos: Vector2, color: Color3, thickness: number)
-                    self._obj.Visible = visible
-                    if visible then
-                        self._obj.From = fromPos
-                        self._obj.To = toPos
-                        self._obj.Color = color
-                        self._obj.Thickness = thickness
-                    end
+                Set = function(self, visible, fromPos, toPos, color, thickness)
+                    pcall(function()
+                        self._obj.Visible = visible
+                        if visible then
+                            self._obj.From = fromPos
+                            self._obj.To = toPos
+                            self._obj.Color = color
+                            self._obj.Thickness = thickness
+                        end
+                    end)
                 end,
-                Destroy = function(self: any)
+                Destroy = function(self)
                     safeDestroyDrawing(self._obj)
                 end,
             }
@@ -388,26 +422,30 @@ local function createArrowWrapper()
     if DrawingSupported then
         local ok, tri = pcall(Drawing.new, "Triangle")
         if ok and tri then
-            tri.Visible = false
-            tri.Filled = true
-            tri.Thickness = 1
+            pcall(function()
+                tri.Visible = false
+                tri.Filled = true
+                tri.Thickness = 1
+            end)
             return {
                 _obj = tri,
-                Set = function(self: any, visible: boolean, tipPos: Vector2, angleRad: number, color: Color3)
-                    self._obj.Visible = visible
-                    if visible then
-                        local dir = Vector2.new(math.cos(angleRad), math.sin(angleRad))
-                        local perp = Vector2.new(-dir.Y, dir.X)
-                        local arrowLen = 14
-                        local halfWidth = 7
-                        local baseCenter = tipPos - dir * arrowLen
-                        self._obj.PointA = tipPos
-                        self._obj.PointB = baseCenter + perp * halfWidth
-                        self._obj.PointC = baseCenter - perp * halfWidth
-                        self._obj.Color = color
-                    end
+                Set = function(self, visible, tipPos, angleRad, color)
+                    pcall(function()
+                        self._obj.Visible = visible
+                        if visible then
+                            local dir = Vector2.new(math.cos(angleRad), math.sin(angleRad))
+                            local perp = Vector2.new(-dir.Y, dir.X)
+                            local arrowLen = 14
+                            local halfWidth = 7
+                            local baseCenter = tipPos - dir * arrowLen
+                            self._obj.PointA = tipPos
+                            self._obj.PointB = baseCenter + perp * halfWidth
+                            self._obj.PointC = baseCenter - perp * halfWidth
+                            self._obj.Color = color
+                        end
+                    end)
                 end,
-                Destroy = function(self: any)
+                Destroy = function(self)
                     safeDestroyDrawing(self._obj)
                 end,
             }
@@ -420,24 +458,30 @@ local function createLabelWrapper()
     if DrawingSupported then
         local ok, txt = pcall(Drawing.new, "Text")
         if ok and txt then
-            txt.Visible = false
-            txt.Center = true
-            txt.Outline = true
-            txt.Size = 13
             pcall(function()
-                txt.Font = (Drawing :: any).Fonts and (Drawing :: any).Fonts.UI or 2
+                txt.Visible = false
+                txt.Center = true
+                txt.Outline = true
+                txt.Size = 13
+                if Drawing.Fonts and Drawing.Fonts.UI then
+                    txt.Font = Drawing.Fonts.UI
+                else
+                    txt.Font = 2
+                end
             end)
             return {
                 _obj = txt,
-                Set = function(self: any, visible: boolean, x: number, y: number, content: string, color: Color3)
-                    self._obj.Visible = visible
-                    if visible then
-                        self._obj.Position = Vector2.new(x, y - 16)
-                        self._obj.Text = content
-                        self._obj.Color = color
-                    end
+                Set = function(self, visible, x, y, content, color)
+                    pcall(function()
+                        self._obj.Visible = visible
+                        if visible then
+                            self._obj.Position = Vector2.new(x, y - 16)
+                            self._obj.Text = content
+                            self._obj.Color = color
+                        end
+                    end)
                 end,
-                Destroy = function(self: any)
+                Destroy = function(self)
                     safeDestroyDrawing(self._obj)
                 end,
             }
@@ -446,7 +490,7 @@ local function createLabelWrapper()
     return createFallbackLabel()
 end
 
--- Screen-centered crisp FOV Ring (always aligned cleanly on mobile high-DPI)
+-- Screen-centered crisp FOV Ring (consistent across all mobile DPI scales)
 local FOVRingFrame = Instance.new("Frame")
 FOVRingFrame.Name = "FOVRing"
 FOVRingFrame.AnchorPoint = Vector2.new(0.5, 0.5)
@@ -496,9 +540,9 @@ local RIG_PART_NAMES = {
     ["Right Leg"] = true,
 }
 
-local function cacheCharacterParts(entry: any, character: Model)
-    local rigParts: {BasePart} = {}
-    local targetCandidates: {[string]: BasePart} = {}
+local function cacheCharacterParts(entry, character)
+    local rigParts = {}
+    local targetCandidates = {}
 
     for _, desc in ipairs(character:GetDescendants()) do
         if desc:IsA("BasePart") then
@@ -536,7 +580,7 @@ local function cacheCharacterParts(entry: any, character: Model)
         or rigParts[1]
 end
 
-local function ensureHighlight(entry: any, character: Model)
+local function ensureHighlight(entry, character)
     if entry.Highlight and entry.Highlight.Parent then
         entry.Highlight.Adornee = character
         return
@@ -557,19 +601,19 @@ local function ensureHighlight(entry: any, character: Model)
     end
 end
 
-local function clearCharacterState(entry: any)
+local function clearCharacterState(entry)
     entry.Character = nil
     entry.Humanoid = nil
     entry.RootPart = nil
-    table.clear(entry.RigParts)
-    table.clear(entry.TargetCandidates)
+    clearTable(entry.RigParts)
+    clearTable(entry.TargetCandidates)
 
     for _, c in ipairs(entry.CharConns) do
         pcall(function()
             c:Disconnect()
         end)
     end
-    table.clear(entry.CharConns)
+    clearTable(entry.CharConns)
 
     if entry.Highlight then
         pcall(function()
@@ -584,7 +628,7 @@ local function clearCharacterState(entry: any)
     entry.Label:Set(false, 0, 0, "", Color3.new(1, 1, 1))
 end
 
-local function bindCharacter(entry: any, character: Model?)
+local function bindCharacter(entry, character)
     clearCharacterState(entry)
     if not character or State.Unloaded then
         return
@@ -595,7 +639,7 @@ local function bindCharacter(entry: any, character: Model?)
     ensureHighlight(entry, character)
 
     local function refreshSoon()
-        if entry.Character == character and character.Parent then
+        if entry.Character == character and character.Parent and not State.Unloaded then
             cacheCharacterParts(entry, character)
         end
     end
@@ -618,29 +662,28 @@ local function bindCharacter(entry: any, character: Model?)
         end
     end))
 
-    -- Re-scan once after brief delay in case rig parts stream in right after CharacterAdded
-    task.delay(0.2, refreshSoon)
+    task.delay(0.25, refreshSoon)
 end
 
-local function trackPlayer(player: Player)
+local function trackPlayer(player)
     if player == LocalPlayer or State.TrackedPlayers[player] then
         return
     end
 
     local entry = {
         Player = player,
-        Character = nil :: Model?,
-        Humanoid = nil :: Humanoid?,
-        RootPart = nil :: BasePart?,
-        RigParts = {} :: {BasePart},
-        TargetCandidates = {} :: {[string]: BasePart},
-        Highlight = nil :: Highlight?,
+        Character = nil,
+        Humanoid = nil,
+        RootPart = nil,
+        RigParts = {},
+        TargetCandidates = {},
+        Highlight = nil,
         Box = createBoxWrapper(),
         Tracer = createLineWrapper(),
         Arrow = createArrowWrapper(),
         Label = createLabelWrapper(),
-        PlayerConns = {} :: {RBXScriptConnection},
-        CharConns = {} :: {RBXScriptConnection},
+        PlayerConns = {},
+        CharConns = {},
     }
 
     State.TrackedPlayers[player] = entry
@@ -658,7 +701,7 @@ local function trackPlayer(player: Player)
     end
 end
 
-local function untrackPlayer(player: Player)
+local function untrackPlayer(player)
     local entry = State.TrackedPlayers[player]
     if not entry then
         return
@@ -675,7 +718,7 @@ local function untrackPlayer(player: Player)
             c:Disconnect()
         end)
     end
-    table.clear(entry.PlayerConns)
+    clearTable(entry.PlayerConns)
 
     entry.Box:Destroy()
     entry.Tracer:Destroy()
@@ -694,7 +737,7 @@ addConnection(Players.PlayerRemoving:Connect(untrackPlayer))
 -- ============================================================================
 -- [SECTION 5] TEAM CHECK, ALIVE CHECK, TARGET PART & RAYCAST VISIBILITY LOGIC
 -- ============================================================================
-local function isTeammate(player: Player): boolean
+local function isTeammate(player)
     if player == LocalPlayer then
         return true
     end
@@ -706,16 +749,22 @@ local function isTeammate(player: Player): boolean
         end
     end
 
-    -- TeamColor check only when Teams service actually defines teams & neither is Neutral
+    -- TeamColor check only when Teams service defines teams & neither is Neutral
     if not LocalPlayer.Neutral and not player.Neutral and #Teams:GetTeams() > 0 then
         if LocalPlayer.TeamColor == player.TeamColor then
             return true
         end
     end
 
-    -- Attribute fallback used by custom shooter frameworks (e.g., Rivals / custom rounds)
-    local localAttr = LocalPlayer:GetAttribute("Team") or LocalPlayer:GetAttribute("TeamId")
-    local targetAttr = player:GetAttribute("Team") or player:GetAttribute("TeamId")
+    -- Attribute fallback for custom team-based shooters (e.g. Rivals / custom rounds)
+    local localAttr = LocalPlayer:GetAttribute("Team")
+    if localAttr == nil then
+        localAttr = LocalPlayer:GetAttribute("TeamId")
+    end
+    local targetAttr = player:GetAttribute("Team")
+    if targetAttr == nil then
+        targetAttr = player:GetAttribute("TeamId")
+    end
     if localAttr ~= nil and targetAttr ~= nil and localAttr == targetAttr then
         return true
     end
@@ -731,7 +780,7 @@ local function isTeammate(player: Player): boolean
     return false
 end
 
-local function isEntryAlive(entry: any): boolean
+local function isEntryAlive(entry)
     local char = entry.Character
     if not char or not char.Parent then
         return false
@@ -754,7 +803,7 @@ local function isEntryAlive(entry: any): boolean
     return entry.RootPart ~= nil and entry.RootPart.Parent ~= nil
 end
 
-local function getAimPart(entry: any, camera: Camera, screenCenter: Vector2): BasePart?
+local function getAimPart(entry, camera, screenCenter)
     local cands = entry.TargetCandidates
     local mode = Config.Aimbot.TargetPart
 
@@ -770,8 +819,7 @@ local function getAimPart(entry: any, camera: Camera, screenCenter: Vector2): Ba
             or (cands.Head and cands.Head.Parent and cands.Head)
             or entry.RootPart
     else
-        -- Closest part to crosshair / screen center
-        local bestPart: BasePart? = nil
+        local bestPart = nil
         local bestDist = math.huge
         local partsToCheck = {
             cands.Head,
@@ -785,7 +833,7 @@ local function getAimPart(entry: any, camera: Camera, screenCenter: Vector2): Ba
                 if screenPos.Z > 0 then
                     local dist = (Vector2.new(screenPos.X, screenPos.Y) - screenCenter).Magnitude
                     if not onScreen then
-                        dist += 2000
+                        dist = dist + 2000
                     end
                     if dist < bestDist then
                         bestDist = dist
@@ -802,7 +850,7 @@ local RayParams = RaycastParams.new()
 RayParams.FilterType = Enum.RaycastFilterType.Exclude
 RayParams.IgnoreWater = true
 
-local function isPartVisible(camera: Camera, targetCharacter: Model, targetPart: BasePart): boolean
+local function isPartVisible(camera, targetCharacter, targetPart)
     local origin = camera.CFrame.Position
     local targetPos = targetPart.Position
     local delta = targetPos - origin
@@ -811,7 +859,7 @@ local function isPartVisible(camera: Camera, targetCharacter: Model, targetPart:
         return true
     end
 
-    local filterList: {Instance} = {OverlayGui, camera}
+    local filterList = {OverlayGui, camera}
     if LocalPlayer.Character then
         table.insert(filterList, LocalPlayer.Character)
     end
@@ -819,7 +867,7 @@ local function isPartVisible(camera: Camera, targetCharacter: Model, targetPart:
     local currentOrigin = origin
     local dirUnit = delta.Unit
 
-    -- Up to 4 pierce steps to ignore non-colliding FX/invisible trigger parts without ignoring real walls
+    -- Up to 4 pierce steps to pass through non-colliding FX or invisible trigger volumes
     for _ = 1, 4 do
         local remaining = (targetPos - currentOrigin).Magnitude
         if remaining < 0.05 then
@@ -841,7 +889,6 @@ local function isPartVisible(camera: Camera, targetCharacter: Model, targetPart:
             return true
         end
 
-        -- Pass through non-blocking effects / fully invisible triggers
         if (not hitPart.CanCollide) or hitPart.Transparency >= 0.95 then
             table.insert(filterList, hitPart)
             currentOrigin = result.Position + dirUnit * 0.05
@@ -856,7 +903,7 @@ end
 -- ============================================================================
 -- [SECTION 6] BOUNDING BOX PROJECTION & ESP RENDERER
 -- ============================================================================
-local function computeScreenBox(camera: Camera, entry: any): (boolean, number, number, number, number)
+local function computeScreenBox(camera, entry)
     local minX, minY = math.huge, math.huge
     local maxX, maxY = -math.huge, -math.huge
     local anyInFront = false
@@ -870,7 +917,6 @@ local function computeScreenBox(camera: Camera, entry: any): (boolean, number, n
         if part and part.Parent then
             local cf = part.CFrame
             local half = part.Size * 0.5
-            -- Project 8 corners of the part's oriented bounding box for accurate screen framing
             for sx = -1, 1, 2 do
                 for sy = -1, 1, 2 do
                     for sz = -1, 1, 2 do
@@ -893,12 +939,11 @@ local function computeScreenBox(camera: Camera, entry: any): (boolean, number, n
         return false, 0, 0, 0, 0
     end
 
-    -- Slight padding so box sits cleanly around character silhouette
     local pad = 3
     return true, minX - pad, minY - pad, (maxX - minX) + pad * 2, (maxY - minY) + pad * 2
 end
 
-local function hideEntryVisuals(entry: any)
+local function hideEntryVisuals(entry)
     entry.Box:Set(false, 0, 0, 0, 0, Config.Colors.Enemy, 1)
     entry.Tracer:Set(false, Vector2.zero, Vector2.zero, Config.Colors.Tracer, 1)
     entry.Arrow:Set(false, Vector2.zero, 0, Config.Colors.Alert360)
@@ -908,7 +953,7 @@ local function hideEntryVisuals(entry: any)
     end
 end
 
-local function updateESPForEntry(entry: any, camera: Camera, viewportSize: Vector2, screenCenter: Vector2)
+local function updateESPForEntry(entry, camera, viewportSize, screenCenter)
     if not Config.ESP.Enabled or not isEntryAlive(entry) then
         hideEntryVisuals(entry)
         return
@@ -919,7 +964,7 @@ local function updateESPForEntry(entry: any, camera: Camera, viewportSize: Vecto
         return
     end
 
-    local rootPart = entry.RootPart :: BasePart
+    local rootPart = entry.RootPart
     local worldDist = (rootPart.Position - camera.CFrame.Position).Magnitude
     if worldDist > Config.ESP.MaxDistance then
         hideEntryVisuals(entry)
@@ -927,7 +972,7 @@ local function updateESPForEntry(entry: any, camera: Camera, viewportSize: Vecto
     end
 
     local checkPart = entry.TargetCandidates.Head or rootPart
-    local visible = isPartVisible(camera, entry.Character :: Model, checkPart)
+    local visible = isPartVisible(camera, entry.Character, checkPart)
 
     if Config.ESP.VisibleCheck and not visible then
         hideEntryVisuals(entry)
@@ -964,7 +1009,7 @@ local function updateESPForEntry(entry: any, camera: Camera, viewportSize: Vecto
 
     -- 2. Tracer (Line ESP)
     if Config.ESP.TracerESP and not isBehindCamera and rootOnScreen then
-        local originPos: Vector2
+        local originPos
         if Config.ESP.TracerOrigin == "Top" then
             originPos = Vector2.new(viewportSize.X * 0.5, 0)
         elseif Config.ESP.TracerOrigin == "Center" then
@@ -981,7 +1026,6 @@ local function updateESPForEntry(entry: any, camera: Camera, viewportSize: Vecto
     -- 3. 360-Degree Alert / Out-of-FOV Indicator
     if Config.ESP.Alert360 then
         local localSpace = camera.CFrame:PointToObjectSpace(rootPart.Position)
-        -- In camera space: +X is right, +Y is up, -Z is forward
         local screenDir = Vector2.new(localSpace.X, -localSpace.Y)
         local distFromCenter = (targetScreenPos - screenCenter).Magnitude
         local outOfFOV = isBehindCamera
@@ -1005,7 +1049,7 @@ local function updateESPForEntry(entry: any, camera: Camera, viewportSize: Vecto
 
     -- 4. Highlight ESP
     if Config.ESP.HighlightESP then
-        ensureHighlight(entry, entry.Character :: Model)
+        ensureHighlight(entry, entry.Character)
         if entry.Highlight then
             local hlColor = Config.ESP.ColorByVisibility and activeColor or Config.Colors.Highlight
             entry.Highlight.FillColor = hlColor
@@ -1037,14 +1081,14 @@ addConnection(UserInputService.InputEnded:Connect(function(input)
     end
 end))
 
-local function isAimbotInputActive(): boolean
+local function isAimbotInputActive()
     if Config.Aimbot.ActivationMode == "Always" then
         return true
     end
     return State.IsHoldingAim
 end
 
-local function validateAimEntry(entry: any, camera: Camera, screenCenter: Vector2): (boolean, BasePart?, number)
+local function validateAimEntry(entry, camera, screenCenter)
     if not entry or not isEntryAlive(entry) then
         return false, nil, math.huge
     end
@@ -1072,22 +1116,21 @@ local function validateAimEntry(entry: any, camera: Camera, screenCenter: Vector
         return false, nil, math.huge
     end
 
-    if Config.Aimbot.VisibleCheck and not isPartVisible(camera, entry.Character :: Model, part) then
+    if Config.Aimbot.VisibleCheck and not isPartVisible(camera, entry.Character, part) then
         return false, nil, math.huge
     end
 
     return true, part, screenDist
 end
 
-local function updateAimbot(camera: Camera, screenCenter: Vector2, dt: number)
+local function updateAimbot(camera, screenCenter, dt)
     if not Config.Aimbot.Enabled or not isAimbotInputActive() then
         State.CurrentAimTarget = nil
         return
     end
 
-    local chosenPart: BasePart? = nil
+    local chosenPart = nil
 
-    -- Check sticky target first
     if Config.Aimbot.StickyTarget and State.CurrentAimTarget then
         local stickyEntry = State.TrackedPlayers[State.CurrentAimTarget]
         local ok, part = validateAimEntry(stickyEntry, camera, screenCenter)
@@ -1098,11 +1141,10 @@ local function updateAimbot(camera: Camera, screenCenter: Vector2, dt: number)
         end
     end
 
-    -- Scan all tracked players for closest valid target within FOV
     if not chosenPart then
         local bestScreenDist = math.huge
-        local bestPlayer: Player? = nil
-        local bestPart: BasePart? = nil
+        local bestPlayer = nil
+        local bestPart = nil
 
         for player, entry in pairs(State.TrackedPlayers) do
             local ok, part, screenDist = validateAimEntry(entry, camera, screenCenter)
@@ -1128,16 +1170,21 @@ local function updateAimbot(camera: Camera, screenCenter: Vector2, dt: number)
     if smoothness >= 0.99 then
         camera.CFrame = targetCFrame
     else
-        -- Frame-rate-independent exponential smoothing for consistent mobile feel
         local alpha = 1 - math.pow(1 - smoothness, math.clamp(dt * 60, 0.25, 3))
         camera.CFrame = camera.CFrame:Lerp(targetCFrame, alpha)
     end
 end
 
 -- ============================================================================
--- [SECTION 8] MAIN RENDER LOOP (CACHED REFERENCES, ZERO ALLOCATIONS)
+-- [SECTION 8] MAIN RENDER LOOP (POST-CAMERA PRIORITY)
 -- ============================================================================
-addConnection(RunService.RenderStepped:Connect(function(dt: number)
+local RENDER_STEP_NAME = "TEAM_AKI_RenderStep"
+
+pcall(function()
+    RunService:UnbindFromRenderStep(RENDER_STEP_NAME)
+end)
+
+RunService:BindToRenderStep(RENDER_STEP_NAME, Enum.RenderPriority.Camera.Value + 1, function(dt)
     if State.Unloaded then
         return
     end
@@ -1159,17 +1206,17 @@ addConnection(RunService.RenderStepped:Connect(function(dt: number)
         FOVStroke.Color = Config.Colors.FOV
     end
 
-    -- Update ESP for every tracked player safely
+    -- Update Aimbot after Roblox CameraScript
+    pcall(updateAimbot, camera, screenCenter, dt)
+
+    -- Update ESP after camera update so boxes & tracers match exact frame
     for _, entry in pairs(State.TrackedPlayers) do
         local ok = pcall(updateESPForEntry, entry, camera, viewportSize, screenCenter)
         if not ok then
             hideEntryVisuals(entry)
         end
     end
-
-    -- Update Aimbot
-    pcall(updateAimbot, camera, screenCenter, dt)
-end))
+end)
 
 -- ============================================================================
 -- [SECTION 9] ADAPTIVE DEEP GLASSMORPHIC GUI (TEAM AKI)
@@ -1180,6 +1227,7 @@ MainGui.IgnoreGuiInset = true
 MainGui.ResetOnSpawn = false
 MainGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 MainGui.DisplayOrder = 1000
+protectGui(MainGui)
 MainGui.Parent = getSafeGuiParent()
 
 local Palette = {
@@ -1195,7 +1243,7 @@ local Palette = {
     Danger = Color3.fromRGB(244, 63, 94),
 }
 
-local function tween(obj: Instance, duration: number, props: {[string]: any})
+local function tween(obj, duration, props)
     local info = TweenInfo.new(duration, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
     local tw = TweenService:Create(obj, info, props)
     tw:Play()
@@ -1215,7 +1263,7 @@ local function updateResponsiveScale()
     local minDim = math.min(vp.X, vp.Y)
     local scale = 1
     if minDim < 420 then
-        scale = math.clamp(minDim / 440, 0.72, 0.95)
+        scale = math.clamp(minDim / 460, 0.68, 0.92)
     elseif minDim < 720 then
         scale = math.clamp(minDim / 680, 0.85, 1.0)
     else
@@ -1225,10 +1273,23 @@ local function updateResponsiveScale()
 end
 
 updateResponsiveScale()
-addConnection(Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(updateResponsiveScale))
-if Workspace.CurrentCamera then
-    addConnection(Workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(updateResponsiveScale))
+local viewportConn = nil
+local function bindCameraViewport()
+    if viewportConn then
+        pcall(function()
+            viewportConn:Disconnect()
+        end)
+        viewportConn = nil
+    end
+    local cam = Workspace.CurrentCamera
+    if cam then
+        viewportConn = addConnection(cam:GetPropertyChangedSignal("ViewportSize"):Connect(updateResponsiveScale))
+    end
+    updateResponsiveScale()
 end
+
+bindCameraViewport()
+addConnection(Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(bindCameraViewport))
 
 -- Main Centered Card Container
 local MainCard = Instance.new("Frame")
@@ -1252,7 +1313,6 @@ MainStroke.Transparency = 0.62
 MainStroke.Color = Palette.StrokeCool
 MainStroke.Parent = MainCard
 
--- Soft Depth Glass Sheen Gradient
 local GlassGradient = Instance.new("UIGradient")
 GlassGradient.Color = ColorSequence.new({
     ColorSequenceKeypoint.new(0, Color3.fromRGB(22, 28, 42)),
@@ -1262,7 +1322,6 @@ GlassGradient.Color = ColorSequence.new({
 GlassGradient.Rotation = 135
 GlassGradient.Parent = MainCard
 
--- Subtle inner depth shadow frame behind content
 local DepthGlow = Instance.new("Frame")
 DepthGlow.Name = "DepthGlow"
 DepthGlow.AnchorPoint = Vector2.new(0.5, 0)
@@ -1278,7 +1337,7 @@ local GlowCorner = Instance.new("UICorner")
 GlowCorner.CornerRadius = UDim.new(1, 0)
 GlowCorner.Parent = DepthGlow
 
--- Header Bar (Draggable on desktop & mobile)
+-- Header Bar (Draggable with multi-touch isolation)
 local HeaderBar = Instance.new("Frame")
 HeaderBar.Name = "HeaderBar"
 HeaderBar.Size = UDim2.new(1, 0, 0, 52)
@@ -1322,7 +1381,6 @@ SubtitleLabel.TextXAlignment = Enum.TextXAlignment.Left
 SubtitleLabel.ZIndex = 3
 SubtitleLabel.Parent = HeaderBar
 
--- Header Action Buttons (Minimize / Hide)
 local HeaderActions = Instance.new("Frame")
 HeaderActions.BackgroundTransparency = 1
 HeaderActions.AnchorPoint = Vector2.new(1, 0.5)
@@ -1338,7 +1396,7 @@ HeaderActionsLayout.VerticalAlignment = Enum.VerticalAlignment.Center
 HeaderActionsLayout.Padding = UDim.new(0, 8)
 HeaderActionsLayout.Parent = HeaderActions
 
-local function createHeaderButton(symbol: string, bg: Color3): TextButton
+local function createHeaderButton(symbol, bg)
     local btn = Instance.new("TextButton")
     btn.Size = UDim2.fromOffset(30, 30)
     btn.BackgroundColor3 = bg
@@ -1367,23 +1425,22 @@ end
 local MinimizeBtn = createHeaderButton("-", Palette.ElevatedSurface)
 local UnloadHeaderBtn = createHeaderButton("×", Palette.Danger)
 
--- Dragging support for MainCard via HeaderBar
 do
-    local dragging = false
-    local dragStart: Vector3? = nil
-    local startPos: UDim2? = nil
+    local activeInput = nil
+    local dragStart = nil
+    local startPos = nil
 
     HeaderBar.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = true
+        if not activeInput and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+            activeInput = input
             dragStart = input.Position
             startPos = MainCard.Position
         end
     end)
 
     addConnection(UserInputService.InputChanged:Connect(function(input)
-        if dragging and dragStart and startPos then
-            if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+        if activeInput and dragStart and startPos then
+            if input == activeInput or (activeInput.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseMovement) then
                 local scale = math.max(RootScale.Scale, 0.5)
                 local delta = (input.Position - dragStart) / scale
                 MainCard.Position = UDim2.new(
@@ -1397,13 +1454,13 @@ do
     end))
 
     addConnection(UserInputService.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = false
+        if input == activeInput then
+            activeInput = nil
         end
     end))
 end
 
--- Tab Navigation Bar (Centered, Equal Grid)
+-- Tab Navigation Bar
 local TabBar = Instance.new("Frame")
 TabBar.Name = "TabBar"
 TabBar.AnchorPoint = Vector2.new(0.5, 0)
@@ -1450,11 +1507,11 @@ ContentHolder.BackgroundTransparency = 1
 ContentHolder.ZIndex = 2
 ContentHolder.Parent = MainCard
 
-local TabPages: {[string]: ScrollingFrame} = {}
-local TabButtons: {[string]: TextButton} = {}
+local TabPages = {}
+local TabButtons = {}
 local TabOrder = {"Aimbot", "ESP", "Colors", "System"}
 
-local function createTabPage(name: string): ScrollingFrame
+local function createTabPage(name)
     local page = Instance.new("ScrollingFrame")
     page.Name = name .. "Page"
     page.Size = UDim2.fromScale(1, 1)
@@ -1486,7 +1543,7 @@ local function createTabPage(name: string): ScrollingFrame
     return page
 end
 
-local function switchTab(tabName: string)
+local function switchTab(tabName)
     Config.UI.ActiveTab = tabName
     for name, page in pairs(TabPages) do
         page.Visible = (name == tabName)
@@ -1507,7 +1564,7 @@ for idx, tabName in ipairs(TabOrder) do
     local btn = Instance.new("TextButton")
     btn.Name = tabName .. "Tab"
     btn.LayoutOrder = idx
-    btn.Font = Enum.Font.GothamSemibold
+    btn.Font = Enum.Font.GothamMedium
     btn.Text = tabName
     btn.TextSize = 12
     btn.AutoButtonColor = false
@@ -1532,9 +1589,9 @@ end
 -- ============================================================================
 -- [SECTION 10] MODULAR UI COMPONENT BUILDERS (CENTERED & ALIGNED)
 -- ============================================================================
-local SyncCallbacks: {() -> ()} = {}
+local SyncCallbacks = {}
 
-local function createCardRow(parent: Instance, height: number, order: number): Frame
+local function createCardRow(parent, height, order)
     local card = Instance.new("Frame")
     card.LayoutOrder = order
     card.Size = UDim2.new(1, 0, 0, height)
@@ -1557,21 +1614,14 @@ local function createCardRow(parent: Instance, height: number, order: number): F
     return card
 end
 
-local function addToggle(
-    parent: Instance,
-    order: number,
-    title: string,
-    subtitle: string?,
-    getter: () -> boolean,
-    setter: (boolean) -> ()
-)
+local function addToggle(parent, order, title, subtitle, getter, setter)
     local row = createCardRow(parent, subtitle and 54 or 44, order)
 
     local label = Instance.new("TextLabel")
     label.BackgroundTransparency = 1
     label.Position = UDim2.fromOffset(14, subtitle and 8 or 0)
     label.Size = UDim2.new(1, -80, 0, subtitle and 20 or 44)
-    label.Font = Enum.Font.GothamSemibold
+    label.Font = Enum.Font.GothamMedium
     label.Text = title
     label.TextSize = 13
     label.TextColor3 = Palette.TextPrimary
@@ -1619,7 +1669,7 @@ local function addToggle(
     knobCorner.CornerRadius = UDim.new(1, 0)
     knobCorner.Parent = knob
 
-    local function sync(instant: boolean?)
+    local function sync(instant)
         local on = getter()
         local targetTrack = on and Palette.Accent or Palette.ToggleOff
         local targetKnobPos = on and UDim2.new(1, -21, 0.5, 0) or UDim2.new(0, 3, 0.5, 0)
@@ -1643,24 +1693,14 @@ local function addToggle(
     end)
 end
 
-local function addSlider(
-    parent: Instance,
-    order: number,
-    title: string,
-    minVal: number,
-    maxVal: number,
-    step: number,
-    formatFn: (number) -> string,
-    getter: () -> number,
-    setter: (number) -> ()
-)
+local function addSlider(parent, order, title, minVal, maxVal, step, formatFn, getter, setter)
     local row = createCardRow(parent, 60, order)
 
     local label = Instance.new("TextLabel")
     label.BackgroundTransparency = 1
     label.Position = UDim2.fromOffset(14, 8)
     label.Size = UDim2.new(0.65, -14, 0, 20)
-    label.Font = Enum.Font.GothamSemibold
+    label.Font = Enum.Font.GothamMedium
     label.Text = title
     label.TextSize = 13
     label.TextColor3 = Palette.TextPrimary
@@ -1738,9 +1778,9 @@ local function addSlider(
     sync()
     table.insert(SyncCallbacks, sync)
 
-    local dragging = false
+    local activeInput = nil
 
-    local function updateFromInput(posX: number)
+    local function updateFromInput(posX)
         local absPos = track.AbsolutePosition.X
         local absSize = math.max(track.AbsoluteSize.X, 1)
         local ratio = math.clamp((posX - absPos) / absSize, 0, 1)
@@ -1752,42 +1792,37 @@ local function addSlider(
     end
 
     trackHitbox.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = true
+        if not activeInput and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+            activeInput = input
             updateFromInput(input.Position.X)
         end
     end)
 
     addConnection(UserInputService.InputChanged:Connect(function(input)
-        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-            updateFromInput(input.Position.X)
+        if activeInput then
+            if input == activeInput or (activeInput.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseMovement) then
+                updateFromInput(input.Position.X)
+            end
         end
     end))
 
     addConnection(UserInputService.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = false
+        if input == activeInput then
+            activeInput = nil
         end
     end))
 
     return sync
 end
 
-local function addSelector(
-    parent: Instance,
-    order: number,
-    title: string,
-    options: {string},
-    getter: () -> string,
-    setter: (string) -> ()
-)
+local function addSelector(parent, order, title, options, getter, setter)
     local row = createCardRow(parent, 66, order)
 
     local label = Instance.new("TextLabel")
     label.BackgroundTransparency = 1
     label.Position = UDim2.fromOffset(14, 8)
     label.Size = UDim2.new(1, -28, 0, 18)
-    label.Font = Enum.Font.GothamSemibold
+    label.Font = Enum.Font.GothamMedium
     label.Text = title
     label.TextSize = 13
     label.TextColor3 = Palette.TextPrimary
@@ -1817,7 +1852,7 @@ local function addSelector(
     grid.SortOrder = Enum.SortOrder.LayoutOrder
     grid.Parent = bar
 
-    local btns: {[string]: TextButton} = {}
+    local btns = {}
 
     local function sync()
         local active = getter()
@@ -1835,7 +1870,7 @@ local function addSelector(
         local b = Instance.new("TextButton")
         b.LayoutOrder = i
         b.Text = opt
-        b.Font = Enum.Font.GothamSemibold
+        b.Font = Enum.Font.GothamMedium
         b.TextSize = 11
         b.AutoButtonColor = false
         b.BorderSizePixel = 0
@@ -1989,13 +2024,12 @@ end)
 local ColorsPage = TabPages.Colors
 local ColorKeys = {"Enemy", "Visible", "Hidden", "Tracer", "Alert360", "Highlight", "FOV"}
 
--- Target color channel selector (2-row clean grid inside card)
 local ChannelCard = createCardRow(ColorsPage, 84, 1)
 local ChannelTitle = Instance.new("TextLabel")
 ChannelTitle.BackgroundTransparency = 1
 ChannelTitle.Position = UDim2.fromOffset(14, 8)
 ChannelTitle.Size = UDim2.new(1, -70, 0, 18)
-ChannelTitle.Font = Enum.Font.GothamSemibold
+ChannelTitle.Font = Enum.Font.GothamMedium
 ChannelTitle.Text = "Color Channel"
 ChannelTitle.TextSize = 13
 ChannelTitle.TextColor3 = Palette.TextPrimary
@@ -2036,8 +2070,10 @@ ChannelGrid.HorizontalAlignment = Enum.HorizontalAlignment.Center
 ChannelGrid.SortOrder = Enum.SortOrder.LayoutOrder
 ChannelGrid.Parent = ChannelGridHolder
 
-local channelBtns: {[string]: TextButton} = {}
-local syncRed, syncGreen, syncBlue: () -> (), () -> (), () -> ()
+local channelBtns = {}
+local syncRed = nil
+local syncGreen = nil
+local syncBlue = nil
 
 local function refreshColorControls()
     local c = Config.Colors[Config.UI.SelectedColorKey]
@@ -2059,7 +2095,7 @@ for idx, key in ipairs(ColorKeys) do
     local b = Instance.new("TextButton")
     b.LayoutOrder = idx
     b.Text = key
-    b.Font = Enum.Font.GothamSemibold
+    b.Font = Enum.Font.GothamMedium
     b.TextSize = 10
     b.AutoButtonColor = false
     b.BorderSizePixel = 0
@@ -2078,12 +2114,12 @@ for idx, key in ipairs(ColorKeys) do
     channelBtns[key] = b
 end
 
-local function updateChannelRGB(r: number?, g: number?, b: number?)
+local function updateChannelRGB(r, g, b)
     local key = Config.UI.SelectedColorKey
     local cur = Config.Colors[key]
-    local nr = r ~= nil and r or math.round(cur.R * 255)
-    local ng = g ~= nil and g or math.round(cur.G * 255)
-    local nb = b ~= nil and b or math.round(cur.B * 255)
+    local nr = (r ~= nil) and r or math.round(cur.R * 255)
+    local ng = (g ~= nil) and g or math.round(cur.G * 255)
+    local nb = (b ~= nil) and b or math.round(cur.B * 255)
     Config.Colors[key] = Color3.fromRGB(nr, ng, nb)
     LiveSwatch.BackgroundColor3 = Config.Colors[key]
     notifyColorUpdated()
@@ -2113,13 +2149,12 @@ end, function(v)
     updateChannelRGB(nil, nil, math.round(v))
 end)
 
--- Preset Swatches Card
 local SwatchesCard = createCardRow(ColorsPage, 66, 5)
 local SwatchTitle = Instance.new("TextLabel")
 SwatchTitle.BackgroundTransparency = 1
 SwatchTitle.Position = UDim2.fromOffset(14, 8)
 SwatchTitle.Size = UDim2.new(1, -28, 0, 18)
-SwatchTitle.Font = Enum.Font.GothamSemibold
+SwatchTitle.Font = Enum.Font.GothamMedium
 SwatchTitle.Text = "Quick Color Presets"
 SwatchTitle.TextSize = 13
 SwatchTitle.TextColor3 = Palette.TextPrimary
@@ -2200,17 +2235,22 @@ end, function(v)
     Config.ESP.AlertRingRadius = v
 end)
 
-local ActionCard = createCardRow(SystemPage, 52, 3)
+local ActionCard = createCardRow(SystemPage, 54, 3)
+local ActionPad = Instance.new("UIPadding")
+ActionPad.PaddingLeft = UDim.new(0, 14)
+ActionPad.PaddingRight = UDim.new(0, 14)
+ActionPad.Parent = ActionCard
+
 local ActionGrid = Instance.new("UIGridLayout")
-ActionGrid.CellSize = UDim2.new(0.5, -10, 0, 34)
-ActionGrid.CellPadding = UDim2.fromOffset(8, 0)
+ActionGrid.CellSize = UDim2.new(0.5, -5, 0, 34)
+ActionGrid.CellPadding = UDim2.fromOffset(10, 0)
 ActionGrid.HorizontalAlignment = Enum.HorizontalAlignment.Center
 ActionGrid.VerticalAlignment = Enum.VerticalAlignment.Center
 ActionGrid.Parent = ActionCard
 
 local ResetBtn = Instance.new("TextButton")
 ResetBtn.Text = "Reset Defaults"
-ResetBtn.Font = Enum.Font.GothamSemibold
+ResetBtn.Font = Enum.Font.GothamMedium
 ResetBtn.TextSize = 12
 ResetBtn.TextColor3 = Palette.TextPrimary
 ResetBtn.BackgroundColor3 = Palette.ElevatedSurface
@@ -2225,7 +2265,7 @@ ResetCorner.Parent = ResetBtn
 
 local UnloadBtn = Instance.new("TextButton")
 UnloadBtn.Text = "Unload TEAM AKI"
-UnloadBtn.Font = Enum.Font.GothamSemibold
+UnloadBtn.Font = Enum.Font.GothamMedium
 UnloadBtn.TextSize = 12
 UnloadBtn.TextColor3 = Palette.TextPrimary
 UnloadBtn.BackgroundColor3 = Palette.Danger
@@ -2268,7 +2308,7 @@ ToggleStroke.Transparency = 0.35
 ToggleStroke.Color = Palette.Accent
 ToggleStroke.Parent = MobileToggle
 
-local function setPanelVisible(visible: boolean)
+local function setPanelVisible(visible)
     Config.UI.Visible = visible
     if visible then
         MainCard.Visible = true
@@ -2284,7 +2324,11 @@ local function setPanelVisible(visible: boolean)
             Size = UDim2.fromOffset(440, 360),
             BackgroundTransparency = 0.6,
         })
-        tw.Completed:Once(function()
+        local completedConn
+        completedConn = tw.Completed:Connect(function()
+            if completedConn then
+                completedConn:Disconnect()
+            end
             if not Config.UI.Visible then
                 MainCard.Visible = false
             end
@@ -2293,16 +2337,16 @@ local function setPanelVisible(visible: boolean)
     end
 end
 
--- Distinguish tap vs drag cleanly on mobile & desktop
+-- Distinguish tap vs drag cleanly on mobile & desktop (multi-touch isolated)
 do
-    local dragging = false
+    local activeInput = nil
     local movedDist = 0
-    local dragStart: Vector3? = nil
-    local startPos: UDim2? = nil
+    local dragStart = nil
+    local startPos = nil
 
     MobileToggle.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = true
+        if not activeInput and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+            activeInput = input
             movedDist = 0
             dragStart = input.Position
             startPos = MobileToggle.Position
@@ -2310,8 +2354,8 @@ do
     end)
 
     addConnection(UserInputService.InputChanged:Connect(function(input)
-        if dragging and dragStart and startPos then
-            if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+        if activeInput and dragStart and startPos then
+            if input == activeInput or (activeInput.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseMovement) then
                 local scale = math.max(RootScale.Scale, 0.5)
                 local delta = (input.Position - dragStart) / scale
                 movedDist = delta.Magnitude
@@ -2328,8 +2372,8 @@ do
     end))
 
     addConnection(UserInputService.InputEnded:Connect(function(input)
-        if dragging and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
-            dragging = false
+        if input == activeInput then
+            activeInput = nil
             if movedDist <= 6 then
                 setPanelVisible(not Config.UI.Visible)
             end
@@ -2341,7 +2385,6 @@ MinimizeBtn.Activated:Connect(function()
     setPanelVisible(false)
 end)
 
--- Keyboard quick toggle for PC/tablet keyboards (RightShift)
 addConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
     if not gameProcessed and input.KeyCode == Enum.KeyCode.RightShift then
         setPanelVisible(not Config.UI.Visible)
@@ -2350,13 +2393,13 @@ end))
 
 ResetBtn.Activated:Connect(function()
     for k, v in pairs(DefaultConfig.Aimbot) do
-        (Config.Aimbot :: any)[k] = v
+        Config.Aimbot[k] = v
     end
     for k, v in pairs(DefaultConfig.ESP) do
-        (Config.ESP :: any)[k] = v
+        Config.ESP[k] = v
     end
     for k, v in pairs(DefaultConfig.Colors) do
-        (Config.Colors :: any)[k] = v
+        Config.Colors[k] = v
     end
     for _, sync in ipairs(SyncCallbacks) do
         pcall(sync)
@@ -2370,12 +2413,16 @@ local function unloadScript()
     end
     State.Unloaded = true
 
+    pcall(function()
+        RunService:UnbindFromRenderStep(RENDER_STEP_NAME)
+    end)
+
     for _, conn in ipairs(State.Connections) do
         pcall(function()
             conn:Disconnect()
         end)
     end
-    table.clear(State.Connections)
+    clearTable(State.Connections)
 
     local trackedCopy = {}
     for player in pairs(State.TrackedPlayers) do
@@ -2385,6 +2432,9 @@ local function unloadScript()
         untrackPlayer(player)
     end
 
+    pcall(function()
+        HighlightContainer:Destroy()
+    end)
     pcall(function()
         OverlayGui:Destroy()
     end)
