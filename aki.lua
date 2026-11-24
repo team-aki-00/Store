@@ -41,6 +41,10 @@ local StatsService = nil
 pcall(function()
     StatsService = getService("Stats")
 end)
+local VirtualInputManager = nil
+pcall(function()
+    VirtualInputManager = getService("VirtualInputManager")
+end)
 
 local LocalPlayer = Players.LocalPlayer
 while not LocalPlayer do
@@ -106,6 +110,19 @@ local Config = {
         StickyTarget = true,
         MaxDistance = 2000,
     },
+    TriggerBot = {
+        Enabled = false,
+        FireMode = "Auto",              -- "Auto" | "Tool Only" | "Mouse1" | "VirtualInput"
+        TargetFilter = "Any Part",      -- "Any Part" | "Head & Chest" | "Head Only"
+        HoldToFire = false,             -- true = hold trigger while locked; false = timed tap shots
+        ReactionDelay = 0.03,           -- 0.00 .. 0.30 seconds
+        ShotCooldown = 0.09,            -- 0.02 .. 0.60 seconds
+        CrosshairTolerance = 6,         -- 0 .. 28 px proximity sweep when ray misses edge
+        TeamCheck = true,
+        VisibleCheck = true,
+        MaxDistance = 1200,
+        ShowIndicator = true,
+    },
     ESP = {
         Enabled = true,
         RenderEngine = "ScreenGui",     -- "ScreenGui" (100% reliable mobile) | "Drawing"
@@ -149,11 +166,14 @@ local Config = {
         SelectedColorKey = "Visible",
         ShowMobileAimButton = true,
         MobileAimLocked = false,
+        ShowMobileTriggerButton = true,
+        MobileTriggerLocked = false,
     },
 }
 
 local DefaultConfig = {
     Aimbot = shallowClone(Config.Aimbot),
+    TriggerBot = shallowClone(Config.TriggerBot),
     ESP = shallowClone(Config.ESP),
     Resolver = shallowClone(Config.Resolver),
     Colors = shallowClone(Config.Colors),
@@ -173,6 +193,11 @@ local State = {
     Camera = Workspace.CurrentCamera,
     CurrentAimTarget = nil,
     IsHoldingAim = false,
+    TriggerTarget = nil,
+    TriggerAcquireTime = 0,
+    LastTriggerFire = 0,
+    TriggerHolding = false,
+    TriggerToolRef = nil,
     ColorListeners = {},
     FrameIndex = 0,
     LastRenderTick = 0,
@@ -321,6 +346,28 @@ FOVStroke.Thickness = Config.Aimbot.FOVThickness
 FOVStroke.Transparency = 0.2
 FOVStroke.Color = Config.Colors.FOV
 FOVStroke.Parent = FOVRingFrame
+
+local TriggerDot = Instance.new("Frame")
+TriggerDot.Name = "TriggerCrosshairDot"
+TriggerDot.AnchorPoint = Vector2.new(0.5, 0.5)
+TriggerDot.Position = UDim2.fromScale(0.5, 0.5)
+TriggerDot.Size = UDim2.fromOffset(7, 7)
+TriggerDot.BackgroundColor3 = Color3.fromRGB(251, 146, 60)
+TriggerDot.BackgroundTransparency = 0.15
+TriggerDot.BorderSizePixel = 0
+TriggerDot.Visible = false
+TriggerDot.ZIndex = 6
+TriggerDot.Parent = OverlayGui
+
+local TriggerDotCorner = Instance.new("UICorner")
+TriggerDotCorner.CornerRadius = UDim.new(1, 0)
+TriggerDotCorner.Parent = TriggerDot
+
+local TriggerDotStroke = Instance.new("UIStroke")
+TriggerDotStroke.Thickness = 1.2
+TriggerDotStroke.Color = Color3.fromRGB(11, 13, 20)
+TriggerDotStroke.Transparency = 0.2
+TriggerDotStroke.Parent = TriggerDot
 
 local function createRegistryVisualBundle()
     local guiRoot = Instance.new("Folder")
@@ -823,13 +870,79 @@ local RIG_PART_NAMES = {
     ["Right Leg"] = true,
 }
 
-local CUSTOM_CHAR_FOLDERS = {"Players", "Characters", "Entities", "ActivePlayers", "Rigs", "GamePlayers"}
+local CUSTOM_CHAR_FOLDERS = {
+    "Players", "Characters", "Entities", "ActivePlayers", "Rigs",
+    "GamePlayers", "Living", "Bots", "Units", "Models", "WorkspacePlayers", "Targets",
+}
 local SAFETY_SYNC_INTERVAL = 1.0
 
 local ScheduleReload
 local ReloadAllSystems
 
-local function resolveCharacterForPlayer(player)
+local function isCandidateModelForPlayer(model, player)
+    if not model or not model:IsA("Model") or not model:IsDescendantOf(Workspace) then
+        return false, false
+    end
+    if not model:FindFirstChildWhichIsA("BasePart", true) then
+        return false, false
+    end
+
+    local matched = false
+    local name = model.Name
+    if name == player.Name or name == player.DisplayName or name == tostring(player.UserId) then
+        matched = true
+    end
+    if not matched then
+        local uid = model:GetAttribute("UserId") or model:GetAttribute("PlayerId") or model:GetAttribute("OwnerId")
+        if uid == player.UserId then
+            matched = true
+        end
+    end
+    if not matched then
+        local ownerVal = model:FindFirstChild("Player") or model:FindFirstChild("Owner") or model:FindFirstChild("Creator")
+        if ownerVal and ownerVal:IsA("ObjectValue") and ownerVal.Value == player then
+            matched = true
+        end
+    end
+    if not matched then
+        return false, false
+    end
+
+    local hum = model:FindFirstChildOfClass("Humanoid")
+    local isAlive = (hum == nil) or (hum.Health > 0) or (model:GetAttribute("Alive") == true)
+    return true, isAlive
+end
+
+local function scanContainerForPlayer(container, player)
+    if not container then
+        return nil
+    end
+    local fallback = nil
+    local byName = container:FindFirstChild(player.Name) or container:FindFirstChild(player.DisplayName)
+    if byName then
+        local ok, alive = isCandidateModelForPlayer(byName, player)
+        if ok then
+            if alive then
+                return byName
+            end
+            fallback = byName
+        end
+    end
+    for _, child in ipairs(container:GetChildren()) do
+        if child:IsA("Model") then
+            local ok, alive = isCandidateModelForPlayer(child, player)
+            if ok then
+                if alive then
+                    return child
+                end
+                fallback = fallback or child
+            end
+        end
+    end
+    return fallback
+end
+
+local function resolveCharacterForPlayer(player, allowDeepScan)
     local directChar = player.Character
     if directChar and directChar.Parent and directChar:IsDescendantOf(Workspace) then
         if directChar:FindFirstChildWhichIsA("BasePart", true) then
@@ -838,37 +951,41 @@ local function resolveCharacterForPlayer(player)
     end
 
     if not Config.Resolver.CustomContainerScan then
-        if directChar and directChar.Parent then
+        if directChar and directChar.Parent and directChar:IsDescendantOf(Workspace) then
             return directChar
         end
         return nil
     end
 
-    local targetName = player.Name
-    local targetDisplay = player.DisplayName
-    local targetUserId = player.UserId
-
     for _, folderName in ipairs(CUSTOM_CHAR_FOLDERS) do
-        local container = Workspace:FindFirstChild(folderName)
-        if container then
-            local byName = container:FindFirstChild(targetName) or container:FindFirstChild(targetDisplay)
-            if byName and byName:IsA("Model") and byName:FindFirstChildWhichIsA("BasePart", true) then
-                return byName
-            end
-            for _, child in ipairs(container:GetChildren()) do
-                if child:IsA("Model") then
-                    local uid = child:GetAttribute("UserId") or child:GetAttribute("PlayerId") or child:GetAttribute("OwnerId")
-                    if uid == targetUserId and child:FindFirstChildWhichIsA("BasePart", true) then
+        local found = scanContainerForPlayer(Workspace:FindFirstChild(folderName), player)
+        if found then
+            return found
+        end
+    end
+
+    local wsDirect = Workspace:FindFirstChild(player.Name) or Workspace:FindFirstChild(player.DisplayName)
+    if wsDirect and wsDirect:IsA("Model") and (wsDirect:FindFirstChildOfClass("Humanoid") or wsDirect.PrimaryPart or wsDirect:FindFirstChild("HumanoidRootPart") or wsDirect:FindFirstChild("Head")) then
+        return wsDirect
+    end
+
+    if allowDeepScan then
+        for _, child in ipairs(Workspace:GetChildren()) do
+            if child:IsA("Folder") or child:IsA("Model") then
+                if child ~= directChar then
+                    local okSelf, aliveSelf = isCandidateModelForPlayer(child, player)
+                    if okSelf and aliveSelf then
                         return child
+                    end
+                    if #child:GetChildren() <= 200 then
+                        local nested = scanContainerForPlayer(child, player)
+                        if nested then
+                            return nested
+                        end
                     end
                 end
             end
         end
-    end
-
-    local wsChild = Workspace:FindFirstChild(targetName) or Workspace:FindFirstChild(targetDisplay)
-    if wsChild and wsChild:IsA("Model") and (wsChild:FindFirstChildOfClass("Humanoid") or wsChild.PrimaryPart or wsChild:FindFirstChild("HumanoidRootPart") or wsChild:FindFirstChild("Head")) then
-        return wsChild
     end
 
     if directChar and directChar.Parent and directChar:IsDescendantOf(Workspace) then
@@ -1083,6 +1200,7 @@ local function registerPlayerEntry(player)
         Visuals = bundle,
         NeedsRescan = false,
         LastScanTime = 0,
+        LastDeepScan = 0,
         LastTrackedPart = nil,
         LastTrackedPos = nil,
         LastKnownWorldPos = nil,
@@ -1109,11 +1227,13 @@ local function registerPlayerEntry(player)
         end
     end))
 
-    local initialChar = resolveCharacterForPlayer(player)
+    local initialChar = resolveCharacterForPlayer(player, true)
     if initialChar then
         bindCharacterToEntry(entry, initialChar)
     end
 end
+
+local releaseTriggerFire = function() end
 
 local function clearLocalCharacterState()
     State.LocalCharacter = nil
@@ -1122,6 +1242,9 @@ local function clearLocalCharacterState()
     State.LocalAlive = false
     State.LastLocalPos = nil
     State.CurrentAimTarget = nil
+    State.TriggerTarget = nil
+    State.TriggerAcquireTime = 0
+    releaseTriggerFire()
 
     for _, c in ipairs(State.LocalConns) do
         pcall(function()
@@ -1258,7 +1381,7 @@ ReloadAllSystems = function(reason, hardReset)
                     entry.AlertArrow = rebuilt.AlertArrow
                 end
 
-                local liveChar = resolveCharacterForPlayer(player)
+                local liveChar = resolveCharacterForPlayer(player, true)
                 if liveChar and liveChar.Parent then
                     if entry.Character ~= liveChar then
                         bindCharacterToEntry(entry, liveChar)
@@ -1340,18 +1463,6 @@ end
 -- ============================================================================
 -- [SECTION 5] FFA-SAFE TEAM RESOLVER, SHARED ELIGIBILITY & VISIBILITY PIPELINE
 -- ============================================================================
-local function readTeamAttribute(inst)
-    if not inst then
-        return nil
-    end
-    local v = inst:GetAttribute("Team")
-    if v == nil then v = inst:GetAttribute("TeamId") end
-    if v == nil then v = inst:GetAttribute("TeamID") end
-    if v == nil then v = inst:GetAttribute("Faction") end
-    if v == nil then v = inst:GetAttribute("Squad") end
-    return v
-end
-
 local NON_COMBAT_TEAM_NAMES = {
     lobby = true,
     spectator = true,
@@ -1376,7 +1487,31 @@ local NON_COMBAT_TEAM_NAMES = {
     ["in-game"] = true,
     neutral = true,
     none = true,
+    default = true,
+    ["0"] = true,
+    ["-1"] = true,
+    ["false"] = true,
+    [""] = true,
 }
+
+local function readTeamAttribute(inst)
+    if not inst then
+        return nil
+    end
+    local v = inst:GetAttribute("Team")
+    if v == nil then v = inst:GetAttribute("TeamId") end
+    if v == nil then v = inst:GetAttribute("TeamID") end
+    if v == nil then v = inst:GetAttribute("Faction") end
+    if v == nil then v = inst:GetAttribute("Squad") end
+    if v == nil or typeof(v) == "boolean" then
+        return nil
+    end
+    local key = string.lower(tostring(v))
+    if NON_COMBAT_TEAM_NAMES[key] then
+        return nil
+    end
+    return v
+end
 
 local function isCombatTeam(teamObj)
     if not teamObj then
@@ -1391,7 +1526,10 @@ local function playerHasLivingWorkspaceChar(plr)
     if ch and ch.Parent and ch:IsDescendantOf(Workspace) then
         local hum = ch:FindFirstChildOfClass("Humanoid")
         if hum and hum.Health <= 0 then
-            return false
+            local customAlive = (ch:GetAttribute("Alive") == true) or (type(ch:GetAttribute("Health")) == "number" and ch:GetAttribute("Health") > 0)
+            if not customAlive then
+                return false
+            end
         end
         return ch:FindFirstChildWhichIsA("BasePart", true) ~= nil
     end
@@ -1409,8 +1547,6 @@ local function refreshDetectedTeamScheme()
 
     local distinctTeams = {}
     local teamCount = 0
-    local distinctColors = {}
-    local colorCount = 0
     local distinctAttrs = {}
     local attrCount = 0
 
@@ -1422,18 +1558,11 @@ local function refreshDetectedTeamScheme()
                     teamCount = teamCount + 1
                 end
             end
-            if not plr.Neutral and (plr.Team == nil or isCombatTeam(plr.Team)) then
-                local colKey = plr.TeamColor.Name
-                if not distinctColors[colKey] then
-                    distinctColors[colKey] = true
-                    colorCount = colorCount + 1
-                end
-            end
             local attr = readTeamAttribute(plr)
             if attr == nil and plr.Character then
                 attr = readTeamAttribute(plr.Character)
             end
-            if attr ~= nil and tostring(attr) ~= "" then
+            if attr ~= nil then
                 local ak = tostring(attr)
                 if not distinctAttrs[ak] then
                     distinctAttrs[ak] = true
@@ -1443,12 +1572,10 @@ local function refreshDetectedTeamScheme()
         end
     end
 
-    if teamCount >= 2 then
+    if teamCount >= 2 and isCombatTeam(LocalPlayer.Team) and not LocalPlayer.Neutral then
         State.DetectedTeamScheme = "Team"
     elseif attrCount >= 2 then
         State.DetectedTeamScheme = "Attribute"
-    elseif colorCount >= 2 and #Teams:GetTeams() >= 2 then
-        State.DetectedTeamScheme = "TeamColor"
     else
         State.DetectedTeamScheme = "FFA"
     end
@@ -1460,11 +1587,6 @@ local function rawSchemeTeammateCheck(scheme, player, entry)
     if scheme == "Team" then
         if isCombatTeam(LocalPlayer.Team) and isCombatTeam(player.Team) and not LocalPlayer.Neutral and not player.Neutral then
             return LocalPlayer.Team == player.Team
-        end
-        return false
-    elseif scheme == "TeamColor" then
-        if not LocalPlayer.Neutral and not player.Neutral then
-            return LocalPlayer.TeamColor == player.TeamColor
         end
         return false
     elseif scheme == "Attribute" then
@@ -1568,7 +1690,10 @@ local function isEntryAlive(entry)
     local hum = entry.Humanoid
     if hum and hum.Parent then
         if hum.Health <= 0 then
-            return false
+            local customAlive = (char:GetAttribute("Alive") == true) or (type(char:GetAttribute("Health")) == "number" and char:GetAttribute("Health") > 0)
+            if not customAlive then
+                return false
+            end
         end
     else
         if char:GetAttribute("Alive") == false or entry.Player:GetAttribute("Alive") == false then
@@ -1804,15 +1929,19 @@ local function computeScreenBox(camera, entry, rootVP, worldDist)
 
     if anyInFront and minX < maxX and minY < maxY then
         local pad = 3
-        local w = math.max((maxX - minX) + pad * 2, 8)
-        local h = math.max((maxY - minY) + pad * 2, 12)
         local vpSize = camera.ViewportSize
-        if w <= vpSize.X * 1.4 and h <= vpSize.Y * 1.4 then
-            return true, minX - pad, minY - pad, w, h
+        local x1 = math.clamp(minX - pad, -40, vpSize.X + 40)
+        local y1 = math.clamp(minY - pad, -40, vpSize.Y + 40)
+        local x2 = math.clamp(maxX + pad, -40, vpSize.X + 40)
+        local y2 = math.clamp(maxY + pad, -40, vpSize.Y + 40)
+        local w = x2 - x1
+        local h = y2 - y1
+        if w >= 8 and h >= 12 and w <= vpSize.X * 1.4 and h <= vpSize.Y * 1.4 then
+            return true, x1, y1, w, h
         end
     end
 
-    -- Fallback proportional 2D box anchored around RootPart projection
+    -- Fallback proportional 2D box anchored around RootPart (or Head if close) projection
     if rootVP and rootVP.Z > 0 then
         local h = math.clamp(2100 / math.max(worldDist, 4), 14, 320)
         local w = h * 0.58
@@ -1856,7 +1985,13 @@ local function updateAllESP(camera, viewportSize, screenCenter)
                 local tracerColor = Config.ESP.ColorByVisibility and visState.activeColor or Config.Colors.Tracer
 
                 local rootVP, rootOnScreen = camera:WorldToViewportPoint(rootPart.Position)
-                local isBehind = rootVP.Z <= 0
+                local headCheckPart = entry.Head or entry.Torso
+                local headInFront = false
+                if headCheckPart and headCheckPart.Parent then
+                    local hvp = camera:WorldToViewportPoint(headCheckPart.Position)
+                    headInFront = hvp.Z > 0
+                end
+                local isBehind = (rootVP.Z <= 0) and (not headInFront)
                 local screenPos = Vector2.new(rootVP.X, rootVP.Y)
 
                 local boxValid, bx, by, bw, bh = false, 0, 0, 0, 0
@@ -2218,6 +2353,270 @@ local function updateAimbot(camera, screenCenter, dt)
     end
 end
 
+-- Advanced Trigger Bot Engine (Raycast + Tolerance Sweep + Multi-Executor Fire)
+releaseTriggerFire = function()
+    if not State.TriggerHolding then
+        return
+    end
+    State.TriggerHolding = false
+    if State.TriggerToolRef and State.TriggerToolRef.Parent then
+        pcall(function()
+            State.TriggerToolRef:Deactivate()
+        end)
+    end
+    State.TriggerToolRef = nil
+    if type(mouse1release) == "function" then
+        pcall(mouse1release)
+    end
+    if VirtualInputManager then
+        pcall(function()
+            local cam = State.Camera or Workspace.CurrentCamera
+            local vp = cam and cam.ViewportSize or Vector2.new(640, 360)
+            VirtualInputManager:SendMouseButtonEvent(vp.X * 0.5, vp.Y * 0.5, 0, false, game, 1)
+        end)
+    end
+end
+
+local function triggerOnceOrPress(screenCenter, holdMode)
+    local mode = Config.TriggerBot.FireMode
+    local localChar = State.LocalCharacter or LocalPlayer.Character
+    local equippedTool = localChar and localChar:FindFirstChildOfClass("Tool") or nil
+    local fired = false
+
+    if (mode == "Auto" or mode == "Tool Only") and equippedTool then
+        local ok = pcall(function()
+            equippedTool:Activate()
+        end)
+        if ok then
+            State.TriggerToolRef = equippedTool
+            fired = true
+        end
+    end
+
+    if (mode == "Auto" or mode == "Mouse1") then
+        if holdMode and type(mouse1press) == "function" then
+            pcall(mouse1press)
+            fired = true
+        elseif (not holdMode) and type(mouse1click) == "function" then
+            pcall(mouse1click)
+            fired = true
+        elseif type(mouse1press) == "function" then
+            pcall(mouse1press)
+            task.delay(0.025, function()
+                if type(mouse1release) == "function" then
+                    pcall(mouse1release)
+                end
+            end)
+            fired = true
+        end
+    end
+
+    if mode == "VirtualInput" or (mode == "Auto" and not fired) then
+        if VirtualInputManager then
+            pcall(function()
+                VirtualInputManager:SendMouseButtonEvent(screenCenter.X, screenCenter.Y, 0, true, game, 1)
+                if not holdMode then
+                    task.delay(0.025, function()
+                        pcall(function()
+                            VirtualInputManager:SendMouseButtonEvent(screenCenter.X, screenCenter.Y, 0, false, game, 1)
+                        end)
+                    end)
+                end
+            end)
+            fired = true
+        end
+    end
+
+    State.TriggerHolding = holdMode and fired
+end
+
+local function partMatchesTriggerFilter(part, entry)
+    local filter = Config.TriggerBot.TargetFilter
+    if filter == "Any Part" then
+        return true
+    end
+    local n = part.Name
+    if filter == "Head Only" then
+        return part == entry.Head or n == "Head"
+    end
+    -- "Head & Chest"
+    return part == entry.Head
+        or part == entry.Torso
+        or n == "Head"
+        or n == "UpperTorso"
+        or n == "LowerTorso"
+        or n == "Torso"
+        or n == "Chest"
+        or n == "HumanoidRootPart"
+end
+
+local function findEntryForHitPart(hitPart)
+    if not hitPart then
+        return nil, nil
+    end
+    for player, entry in pairs(Registry) do
+        if entry.Character and hitPart:IsDescendantOf(entry.Character) then
+            return player, entry
+        end
+    end
+    return nil, nil
+end
+
+local function findTriggerTarget(camera, screenCenter)
+    local maxDist = Config.TriggerBot.MaxDistance
+    local origin = camera.CFrame.Position
+    local dirUnit = camera.CFrame.LookVector
+
+    local filterList = {OverlayGui, HighlightContainer, camera}
+    local localChar = State.LocalCharacter or LocalPlayer.Character
+    if localChar then
+        table.insert(filterList, localChar)
+    end
+
+    RayParams.IgnoreWater = Config.ESP.IgnoreGlassWater
+    local currentOrigin = origin
+    local remaining = maxDist
+
+    for _ = 1, 6 do
+        if remaining < 0.1 then
+            break
+        end
+        RayParams.FilterDescendantsInstances = filterList
+        local result = Workspace:Raycast(currentOrigin, dirUnit * remaining, RayParams)
+        if not result or not result.Instance then
+            break
+        end
+
+        local hitPart = result.Instance
+        local hitPlayer, hitEntry = findEntryForHitPart(hitPart)
+        if hitPlayer and hitEntry then
+            if partMatchesTriggerFilter(hitPart, hitEntry) then
+                local valid = IsValidTarget(hitPlayer, {
+                    checkTeam = Config.TriggerBot.TeamCheck,
+                    checkVisible = false,
+                    maxDistance = maxDist,
+                    camera = camera,
+                    targetPart = hitPart,
+                })
+                if valid then
+                    return hitPlayer, hitEntry, hitPart
+                end
+            end
+            break
+        end
+
+        local isAccessory = hitPart:FindFirstAncestorOfClass("Accessory") ~= nil
+        local isNonBlockingGlass = Config.ESP.IgnoreGlassWater
+            and (hitPart.Transparency >= 0.45 or hitPart.Material == Enum.Material.Glass)
+        if (not hitPart.CanCollide) or isAccessory or isNonBlockingGlass or hitPart.Transparency >= 0.92 then
+            table.insert(filterList, hitPart)
+            remaining = remaining - (result.Position - currentOrigin).Magnitude - 0.05
+            currentOrigin = result.Position + dirUnit * 0.05
+        else
+            break
+        end
+    end
+
+    -- Pass 2: Crosshair Tolerance Sweep (catches fast-moving targets within N px of center reticle)
+    local tol = Config.TriggerBot.CrosshairTolerance
+    if tol > 0 then
+        local bestPlayer = nil
+        local bestEntry = nil
+        local bestPart = nil
+        local bestScreenDist = tol + 0.001
+
+        for player, entry in pairs(Registry) do
+            local checkParts
+            if Config.TriggerBot.TargetFilter == "Head Only" then
+                checkParts = {entry.Head}
+            elseif Config.TriggerBot.TargetFilter == "Head & Chest" then
+                checkParts = {entry.Head, entry.Torso, entry.RootPart}
+            else
+                checkParts = {entry.Head, entry.Torso, entry.RootPart}
+            end
+
+            for _, part in ipairs(checkParts) do
+                if part and part.Parent then
+                    local vp, onScreen = camera:WorldToViewportPoint(part.Position)
+                    if vp.Z > 0 and onScreen then
+                        local sDist = (Vector2.new(vp.X, vp.Y) - screenCenter).Magnitude
+                        if sDist <= bestScreenDist then
+                            local valid = IsValidTarget(player, {
+                                checkTeam = Config.TriggerBot.TeamCheck,
+                                checkVisible = Config.TriggerBot.VisibleCheck,
+                                maxDistance = maxDist,
+                                camera = camera,
+                                targetPart = part,
+                            })
+                            if valid then
+                                bestScreenDist = sDist
+                                bestPlayer = player
+                                bestEntry = entry
+                                bestPart = part
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        if bestPlayer then
+            return bestPlayer, bestEntry, bestPart
+        end
+    end
+
+    return nil, nil, nil
+end
+
+local function updateTriggerBot(camera, screenCenter, now)
+    if not Config.TriggerBot.Enabled or not State.LocalAlive then
+        State.TriggerTarget = nil
+        State.TriggerAcquireTime = 0
+        releaseTriggerFire()
+        TriggerDot.Visible = false
+        return
+    end
+
+    local targetPlayer = findTriggerTarget(camera, screenCenter)
+    local locked = (targetPlayer ~= nil)
+
+    if Config.TriggerBot.ShowIndicator then
+        TriggerDot.Visible = true
+        TriggerDot.Position = UDim2.fromOffset(screenCenter.X, screenCenter.Y)
+        TriggerDot.BackgroundColor3 = locked and Color3.fromRGB(56, 232, 198) or Color3.fromRGB(251, 146, 60)
+        TriggerDot.Size = locked and UDim2.fromOffset(9, 9) or UDim2.fromOffset(6, 6)
+    else
+        TriggerDot.Visible = false
+    end
+
+    if not locked then
+        State.TriggerTarget = nil
+        State.TriggerAcquireTime = 0
+        releaseTriggerFire()
+        return
+    end
+
+    if State.TriggerTarget ~= targetPlayer then
+        State.TriggerTarget = targetPlayer
+        State.TriggerAcquireTime = now
+    end
+
+    if (now - State.TriggerAcquireTime) < Config.TriggerBot.ReactionDelay then
+        return
+    end
+
+    if Config.TriggerBot.HoldToFire then
+        if not State.TriggerHolding then
+            triggerOnceOrPress(screenCenter, true)
+        end
+    else
+        if (now - State.LastTriggerFire) >= Config.TriggerBot.ShotCooldown then
+            State.LastTriggerFire = now
+            triggerOnceOrPress(screenCenter, false)
+        end
+    end
+end
+
 -- ============================================================================
 -- [SECTION 8] MAIN RENDER LOOP & EVERY-FRAME PLAYER COVERAGE SYNC
 -- ============================================================================
@@ -2266,7 +2665,11 @@ local function onRenderStepFrame(dt)
                 entry = Registry[player]
             end
             if entry then
-                local liveChar = resolveCharacterForPlayer(player)
+                local allowDeep = (entry.Character == nil) and ((now - entry.LastDeepScan) >= 0.4)
+                if allowDeep then
+                    entry.LastDeepScan = now
+                end
+                local liveChar = resolveCharacterForPlayer(player, allowDeep)
                 if liveChar and liveChar.Parent then
                     if entry.Character ~= liveChar then
                         bindCharacterToEntry(entry, liveChar)
@@ -2327,6 +2730,7 @@ local function onRenderStepFrame(dt)
     end
 
     updateAimbot(camera, screenCenter, dt)
+    updateTriggerBot(camera, screenCenter, now)
     updateAllESP(camera, viewportSize, screenCenter)
 end
 
@@ -2673,9 +3077,11 @@ TabPadding.PaddingTop = UDim.new(0, 4)
 TabPadding.PaddingBottom = UDim.new(0, 4)
 TabPadding.Parent = TabBar
 
+local TabOrder = {"Aimbot", "Trigger", "ESP", "Colors", "Settings"}
+
 local TabGrid = Instance.new("UIGridLayout")
-TabGrid.CellSize = UDim2.new(0.25, -4, 1, 0)
-TabGrid.CellPadding = UDim2.fromOffset(5, 0)
+TabGrid.CellSize = UDim2.new(1 / #TabOrder, -4, 1, 0)
+TabGrid.CellPadding = UDim2.fromOffset(4, 0)
 TabGrid.HorizontalAlignment = Enum.HorizontalAlignment.Center
 TabGrid.VerticalAlignment = Enum.VerticalAlignment.Center
 TabGrid.SortOrder = Enum.SortOrder.LayoutOrder
@@ -2692,7 +3098,6 @@ ContentHolder.Parent = MainCard
 
 local TabPages = {}
 local TabButtons = {}
-local TabOrder = {"Aimbot", "ESP Visuals", "Colors & Thickness", "Settings"}
 
 local function createTabPage(name)
     local page = Instance.new("ScrollingFrame")
@@ -2777,10 +3182,17 @@ end
 -- ============================================================================
 local SyncCallbacks = {}
 local syncMobileAimVisibility = function() end
+local syncMobileTriggerVisibility = function() end
 
 local function SyncDependentSettings(needsFullReload, reason)
     if not Config.Aimbot.Enabled then
         State.CurrentAimTarget = nil
+    end
+    if not Config.TriggerBot.Enabled then
+        State.TriggerTarget = nil
+        State.TriggerAcquireTime = 0
+        releaseTriggerFire()
+        TriggerDot.Visible = false
     end
     if not Config.ESP.Enabled then
         for _, entry in pairs(Registry) do
@@ -2794,6 +3206,7 @@ local function SyncDependentSettings(needsFullReload, reason)
     end
     State.LastTeamScan = -1
     syncMobileAimVisibility()
+    syncMobileTriggerVisibility()
     if needsFullReload then
         ScheduleReload(reason or "ConfigMutation", false)
     end
@@ -3253,8 +3666,78 @@ end, function(v)
     Config.Aimbot.StickyTarget = v
 end)
 
--- 2. ESP VISUALS TAB
-local EspPage = TabPages["ESP Visuals"]
+-- 2. TRIGGER BOT TAB
+local TriggerPage = TabPages["Trigger"]
+addToggle(TriggerPage, 1, "Enable Trigger Bot", "Auto-fires when valid enemy crosses reticle", function()
+    return Config.TriggerBot.Enabled
+end, function(v)
+    Config.TriggerBot.Enabled = v
+    Config.UI.MobileTriggerLocked = v
+end)
+
+addSelector(TriggerPage, 2, "Target Part Filter", {"Any Part", "Head & Chest", "Head Only"}, function()
+    return Config.TriggerBot.TargetFilter
+end, function(v)
+    Config.TriggerBot.TargetFilter = v
+end, false)
+
+addSelector(TriggerPage, 3, "Fire Method", {"Auto", "Tool Only", "Mouse1", "VirtualInput"}, function()
+    return Config.TriggerBot.FireMode
+end, function(v)
+    Config.TriggerBot.FireMode = v
+end, false)
+
+addToggle(TriggerPage, 4, "Hold Fire While Locked", "Hold trigger continuously vs timed burst taps", function()
+    return Config.TriggerBot.HoldToFire
+end, function(v)
+    Config.TriggerBot.HoldToFire = v
+end)
+
+addSlider(TriggerPage, 5, "Crosshair Tolerance", 0, 28, 1, function(v)
+    local n = math.round(v)
+    return (n == 0) and "0 px (Exact)" or string.format("%d px", n)
+end, function()
+    return Config.TriggerBot.CrosshairTolerance
+end, function(v)
+    Config.TriggerBot.CrosshairTolerance = math.round(v)
+end)
+
+addSlider(TriggerPage, 6, "Reaction Delay", 0.00, 0.30, 0.01, function(v)
+    return string.format("%.2fs", v)
+end, function()
+    return Config.TriggerBot.ReactionDelay
+end, function(v)
+    Config.TriggerBot.ReactionDelay = v
+end)
+
+addSlider(TriggerPage, 7, "Shot Cooldown", 0.02, 0.60, 0.01, function(v)
+    return string.format("%.2fs", v)
+end, function()
+    return Config.TriggerBot.ShotCooldown
+end, function(v)
+    Config.TriggerBot.ShotCooldown = v
+end)
+
+addToggle(TriggerPage, 8, "Trigger Team Check", "Never shoots teammates (FFA-safe Auto mode)", function()
+    return Config.TriggerBot.TeamCheck
+end, function(v)
+    Config.TriggerBot.TeamCheck = v
+end)
+
+addToggle(TriggerPage, 9, "Trigger Visible Check", "Blocks shots when enemy is behind walls", function()
+    return Config.TriggerBot.VisibleCheck
+end, function(v)
+    Config.TriggerBot.VisibleCheck = v
+end)
+
+addToggle(TriggerPage, 10, "Show Crosshair Indicator", "Center reticle dot pulses mint when target locked", function()
+    return Config.TriggerBot.ShowIndicator
+end, function(v)
+    Config.TriggerBot.ShowIndicator = v
+end)
+
+-- 3. ESP VISUALS TAB
+local EspPage = TabPages["ESP"]
 addToggle(EspPage, 1, "Master ESP", "Enables or disables all ESP layers", function()
     return Config.ESP.Enabled
 end, function(v)
@@ -3345,8 +3828,8 @@ end, function(v)
     Config.ESP.ColorByVisibility = v
 end)
 
--- 3. COLORS & THICKNESS TAB
-local ColorsPage = TabPages["Colors & Thickness"]
+-- 4. COLORS & THICKNESS TAB
+local ColorsPage = TabPages["Colors"]
 
 addSlider(ColorsPage, 1, "FOV Circle Thickness", 1.0, 10.0, 0.5, function(v)
     return string.format("%.1f px", v)
@@ -3629,6 +4112,13 @@ end, function(v)
 end)
 settingsOrder = settingsOrder + 1
 
+addToggle(SettingsPage, settingsOrder, "Show Trigger Bot GUI Button", "Displays floating draggable Trigger ON/OFF button", function()
+    return Config.UI.ShowMobileTriggerButton
+end, function(v)
+    Config.UI.ShowMobileTriggerButton = v
+end)
+settingsOrder = settingsOrder + 1
+
 addSlider(SettingsPage, settingsOrder, "Max Render Distance", 200, 3500, 50, function(v)
     return string.format("%dm", math.round(v))
 end, function()
@@ -3770,7 +4260,49 @@ syncMobileAimVisibility = function()
     refreshMobileAimStyle()
 end
 
+local MobileTriggerBtn = Instance.new("TextButton")
+MobileTriggerBtn.Name = "TEAM_AKI_MobileTrigger"
+MobileTriggerBtn.AnchorPoint = Vector2.new(0, 0.5)
+MobileTriggerBtn.Position = UDim2.new(0, 18, 0.25, 96)
+MobileTriggerBtn.Size = UDim2.fromOffset(132, 38)
+MobileTriggerBtn.BackgroundColor3 = Palette.GlassBase
+MobileTriggerBtn.BackgroundTransparency = 0.22
+MobileTriggerBtn.Font = Enum.Font.GothamBold
+MobileTriggerBtn.Text = "TRIGGER: OFF"
+MobileTriggerBtn.TextSize = 12
+MobileTriggerBtn.TextColor3 = Palette.TextSilver
+MobileTriggerBtn.AutoButtonColor = false
+MobileTriggerBtn.BorderSizePixel = 0
+MobileTriggerBtn.Visible = true
+MobileTriggerBtn.ZIndex = 20
+MobileTriggerBtn.Parent = MainGui
+
+local TriggerBtnCorner = Instance.new("UICorner")
+TriggerBtnCorner.CornerRadius = UDim.new(1, 0)
+TriggerBtnCorner.Parent = MobileTriggerBtn
+
+local TriggerBtnStroke = applyGlassStroke(MobileTriggerBtn, 1.4, 0.45)
+
+local function refreshMobileTriggerStyle()
+    local on = Config.TriggerBot.Enabled
+    Config.UI.MobileTriggerLocked = on
+    MobileTriggerBtn.Text = on and "TRIGGER: ON" or "TRIGGER: OFF"
+    tween(MobileTriggerBtn, 0.15, {
+        TextColor3 = on and Color3.fromRGB(251, 146, 60) or Palette.TextSilver,
+        BackgroundColor3 = on and Color3.fromRGB(36, 24, 16) or Palette.GlassBase,
+    })
+    tween(TriggerBtnStroke, 0.15, {
+        Color = on and Color3.fromRGB(251, 146, 60) or Palette.GlassEdge,
+    })
+end
+
+syncMobileTriggerVisibility = function()
+    MobileTriggerBtn.Visible = Config.UI.ShowMobileTriggerButton
+    refreshMobileTriggerStyle()
+end
+
 syncMobileAimVisibility()
+syncMobileTriggerVisibility()
 
 local function makeDraggableButton(btn, onTap)
     local activeInput = nil
@@ -3874,6 +4406,16 @@ makeDraggableButton(MobileAimBtn, function()
     SyncDependentSettings(false)
 end)
 
+makeDraggableButton(MobileTriggerBtn, function()
+    local nextState = not Config.TriggerBot.Enabled
+    Config.TriggerBot.Enabled = nextState
+    Config.UI.MobileTriggerLocked = nextState
+    for _, sync in ipairs(SyncCallbacks) do
+        pcall(sync)
+    end
+    SyncDependentSettings(false)
+end)
+
 MinimizeBtn.Activated:Connect(function()
     setPanelVisible(false)
 end)
@@ -3898,6 +4440,9 @@ ResetBtn.Activated:Connect(function()
     for k, v in pairs(DefaultConfig.Aimbot) do
         Config.Aimbot[k] = v
     end
+    for k, v in pairs(DefaultConfig.TriggerBot) do
+        Config.TriggerBot[k] = v
+    end
     for k, v in pairs(DefaultConfig.ESP) do
         Config.ESP[k] = v
     end
@@ -3909,6 +4454,8 @@ ResetBtn.Activated:Connect(function()
     end
     Config.UI.ShowMobileAimButton = true
     Config.UI.MobileAimLocked = false
+    Config.UI.ShowMobileTriggerButton = true
+    Config.UI.MobileTriggerLocked = false
     for _, sync in ipairs(SyncCallbacks) do
         pcall(sync)
     end
@@ -3928,6 +4475,7 @@ local function unloadScript()
     end
     State.Unloaded = true
     State.ReloadToken = State.ReloadToken + 1
+    releaseTriggerFire()
 
     pcall(function()
         RunService:UnbindFromRenderStep(RENDER_STEP_NAME)
