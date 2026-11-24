@@ -1,9 +1,8 @@
 --[[
     ============================================================================
-      TEAM AKI — Universal Adaptive Glassmorphic Hub (Mobile Roblox Executor)
-      Executors : Delta, Arceus X, Fluxus, Krnl & Universal Luau Executors
-      Systems   : Triple-Layer Entity Scanner, Adaptive Team/Game Resolver,
-                  Pooled Drawing + ScreenGui Hybrid ESP, Kinematic Prediction
+      TEAM AKI v3 — Event-Driven Full Reload & End-to-End Connected Hub
+      Executors : Mobile Roblox Executors (Delta, Arceus X, Fluxus, Krnl)
+      Targets   : Universal R6 / R15 / Custom Rigs (Rivals, Arsenal, One Shot)
     ============================================================================
 ]]
 
@@ -87,17 +86,17 @@ local function protectGui(gui)
 end
 
 -- ============================================================================
--- [SECTION 2] CONFIGURATION & RUNTIME STATE
+-- [SECTION 2] SINGLE SOURCE OF TRUTH (CONFIG, STATE & REGISTRY)
 -- ============================================================================
 local Config = {
     Aimbot = {
         Enabled = false,
         ActivationMode = "Always",      -- "Always" | "Hold" | "Mobile Button"
-        TargetPart = "Head",            -- "Head" | "Chest/Torso" | "HumanoidRootPart" | "Closest"
-        Smoothness = 6,                 -- 1 (instant lock) .. 20 (humanized smooth)
-        PredictionStrength = 0.08,      -- 0.00 .. 0.30 seconds lead time
-        ProjectileSpeed = 0,            -- 0 = pure lead time; >0 adds Distance / Speed
-        PingCompensation = false,       -- Adds half-RTT network ping lead
+        TargetPart = "Head",            -- "Head" | "Chest" | "HumanoidRootPart" | "Closest"
+        Smoothness = 6,                 -- 1 (instant) .. 20 (smooth)
+        Prediction = 0.08,              -- 0.00 .. 0.30 seconds lead time
+        ProjectileSpeed = 0,            -- 0 = pure lead; >0 adds Distance / Speed
+        PingCompensation = false,
         FOVRadius = 135,                -- pixels
         FOVThickness = 1.8,             -- 1 .. 5 pixels
         ShowFOV = true,
@@ -108,14 +107,14 @@ local Config = {
     },
     ESP = {
         Enabled = true,
-        RenderEngine = "Auto",          -- "Auto" (Drawing when available) | "Drawing" | "ScreenGui"
+        RenderEngine = "Auto",          -- "Auto" | "Drawing" | "ScreenGui"
         BoxESP = true,
         BoxStyle = "Corner",            -- "Corner" | "Full"
         BoxThickness = 1.8,             -- 1 .. 5 pixels
         HealthBar = true,
         ShowHealthPercent = true,
         TracerESP = true,
-        TracerOrigin = "Bottom",        -- "Bottom" -> Feet | "Center" -> Chest | "Top" -> Head
+        TracerOrigin = "Bottom",        -- "Bottom" | "Center" | "Top"
         LineThickness = 1.5,            -- 1 .. 5 pixels
         Alert360 = true,
         Alert360VisibleOnly = false,
@@ -128,18 +127,20 @@ local Config = {
         ShowNameDistance = true,
         IgnoreGlassWater = true,
         MaxDistance = 1800,
-        HighlightFillTransparency = 0.66,
+        HighlightFillTransparency = 0.65,
         HighlightOutlineTransparency = 0.12,
     },
     Resolver = {
         TeamCheckMode = "Auto",         -- "Auto" | "Team Property" | "TeamColor" | "Off"
-        CustomContainerScan = true,     -- Scans Workspace.Players / Characters / Entities
+        CustomContainerScan = true,
     },
     Colors = {
         Visible = Color3.fromRGB(56, 232, 198),     -- Mint-Cyan (Unobstructed)
-        Hidden = Color3.fromRGB(244, 63, 94),       -- Crimson (Behind Wall / Cover)
-        BoxTracer = Color3.fromRGB(88, 156, 255),   -- Electric Cyan-Indigo
-        FOV = Color3.fromRGB(110, 165, 255),        -- Ice-Cyan FOV Circle
+        Hidden = Color3.fromRGB(244, 63, 94),       -- Crimson (Behind Cover)
+        Box = Color3.fromRGB(88, 156, 255),         -- Electric Cyan-Indigo
+        Tracer = Color3.fromRGB(125, 211, 252),     -- Ice-Blue Tracer
+        Alert360 = Color3.fromRGB(251, 146, 60),    -- Amber Fallback Alert
+        FOV = Color3.fromRGB(110, 165, 255),        -- Ice-Cyan FOV Ring
     },
     UI = {
         Visible = true,
@@ -157,14 +158,26 @@ local DefaultConfig = {
     Colors = shallowClone(Config.Colors),
 }
 
+local Registry = {}
+
 local State = {
     Unloaded = false,
     Connections = {},
-    TrackedPlayers = {},
+    LocalConns = {},
+    LocalCharacter = nil,
+    LocalHumanoid = nil,
+    LocalRootPart = nil,
+    LocalAlive = false,
+    Camera = Workspace.CurrentCamera,
     CurrentAimTarget = nil,
     IsHoldingAim = false,
     ColorListeners = {},
-    LastReconcileTime = 0,
+    FrameIndex = 0,
+    ReloadCount = 0,
+    ReloadToken = 0,
+    ReloadPending = false,
+    LastSafetySync = 0,
+    LastReloadReason = "Startup",
 }
 
 local function addConnection(conn)
@@ -182,7 +195,7 @@ end
 -- [SECTION 3] POOLED DRAWING & SCREENGUI OVERLAY ENGINE
 -- ============================================================================
 local OverlayGui = Instance.new("ScreenGui")
-OverlayGui.Name = "TEAM_AKI_Overlay"
+OverlayGui.Name = "TEAM_AKI_Overlay_v3"
 OverlayGui.IgnoreGuiInset = true
 OverlayGui.ResetOnSpawn = false
 OverlayGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
@@ -194,7 +207,6 @@ local EspContainer = Instance.new("Folder")
 EspContainer.Name = "ESP_Elements"
 EspContainer.Parent = OverlayGui
 
--- Highlight instances require CoreGui or Workspace ancestry to render consistently
 local HighlightContainer = Instance.new("Folder")
 HighlightContainer.Name = "TEAM_AKI_Highlights"
 local okHighlightParent = pcall(function()
@@ -204,7 +216,6 @@ if not okHighlightParent or not HighlightContainer.Parent then
     HighlightContainer.Parent = Workspace
 end
 
--- Probe native Drawing API safely (handles both table and userdata implementations)
 local DrawingSupported = false
 do
     local ok, res = pcall(function()
@@ -249,7 +260,7 @@ local function shouldUseDrawing()
     return true
 end
 
--- Pre-allocate pooled FOV Circle Drawing if supported, plus ScreenGui fallback ring
+-- Pooled FOV Circle (Drawing primary + ScreenGui fallback)
 local DrawingFOV = nil
 if DrawingSupported then
     pcall(function()
@@ -282,8 +293,8 @@ FOVStroke.Transparency = 0.2
 FOVStroke.Color = Config.Colors.FOV
 FOVStroke.Parent = FOVRingFrame
 
--- Pre-allocate pooled per-player Drawing + ScreenGui visual elements (zero allocation in RenderStepped)
-local function createPlayerVisuals()
+-- Creates pooled per-player Drawing + ScreenGui visual handles bound directly to Registry[player]
+local function createRegistryVisualBundle()
     local guiRoot = Instance.new("Folder")
     guiRoot.Parent = EspContainer
 
@@ -296,7 +307,7 @@ local function createPlayerVisuals()
     local fullBoxStroke = Instance.new("UIStroke")
     fullBoxStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
     fullBoxStroke.Thickness = Config.ESP.BoxThickness
-    fullBoxStroke.Color = Config.Colors.BoxTracer
+    fullBoxStroke.Color = Config.Colors.Box
     fullBoxStroke.Parent = fullBoxFrame
 
     local cornerSegs = {}
@@ -391,7 +402,6 @@ local function createPlayerVisuals()
     arrowRight.ZIndex = 4
     arrowRight.Parent = arrowHolder
 
-    -- Pre-allocate Drawing primitives at player registration time (never inside RenderStepped)
     local drawCache = nil
     if DrawingSupported then
         local ok, cache = pcall(function()
@@ -479,6 +489,11 @@ local function createPlayerVisuals()
     end
 
     return {
+        BoxLines = drawCache and drawCache.Corners or cornerSegs,
+        TracerLine = drawCache and drawCache.Tracer or tracerFrame,
+        HealthBg = drawCache and drawCache.HpBack or hpBack,
+        HealthFill = drawCache and drawCache.HpFill or hpFill,
+        AlertArrow = drawCache and drawCache.Arrow or arrowHolder,
         HideAll = function()
             hideGui()
             hideDrawing()
@@ -489,7 +504,6 @@ local function createPlayerVisuals()
                 hideGui()
                 local d = drawCache
                 pcall(function()
-                    -- 1. Box (Corner Brackets or Full Box)
                     if state.ShowBox then
                         local x, y, w, h = state.BX, state.BY, state.BW, state.BH
                         local t = state.BoxThickness
@@ -529,7 +543,6 @@ local function createPlayerVisuals()
                         for i = 1, 8 do d.Corners[i].Visible = false end
                     end
 
-                    -- 2. Vertical Health Bar (0% - 100%) + Optional % Readout
                     if state.ShowHealth then
                         local barX = state.BX - 6
                         local barY = state.BY
@@ -558,7 +571,6 @@ local function createPlayerVisuals()
                         d.HpText.Visible = false
                     end
 
-                    -- 3. Name & Distance Label
                     if state.ShowLabel then
                         d.Label.Visible = true
                         d.Label.Position = Vector2.new(state.BX + state.BW * 0.5, state.BY - 16)
@@ -568,7 +580,6 @@ local function createPlayerVisuals()
                         d.Label.Visible = false
                     end
 
-                    -- 4. Smart Anchor-Matched Tracer Line
                     if state.ShowTracer then
                         d.Tracer.Visible = true
                         d.Tracer.From = state.TracerFrom
@@ -579,7 +590,6 @@ local function createPlayerVisuals()
                         d.Tracer.Visible = false
                     end
 
-                    -- 5. 360-Degree Visibility-Reactive Off-Screen Alert Arrow
                     if state.ShowArrow then
                         local dir = Vector2.new(math.cos(state.ArrowAngle), math.sin(state.ArrowAngle))
                         local perp = Vector2.new(-dir.Y, dir.X)
@@ -597,7 +607,7 @@ local function createPlayerVisuals()
                 return
             end
 
-            -- ScreenGui Fallback Path (when Drawing API is missing or ScreenGui is manually selected)
+            -- ScreenGui fallback path
             hideDrawing()
 
             if state.ShowBox then
@@ -719,7 +729,7 @@ local function createPlayerVisuals()
 end
 
 -- ============================================================================
--- [SECTION 4] TRIPLE-LAYER ENTITY SCANNER & GAME ADAPTER
+-- [SECTION 4] EVENT-DRIVEN FULL RELOAD SYSTEM & REGISTRY LIFECYCLE
 -- ============================================================================
 local RIG_PART_NAMES = {
     Head = true,
@@ -750,7 +760,10 @@ local RIG_PART_NAMES = {
 }
 
 local CUSTOM_CHAR_FOLDERS = {"Players", "Characters", "Entities", "ActivePlayers", "Rigs", "GamePlayers"}
-local RECONCILE_INTERVAL = 0.5
+local SAFETY_SYNC_INTERVAL = 1.0
+
+local ScheduleReload
+local ReloadAllSystems
 
 local function resolveCharacterForPlayer(player)
     local directChar = player.Character
@@ -766,7 +779,6 @@ local function resolveCharacterForPlayer(player)
     local targetDisplay = player.DisplayName
     local targetUserId = player.UserId
 
-    -- Scan common custom Workspace character containers used by FPS/arena games
     for _, folderName in ipairs(CUSTOM_CHAR_FOLDERS) do
         local container = Workspace:FindFirstChild(folderName)
         if container then
@@ -785,7 +797,6 @@ local function resolveCharacterForPlayer(player)
         end
     end
 
-    -- Fallback: direct Workspace child model matching player name when Player.Character is detached
     local wsChild = Workspace:FindFirstChild(targetName)
     if wsChild and wsChild:IsA("Model") and (wsChild:FindFirstChildOfClass("Humanoid") or wsChild.PrimaryPart) then
         return wsChild
@@ -797,7 +808,7 @@ end
 local function cacheCharacterParts(entry, character)
     local rigParts = {}
     local targetCandidates = {}
-    local largestTorsoFallback = nil
+    local largestTorso = nil
     local largestVol = 0
 
     for _, desc in ipairs(character:GetDescendants()) do
@@ -824,7 +835,7 @@ local function cacheCharacterParts(entry, character)
                 local vol = s.X * s.Y * s.Z
                 if vol > largestVol then
                     largestVol = vol
-                    largestTorsoFallback = desc
+                    largestTorso = desc
                 end
             end
         end
@@ -845,19 +856,15 @@ local function cacheCharacterParts(entry, character)
         end
     end
 
-    if not targetCandidates.Torso and not targetCandidates.UpperTorso then
-        targetCandidates.Torso = largestTorsoFallback
-    end
-
     entry.RigParts = rigParts
     entry.TargetCandidates = targetCandidates
     entry.Humanoid = character:FindFirstChildOfClass("Humanoid")
+    entry.Head = targetCandidates.Head
+    entry.Torso = targetCandidates.UpperTorso or targetCandidates.Torso or largestTorso or targetCandidates.HumanoidRootPart
     entry.RootPart = targetCandidates.HumanoidRootPart
-        or targetCandidates.UpperTorso
-        or targetCandidates.Torso
-        or targetCandidates.Head
+        or entry.Torso
+        or entry.Head
         or character.PrimaryPart
-        or largestTorsoFallback
         or rigParts[1]
     entry.LastScanTime = os.clock()
 end
@@ -871,13 +878,16 @@ local function destroyHighlight(entry)
     end
 end
 
-local function clearCharacterState(entry)
+local function clearCharacterFromEntry(entry)
     entry.Character = nil
     entry.Humanoid = nil
     entry.RootPart = nil
+    entry.Head = nil
+    entry.Torso = nil
     entry.LastTrackedPart = nil
     entry.LastTrackedPos = nil
     entry.EstimatedVel = Vector3.zero
+    entry.FrameVisualCache = nil
     clearTable(entry.RigParts)
     clearTable(entry.TargetCandidates)
 
@@ -889,11 +899,13 @@ local function clearCharacterState(entry)
     clearTable(entry.CharConns)
 
     destroyHighlight(entry)
-    entry.Visuals:HideAll()
+    if entry.Visuals then
+        entry.Visuals:HideAll()
+    end
 end
 
-local function bindCharacter(entry, character)
-    clearCharacterState(entry)
+local function bindCharacterToEntry(entry, character)
+    clearCharacterFromEntry(entry)
     if not character or State.Unloaded then
         return
     end
@@ -913,52 +925,25 @@ local function bindCharacter(entry, character)
     table.insert(entry.CharConns, character.DescendantRemoving:Connect(onDescendantChanged))
     table.insert(entry.CharConns, character.AncestryChanged:Connect(function(_, newParent)
         if not newParent then
-            clearCharacterState(entry)
+            clearCharacterFromEntry(entry)
         end
     end))
-end
 
-local function trackPlayer(player)
-    if player == LocalPlayer or State.TrackedPlayers[player] then
-        return
-    end
-
-    local entry = {
-        Player = player,
-        Character = nil,
-        Humanoid = nil,
-        RootPart = nil,
-        RigParts = {},
-        TargetCandidates = {},
-        Highlight = nil,
-        NeedsRescan = false,
-        LastScanTime = 0,
-        LastTrackedPart = nil,
-        LastTrackedPos = nil,
-        EstimatedVel = Vector3.zero,
-        Visuals = createPlayerVisuals(),
-        PlayerConns = {},
-        CharConns = {},
-    }
-
-    State.TrackedPlayers[player] = entry
-
-    table.insert(entry.PlayerConns, player.CharacterAdded:Connect(function(char)
-        bindCharacter(entry, char)
-    end))
-
-    table.insert(entry.PlayerConns, player.CharacterRemoving:Connect(function()
-        clearCharacterState(entry)
-    end))
-
-    local initialChar = resolveCharacterForPlayer(player)
-    if initialChar then
-        bindCharacter(entry, initialChar)
+    if entry.Humanoid then
+        table.insert(entry.CharConns, entry.Humanoid.Died:Connect(function()
+            if State.CurrentAimTarget == entry.Player then
+                State.CurrentAimTarget = nil
+            end
+            destroyHighlight(entry)
+            if entry.Visuals then
+                entry.Visuals:HideAll()
+            end
+        end))
     end
 end
 
-local function untrackPlayer(player)
-    local entry = State.TrackedPlayers[player]
+local function destroyPlayerEntry(player)
+    local entry = Registry[player]
     if not entry then
         return
     end
@@ -967,7 +952,7 @@ local function untrackPlayer(player)
         State.CurrentAimTarget = nil
     end
 
-    clearCharacterState(entry)
+    clearCharacterFromEntry(entry)
 
     for _, c in ipairs(entry.PlayerConns) do
         pcall(function()
@@ -976,74 +961,270 @@ local function untrackPlayer(player)
     end
     clearTable(entry.PlayerConns)
 
-    entry.Visuals:Destroy()
-    State.TrackedPlayers[player] = nil
+    if entry.Visuals then
+        entry.Visuals:Destroy()
+        entry.Visuals = nil
+    end
+    Registry[player] = nil
 end
 
--- Layer 1: Immediate Startup Snapshot + Player Lifecycle Hooks
-for _, player in ipairs(Players:GetPlayers()) do
-    trackPlayer(player)
-end
-addConnection(Players.PlayerAdded:Connect(trackPlayer))
-addConnection(Players.PlayerRemoving:Connect(untrackPlayer))
-
--- Layer 2: Fast Per-Frame Character Binding + Periodic 0.5s Reconciliation Sweep
-local function syncTrackedEntry(entry, allowCustomSearch)
-    local player = entry.Player
-    local liveChar = player.Character
-    if (not liveChar or not liveChar.Parent) and allowCustomSearch then
-        liveChar = resolveCharacterForPlayer(player)
+local function registerPlayerEntry(player)
+    if player == LocalPlayer or Registry[player] or State.Unloaded then
+        return
     end
 
-    if liveChar and liveChar.Parent then
-        if entry.Character ~= liveChar then
-            bindCharacter(entry, liveChar)
-        elseif entry.NeedsRescan
-            or (not entry.RootPart)
-            or (not entry.RootPart.Parent)
-            or (not entry.Humanoid)
-            or (not entry.Humanoid.Parent)
-            or (#entry.RigParts == 0 and (os.clock() - entry.LastScanTime) > 0.25)
-        then
-            entry.NeedsRescan = false
-            cacheCharacterParts(entry, liveChar)
+    local bundle = createRegistryVisualBundle()
+    local entry = {
+        Player = player,
+        Character = nil,
+        Humanoid = nil,
+        RootPart = nil,
+        Head = nil,
+        Torso = nil,
+        RigParts = {},
+        TargetCandidates = {},
+        BoxLines = bundle.BoxLines,
+        TracerLine = bundle.TracerLine,
+        HealthBg = bundle.HealthBg,
+        HealthFill = bundle.HealthFill,
+        Highlight = nil,
+        AlertArrow = bundle.AlertArrow,
+        Visuals = bundle,
+        NeedsRescan = false,
+        LastScanTime = 0,
+        LastTrackedPart = nil,
+        LastTrackedPos = nil,
+        EstimatedVel = Vector3.zero,
+        FrameVisualCache = nil,
+        FrameVisualId = -1,
+        PlayerConns = {},
+        CharConns = {},
+    }
+
+    Registry[player] = entry
+
+    table.insert(entry.PlayerConns, player.CharacterAdded:Connect(function(char)
+        if not State.Unloaded then
+            bindCharacterToEntry(entry, char)
+            ScheduleReload("RemoteCharacterAdded:" .. player.Name)
         end
-    elseif entry.Character ~= nil then
-        clearCharacterState(entry)
+    end))
+
+    table.insert(entry.PlayerConns, player.CharacterRemoving:Connect(function()
+        clearCharacterFromEntry(entry)
+        if not State.Unloaded then
+            ScheduleReload("RemoteCharacterRemoving:" .. player.Name)
+        end
+    end))
+
+    local initialChar = resolveCharacterForPlayer(player)
+    if initialChar then
+        bindCharacterToEntry(entry, initialChar)
     end
 end
 
-local function syncAllPlayers(isSweepTick)
-    if isSweepTick then
-        local seen = {}
-        for _, player in ipairs(Players:GetPlayers()) do
-            if player ~= LocalPlayer then
-                seen[player] = true
-                local entry = State.TrackedPlayers[player]
-                if not entry then
-                    trackPlayer(player)
-                    entry = State.TrackedPlayers[player]
-                end
-                if entry then
-                    syncTrackedEntry(entry, true)
-                end
-            end
-        end
+-- Local Player Character, Humanoid & Camera Re-Binding
+local function clearLocalCharacterState()
+    State.LocalCharacter = nil
+    State.LocalHumanoid = nil
+    State.LocalRootPart = nil
+    State.LocalAlive = false
+    State.CurrentAimTarget = nil
 
-        for player in pairs(State.TrackedPlayers) do
-            if not seen[player] then
-                untrackPlayer(player)
-            end
-        end
+    for _, c in ipairs(State.LocalConns) do
+        pcall(function()
+            c:Disconnect()
+        end)
+    end
+    clearTable(State.LocalConns)
+end
+
+local function bindLocalCharacter(character)
+    clearLocalCharacterState()
+    if not character or State.Unloaded then
+        return
+    end
+
+    State.LocalCharacter = character
+    State.Camera = Workspace.CurrentCamera
+    State.LocalHumanoid = character:FindFirstChildOfClass("Humanoid")
+    State.LocalRootPart = character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart
+    State.LocalAlive = true
+
+    local function attachHumanoidDeath(hum)
+        State.LocalHumanoid = hum
+        State.LocalAlive = (hum.Health > 0)
+        table.insert(State.LocalConns, hum.Died:Connect(function()
+            State.LocalAlive = false
+            State.CurrentAimTarget = nil
+            ScheduleReload("LocalPlayerDied")
+        end))
+    end
+
+    if State.LocalHumanoid then
+        attachHumanoidDeath(State.LocalHumanoid)
     else
-        for _, entry in pairs(State.TrackedPlayers) do
-            syncTrackedEntry(entry, false)
+        -- Wait briefly without yielding inside RenderStep for Humanoid readiness
+        table.insert(State.LocalConns, character.ChildAdded:Connect(function(child)
+            if State.Unloaded then return end
+            if child:IsA("Humanoid") then
+                attachHumanoidDeath(child)
+                ScheduleReload("LocalHumanoidReady")
+            elseif child.Name == "HumanoidRootPart" and child:IsA("BasePart") then
+                State.LocalRootPart = child
+            end
+        end))
+    end
+
+    table.insert(State.LocalConns, character.AncestryChanged:Connect(function(_, newParent)
+        if not newParent and not State.Unloaded then
+            clearLocalCharacterState()
+            ScheduleReload("LocalCharacterRemoved")
         end
+    end))
+end
+
+-- Centralized Debounced Full Reload (tears down stale/orphaned state & rebuilds Registry from scratch)
+ReloadAllSystems = function(reason)
+    if State.Unloaded then
+        return
+    end
+
+    State.ReloadPending = false
+    State.ReloadCount = State.ReloadCount + 1
+    State.LastReloadReason = reason or "Manual"
+    State.CurrentAimTarget = nil
+    State.Camera = Workspace.CurrentCamera
+
+    -- 1. Clean teardown of all existing Registry entries and leftover Highlights
+    local existingPlayers = {}
+    for player in pairs(Registry) do
+        table.insert(existingPlayers, player)
+    end
+    for _, player in ipairs(existingPlayers) do
+        destroyPlayerEntry(player)
+    end
+    clearTable(Registry)
+
+    for _, hl in ipairs(HighlightContainer:GetChildren()) do
+        pcall(function()
+            hl:Destroy()
+        end)
+    end
+
+    -- 2. Re-bind LocalPlayer character if missing or changed
+    local liveLocalChar = LocalPlayer.Character
+    if liveLocalChar and liveLocalChar.Parent then
+        if State.LocalCharacter ~= liveLocalChar then
+            bindLocalCharacter(liveLocalChar)
+        else
+            State.LocalHumanoid = liveLocalChar:FindFirstChildOfClass("Humanoid") or State.LocalHumanoid
+            State.LocalRootPart = liveLocalChar:FindFirstChild("HumanoidRootPart") or liveLocalChar.PrimaryPart or State.LocalRootPart
+        end
+    end
+
+    -- 3. Rebuild complete active Registry from current Players:GetPlayers()
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            registerPlayerEntry(player)
+        end
+    end
+end
+
+ScheduleReload = function(reason)
+    if State.Unloaded then
+        return
+    end
+    State.ReloadToken = State.ReloadToken + 1
+    local myToken = State.ReloadToken
+    State.ReloadPending = true
+    State.LastReloadReason = reason or "Event"
+
+    task.delay(0.06, function()
+        if not State.Unloaded and State.ReloadToken == myToken then
+            ReloadAllSystems(reason)
+        end
+    end)
+end
+
+-- Wire all mandatory player & local-player lifecycle events
+addConnection(Players.PlayerAdded:Connect(function(player)
+    if not State.Unloaded then
+        registerPlayerEntry(player)
+        ScheduleReload("PlayerAdded:" .. player.Name)
+    end
+end))
+
+addConnection(Players.PlayerRemoving:Connect(function(player)
+    destroyPlayerEntry(player)
+    if not State.Unloaded then
+        ScheduleReload("PlayerRemoving:" .. player.Name)
+    end
+end))
+
+addConnection(LocalPlayer.CharacterAdded:Connect(function(char)
+    if not State.Unloaded then
+        bindLocalCharacter(char)
+        ScheduleReload("LocalPlayerRespawned")
+    end
+end))
+
+addConnection(LocalPlayer.CharacterRemoving:Connect(function()
+    clearLocalCharacterState()
+    if not State.Unloaded then
+        ScheduleReload("LocalPlayerCharacterRemoving")
+    end
+end))
+
+-- Initial startup population & local character bind
+if LocalPlayer.Character then
+    bindLocalCharacter(LocalPlayer.Character)
+end
+ReloadAllSystems("InitialBootstrap")
+
+-- 1.0s Periodic Safety Sync: repairs any missed player or stale character automatically
+local function runPeriodicSafetySync()
+    local currentPlayers = Players:GetPlayers()
+    local seen = {}
+    local mismatchReason = nil
+
+    for _, player in ipairs(currentPlayers) do
+        if player ~= LocalPlayer then
+            seen[player] = true
+            local entry = Registry[player]
+            if not entry then
+                mismatchReason = "PeriodicMissingPlayer:" .. player.Name
+                break
+            end
+            local liveChar = resolveCharacterForPlayer(player)
+            if liveChar and entry.Character ~= liveChar then
+                mismatchReason = "PeriodicCharMismatch:" .. player.Name
+                break
+            elseif (not liveChar) and entry.Character ~= nil then
+                clearCharacterFromEntry(entry)
+            elseif entry.NeedsRescan or (liveChar and (not entry.RootPart or not entry.RootPart.Parent)) then
+                entry.NeedsRescan = false
+                cacheCharacterParts(entry, liveChar)
+            end
+        end
+    end
+
+    if not mismatchReason then
+        for player in pairs(Registry) do
+            if not seen[player] then
+                mismatchReason = "PeriodicOrphanedPlayer"
+                break
+            end
+        end
+    end
+
+    if mismatchReason then
+        ReloadAllSystems(mismatchReason)
     end
 end
 
 -- ============================================================================
--- [SECTION 5] ADAPTIVE TEAM RESOLVER, HEALTH & RAYCAST VISIBILITY
+-- [SECTION 5] SHARED ELIGIBILITY, VISIBILITY & COLOR RESOLVER PIPELINE
 -- ============================================================================
 local function readTeamAttribute(inst)
     if not inst then
@@ -1098,7 +1279,6 @@ local function isTeammate(player, entry)
         return false
     end
 
-    -- "Auto" Adaptive Resolver
     if LocalPlayer.Team ~= nil and player.Team ~= nil then
         if not LocalPlayer.Neutral and not player.Neutral then
             return LocalPlayer.Team == player.Team
@@ -1117,16 +1297,16 @@ local function isTeammate(player, entry)
         return localAttr == targetAttr
     end
 
+    local localChar = State.LocalCharacter or LocalPlayer.Character
     local targetChar = (entry and entry.Character) or player.Character
-    if LocalPlayer.Character and targetChar then
-        local cLocal = readTeamAttribute(LocalPlayer.Character)
+    if localChar and targetChar then
+        local cLocal = readTeamAttribute(localChar)
         local cTarget = readTeamAttribute(targetChar)
         if cLocal ~= nil and cTarget ~= nil then
             return cLocal == cTarget
         end
 
-        -- Overhead BillboardGui team tag color check when game hides Team property
-        local lTag = readOverheadTagColor(LocalPlayer.Character)
+        local lTag = readOverheadTagColor(localChar)
         local tTag = readOverheadTagColor(targetChar)
         if lTag and tTag then
             local diff = math.abs(lTag.R - tTag.R) + math.abs(lTag.G - tTag.G) + math.abs(lTag.B - tTag.B)
@@ -1164,6 +1344,9 @@ local function getCharacterHealth(entry)
 end
 
 local function isEntryAlive(entry)
+    if not entry then
+        return false
+    end
     local char = entry.Character
     if not char or not char.Parent then
         return false
@@ -1191,60 +1374,20 @@ end
 local function getBodyAnchorPart(entry, desired)
     local cands = entry.TargetCandidates
     if desired == "Head" then
-        return (cands.Head and cands.Head.Parent and cands.Head)
-            or (cands.UpperTorso and cands.UpperTorso.Parent and cands.UpperTorso)
-            or (cands.Torso and cands.Torso.Parent and cands.Torso)
+        return (entry.Head and entry.Head.Parent and entry.Head)
+            or (entry.Torso and entry.Torso.Parent and entry.Torso)
             or entry.RootPart
     elseif desired == "Chest" then
-        return (cands.UpperTorso and cands.UpperTorso.Parent and cands.UpperTorso)
-            or (cands.Torso and cands.Torso.Parent and cands.Torso)
+        return (entry.Torso and entry.Torso.Parent and entry.Torso)
             or (cands.HumanoidRootPart and cands.HumanoidRootPart.Parent and cands.HumanoidRootPart)
-            or (cands.Head and cands.Head.Parent and cands.Head)
+            or entry.Head
             or entry.RootPart
     elseif desired == "Feet" then
         return (cands.Foot and cands.Foot.Parent and cands.Foot) or entry.RootPart
     else
         return (cands.HumanoidRootPart and cands.HumanoidRootPart.Parent and cands.HumanoidRootPart)
-            or (cands.UpperTorso and cands.UpperTorso.Parent and cands.UpperTorso)
-            or (cands.Torso and cands.Torso.Parent and cands.Torso)
+            or entry.Torso
             or entry.RootPart
-    end
-end
-
-local function getAimPart(entry, camera, screenCenter)
-    local mode = Config.Aimbot.TargetPart
-    if mode == "Head" then
-        return getBodyAnchorPart(entry, "Head")
-    elseif mode == "Chest/Torso" then
-        return getBodyAnchorPart(entry, "Chest")
-    elseif mode == "HumanoidRootPart" then
-        return getBodyAnchorPart(entry, "Root")
-    else
-        local cands = entry.TargetCandidates
-        local bestPart = nil
-        local bestDist = math.huge
-        local partsToCheck = {
-            cands.Head,
-            cands.UpperTorso,
-            cands.Torso,
-            cands.HumanoidRootPart,
-        }
-        for _, part in ipairs(partsToCheck) do
-            if part and part.Parent then
-                local vp, onScreen = camera:WorldToViewportPoint(part.Position)
-                if vp.Z > 0 then
-                    local dist = (Vector2.new(vp.X, vp.Y) - screenCenter).Magnitude
-                    if not onScreen then
-                        dist = dist + 2000
-                    end
-                    if dist < bestDist then
-                        bestDist = dist
-                        bestPart = part
-                    end
-                end
-            end
-        end
-        return bestPart or entry.RootPart
     end
 end
 
@@ -1252,8 +1395,8 @@ local RayParams = RaycastParams.new()
 RayParams.FilterType = Enum.RaycastFilterType.Exclude
 RayParams.IgnoreWater = true
 
-local function isPartVisible(camera, targetCharacter, targetPart)
-    if not targetCharacter or not targetPart or not targetPart.Parent then
+local function raycastPartVisible(camera, targetCharacter, targetPart)
+    if not camera or not targetCharacter or not targetPart or not targetPart.Parent then
         return false
     end
 
@@ -1266,8 +1409,9 @@ local function isPartVisible(camera, targetCharacter, targetPart)
     end
 
     local filterList = {OverlayGui, HighlightContainer, camera}
-    if LocalPlayer.Character then
-        table.insert(filterList, LocalPlayer.Character)
+    local localChar = State.LocalCharacter or LocalPlayer.Character
+    if localChar then
+        table.insert(filterList, localChar)
     end
 
     RayParams.IgnoreWater = Config.ESP.IgnoreGlassWater
@@ -1306,23 +1450,90 @@ local function isPartVisible(camera, targetCharacter, targetPart)
     return false
 end
 
-local function isEntryVisible(camera, entry)
-    local headPart = entry.TargetCandidates.Head
-    local chestPart = getBodyAnchorPart(entry, "Chest")
-    if headPart and headPart.Parent and isPartVisible(camera, entry.Character, headPart) then
-        return true
+-- Shared Visibility & Color Resolver: single raycast evaluation per target/frame
+local function GetTargetVisualState(player, targetPart)
+    local entry = Registry[player]
+    if not entry then
+        return { isVisible = false, activeColor = Config.Colors.Hidden }
     end
-    if chestPart and chestPart.Parent and chestPart ~= headPart and isPartVisible(camera, entry.Character, chestPart) then
-        return true
+
+    if targetPart == nil and entry.FrameVisualId == State.FrameIndex and entry.FrameVisualCache then
+        return entry.FrameVisualCache
     end
-    if entry.RootPart and entry.RootPart ~= headPart and entry.RootPart ~= chestPart then
-        return isPartVisible(camera, entry.Character, entry.RootPart)
+
+    local camera = State.Camera or Workspace.CurrentCamera
+    local isVis = false
+    if camera and entry.Character then
+        if targetPart and targetPart.Parent then
+            isVis = raycastPartVisible(camera, entry.Character, targetPart)
+        else
+            local headPart = entry.Head
+            local chestPart = entry.Torso
+            if headPart and headPart.Parent and raycastPartVisible(camera, entry.Character, headPart) then
+                isVis = true
+            elseif chestPart and chestPart.Parent and chestPart ~= headPart and raycastPartVisible(camera, entry.Character, chestPart) then
+                isVis = true
+            elseif entry.RootPart and entry.RootPart.Parent and entry.RootPart ~= headPart and entry.RootPart ~= chestPart then
+                isVis = raycastPartVisible(camera, entry.Character, entry.RootPart)
+            end
+        end
     end
-    return false
+
+    local result = {
+        isVisible = isVis,
+        activeColor = isVis and Config.Colors.Visible or Config.Colors.Hidden,
+    }
+
+    if targetPart == nil then
+        entry.FrameVisualId = State.FrameIndex
+        entry.FrameVisualCache = result
+    end
+
+    return result
+end
+
+-- Shared Target Eligibility Pipeline used by BOTH Aimbot and ESP
+local function IsValidTarget(player, opts)
+    if not player or player == LocalPlayer then
+        return false, nil, nil, math.huge
+    end
+
+    local entry = Registry[player]
+    if not isEntryAlive(entry) then
+        return false, entry, nil, math.huge
+    end
+
+    local checkTeam = (opts and opts.checkTeam ~= nil) and opts.checkTeam or Config.ESP.TeamCheck
+    if checkTeam and isTeammate(player, entry) then
+        return false, entry, nil, math.huge
+    end
+
+    local camera = (opts and opts.camera) or State.Camera or Workspace.CurrentCamera
+    if not camera then
+        return false, entry, nil, math.huge
+    end
+
+    local evalPart = (opts and opts.targetPart) or entry.RootPart
+    if not evalPart or not evalPart.Parent then
+        return false, entry, nil, math.huge
+    end
+
+    local worldDist = (evalPart.Position - camera.CFrame.Position).Magnitude
+    local maxDist = (opts and opts.maxDistance) or Config.ESP.MaxDistance
+    if worldDist > maxDist then
+        return false, entry, nil, worldDist
+    end
+
+    local visState = GetTargetVisualState(player, opts and opts.targetPart or nil)
+    if opts and opts.checkVisible and not visState.isVisible then
+        return false, entry, visState, worldDist
+    end
+
+    return true, entry, visState, worldDist
 end
 
 -- ============================================================================
--- [SECTION 6] REBUILT ESP RENDERER (CORNER BOX, HEALTH, SMART TRACERS, 360 & HL)
+-- [SECTION 6] REBUILT ESP RENDERER (CORNER BOX, HEALTH BAR, ANCHOR TRACERS, 360 & HL)
 -- ============================================================================
 local function computeScreenBox(camera, entry)
     local minX, minY = math.huge, math.huge
@@ -1401,159 +1612,150 @@ local MAX_ACTIVE_HIGHLIGHTS = 28
 local function updateAllESP(camera, viewportSize, screenCenter)
     local highlightCandidates = {}
 
-    for _, entry in pairs(State.TrackedPlayers) do
-        if not Config.ESP.Enabled or not isEntryAlive(entry) then
-            entry.Visuals:HideAll()
-            if entry.Highlight then entry.Highlight.Enabled = false end
-        elseif Config.ESP.TeamCheck and isTeammate(entry.Player, entry) then
+    for player, entry in pairs(Registry) do
+        if not Config.ESP.Enabled then
             entry.Visuals:HideAll()
             if entry.Highlight then entry.Highlight.Enabled = false end
         else
-            local rootPart = entry.RootPart
-            local worldDist = (rootPart.Position - camera.CFrame.Position).Magnitude
+            local valid, _, visState, worldDist = IsValidTarget(player, {
+                checkTeam = Config.ESP.TeamCheck,
+                checkVisible = Config.ESP.VisibleCheck,
+                maxDistance = Config.ESP.MaxDistance,
+                camera = camera,
+            })
 
-            if worldDist > Config.ESP.MaxDistance then
+            if not valid or not visState then
                 entry.Visuals:HideAll()
                 if entry.Highlight then entry.Highlight.Enabled = false end
             else
-                local visible = isEntryVisible(camera, entry)
+                local rootPart = entry.RootPart
+                local boxColor = Config.ESP.ColorByVisibility and visState.activeColor or Config.Colors.Box
+                local tracerColor = Config.ESP.ColorByVisibility and visState.activeColor or Config.Colors.Tracer
 
-                if Config.ESP.VisibleCheck and not visible then
-                    entry.Visuals:HideAll()
-                    if entry.Highlight then entry.Highlight.Enabled = false end
-                else
-                    local boxColor = Config.Colors.BoxTracer
-                    if Config.ESP.ColorByVisibility then
-                        boxColor = visible and Config.Colors.Visible or Config.Colors.Hidden
-                    end
+                local rootVP, rootOnScreen = camera:WorldToViewportPoint(rootPart.Position)
+                local isBehind = rootVP.Z <= 0
+                local screenPos = Vector2.new(rootVP.X, rootVP.Y)
 
-                    local rootVP, rootOnScreen = camera:WorldToViewportPoint(rootPart.Position)
-                    local isBehind = rootVP.Z <= 0
-                    local screenPos = Vector2.new(rootVP.X, rootVP.Y)
+                local boxValid, bx, by, bw, bh = false, 0, 0, 0, 0
+                if not isBehind then
+                    boxValid, bx, by, bw, bh = computeScreenBox(camera, entry)
+                end
 
-                    local boxValid, bx, by, bw, bh = false, 0, 0, 0, 0
-                    if not isBehind then
-                        boxValid, bx, by, bw, bh = computeScreenBox(camera, entry)
-                    end
+                -- 1. Sidebar Health Bar (0% - 100%)
+                local _, _, hpRatio = getCharacterHealth(entry)
+                local hpColor = getHealthColor(hpRatio)
 
-                    -- 1. Health ratio (0% - 100%)
-                    local _, _, hpRatio = getCharacterHealth(entry)
-                    local hpColor = getHealthColor(hpRatio)
+                -- 2. Anchor-Matched Tracer Wiring (Bottom->Feet, Center->Chest, Top->Head)
+                local showTracer = Config.ESP.TracerESP and (not isBehind) and rootOnScreen
+                local tracerFrom = Vector2.new(viewportSize.X * 0.5, viewportSize.Y)
+                local tracerTo = boxValid and Vector2.new(bx + bw * 0.5, by + bh) or screenPos
 
-                    -- 2. Smart Anchor-Matched Tracer (Bottom->Feet, Center->Chest, Top->Head)
-                    local showTracer = Config.ESP.TracerESP and (not isBehind) and rootOnScreen
-                    local tracerFrom = Vector2.new(viewportSize.X * 0.5, viewportSize.Y)
-                    local tracerTo = boxValid and Vector2.new(bx + bw * 0.5, by + bh) or screenPos
-
-                    if Config.ESP.TracerOrigin == "Top" then
-                        tracerFrom = Vector2.new(viewportSize.X * 0.5, 0)
-                        local headPart = getBodyAnchorPart(entry, "Head")
-                        if headPart and headPart.Parent then
-                            local hvp = camera:WorldToViewportPoint(headPart.Position)
-                            if hvp.Z > 0 then
-                                tracerTo = Vector2.new(hvp.X, hvp.Y)
-                            elseif boxValid then
-                                tracerTo = Vector2.new(bx + bw * 0.5, by)
-                            end
+                if Config.ESP.TracerOrigin == "Top" then
+                    tracerFrom = Vector2.new(viewportSize.X * 0.5, 0)
+                    local headPart = getBodyAnchorPart(entry, "Head")
+                    if headPart and headPart.Parent then
+                        local hvp = camera:WorldToViewportPoint(headPart.Position)
+                        if hvp.Z > 0 then
+                            tracerTo = Vector2.new(hvp.X, hvp.Y)
                         elseif boxValid then
                             tracerTo = Vector2.new(bx + bw * 0.5, by)
                         end
-                    elseif Config.ESP.TracerOrigin == "Center" then
-                        tracerFrom = screenCenter
-                        local chestPart = getBodyAnchorPart(entry, "Chest")
-                        if chestPart and chestPart.Parent then
-                            local cvp = camera:WorldToViewportPoint(chestPart.Position)
-                            if cvp.Z > 0 then
-                                tracerTo = Vector2.new(cvp.X, cvp.Y)
-                            elseif boxValid then
-                                tracerTo = Vector2.new(bx + bw * 0.5, by + bh * 0.45)
-                            end
+                    elseif boxValid then
+                        tracerTo = Vector2.new(bx + bw * 0.5, by)
+                    end
+                elseif Config.ESP.TracerOrigin == "Center" then
+                    tracerFrom = screenCenter
+                    local chestPart = getBodyAnchorPart(entry, "Chest")
+                    if chestPart and chestPart.Parent then
+                        local cvp = camera:WorldToViewportPoint(chestPart.Position)
+                        if cvp.Z > 0 then
+                            tracerTo = Vector2.new(cvp.X, cvp.Y)
                         elseif boxValid then
                             tracerTo = Vector2.new(bx + bw * 0.5, by + bh * 0.45)
                         end
+                    elseif boxValid then
+                        tracerTo = Vector2.new(bx + bw * 0.5, by + bh * 0.45)
+                    end
+                else
+                    tracerFrom = Vector2.new(viewportSize.X * 0.5, viewportSize.Y)
+                    if boxValid then
+                        tracerTo = Vector2.new(bx + bw * 0.5, by + bh)
                     else
-                        tracerFrom = Vector2.new(viewportSize.X * 0.5, viewportSize.Y)
-                        if boxValid then
-                            tracerTo = Vector2.new(bx + bw * 0.5, by + bh)
-                        else
-                            local footPart = getBodyAnchorPart(entry, "Feet")
-                            if footPart and footPart.Parent then
-                                local fvp = camera:WorldToViewportPoint(footPart.Position)
-                                if fvp.Z > 0 then
-                                    tracerTo = Vector2.new(fvp.X, fvp.Y)
-                                end
+                        local footPart = getBodyAnchorPart(entry, "Feet")
+                        if footPart and footPart.Parent then
+                            local fvp = camera:WorldToViewportPoint(footPart.Position)
+                            if fvp.Z > 0 then
+                                tracerTo = Vector2.new(fvp.X, fvp.Y)
                             end
                         end
                     end
+                end
 
-                    local tracerColor = Config.ESP.ColorByVisibility and boxColor or Config.Colors.BoxTracer
+                -- 3. 360-Degree Off-Screen Alert wired to GetTargetVisualState
+                local showArrow = false
+                local arrowPos = Vector2.zero
+                local arrowAngle = 0
+                local arrowColor = Config.ESP.ColorByVisibility and visState.activeColor or Config.Colors.Alert360
 
-                    -- 3. Visibility-Reactive 360-Degree Off-Screen Alert
-                    local showArrow = false
-                    local arrowPos = Vector2.zero
-                    local arrowAngle = 0
-                    local arrowColor = visible and Config.Colors.Visible or Config.Colors.Hidden
-
-                    if Config.ESP.Alert360 then
-                        local alertAllowed = (not Config.ESP.Alert360VisibleOnly) or visible
-                        if alertAllowed then
-                            local localSpace = camera.CFrame:PointToObjectSpace(rootPart.Position)
-                            local screenDir = Vector2.new(localSpace.X, -localSpace.Y)
-                            local distFromCenter = (screenPos - screenCenter).Magnitude
-                            local outOfFOV = isBehind or (not rootOnScreen) or (distFromCenter > Config.Aimbot.FOVRadius)
-                            if outOfFOV and screenDir.Magnitude > 0.001 then
-                                showArrow = true
-                                arrowAngle = math.atan2(screenDir.Y, screenDir.X)
-                                local ringR = math.min(
-                                    Config.ESP.AlertRingRadius,
-                                    math.min(viewportSize.X, viewportSize.Y) * 0.42
-                                )
-                                arrowPos = screenCenter + Vector2.new(math.cos(arrowAngle), math.sin(arrowAngle)) * ringR
-                            end
+                if Config.ESP.Alert360 then
+                    local alertAllowed = (not Config.ESP.Alert360VisibleOnly) or visState.isVisible
+                    if alertAllowed then
+                        local localSpace = camera.CFrame:PointToObjectSpace(rootPart.Position)
+                        local screenDir = Vector2.new(localSpace.X, -localSpace.Y)
+                        local distFromCenter = (screenPos - screenCenter).Magnitude
+                        local outOfFOV = isBehind or (not rootOnScreen) or (distFromCenter > Config.Aimbot.FOVRadius)
+                        if outOfFOV and screenDir.Magnitude > 0.001 then
+                            showArrow = true
+                            arrowAngle = math.atan2(screenDir.Y, screenDir.X)
+                            local ringR = math.min(
+                                Config.ESP.AlertRingRadius,
+                                math.min(viewportSize.X, viewportSize.Y) * 0.42
+                            )
+                            arrowPos = screenCenter + Vector2.new(math.cos(arrowAngle), math.sin(arrowAngle)) * ringR
                         end
                     end
+                end
 
-                    entry.Visuals:Render({
-                        ShowBox = Config.ESP.BoxESP and boxValid,
-                        BoxStyle = Config.ESP.BoxStyle,
-                        BoxThickness = Config.ESP.BoxThickness,
-                        BoxColor = boxColor,
-                        BX = bx,
-                        BY = by,
-                        BW = bw,
-                        BH = bh,
-                        ShowHealth = Config.ESP.HealthBar and boxValid,
-                        ShowHealthText = Config.ESP.ShowHealthPercent,
-                        HealthRatio = hpRatio,
-                        HealthColor = hpColor,
-                        ShowLabel = Config.ESP.ShowNameDistance and boxValid,
-                        LabelText = string.format("%s [%.0fm]", entry.Player.DisplayName, worldDist),
-                        ShowTracer = showTracer,
-                        TracerFrom = tracerFrom,
-                        TracerTo = tracerTo,
-                        TracerColor = tracerColor,
-                        LineThickness = Config.ESP.LineThickness,
-                        ShowArrow = showArrow,
-                        ArrowPos = arrowPos,
-                        ArrowAngle = arrowAngle,
-                        ArrowColor = arrowColor,
-                    })
+                entry.Visuals:Render({
+                    ShowBox = Config.ESP.BoxESP and boxValid,
+                    BoxStyle = Config.ESP.BoxStyle,
+                    BoxThickness = Config.ESP.BoxThickness,
+                    BoxColor = boxColor,
+                    BX = bx,
+                    BY = by,
+                    BW = bw,
+                    BH = bh,
+                    ShowHealth = Config.ESP.HealthBar and boxValid,
+                    ShowHealthText = Config.ESP.ShowHealthPercent,
+                    HealthRatio = hpRatio,
+                    HealthColor = hpColor,
+                    ShowLabel = Config.ESP.ShowNameDistance and boxValid,
+                    LabelText = string.format("%s [%.0fm]", player.DisplayName, worldDist),
+                    ShowTracer = showTracer,
+                    TracerFrom = tracerFrom,
+                    TracerTo = tracerTo,
+                    TracerColor = tracerColor,
+                    LineThickness = Config.ESP.LineThickness,
+                    ShowArrow = showArrow,
+                    ArrowPos = arrowPos,
+                    ArrowAngle = arrowAngle,
+                    ArrowColor = arrowColor,
+                })
 
-                    -- 4. Visibility-Reactive Highlight Pool
-                    if Config.ESP.HighlightESP then
-                        local hlAllowed = (not Config.ESP.HighlightVisibleOnly) or visible
-                        if hlAllowed then
-                            table.insert(highlightCandidates, {
-                                Entry = entry,
-                                Dist = worldDist,
-                                Visible = visible,
-                            })
-                        elseif entry.Highlight then
-                            entry.Highlight.Enabled = false
-                        end
+                -- 4. Highlight ESP wired directly to GetTargetVisualState
+                if Config.ESP.HighlightESP then
+                    local hlAllowed = (not Config.ESP.HighlightVisibleOnly) or visState.isVisible
+                    if hlAllowed then
+                        table.insert(highlightCandidates, {
+                            Entry = entry,
+                            Dist = worldDist,
+                            ActiveColor = visState.activeColor,
+                        })
                     elseif entry.Highlight then
                         entry.Highlight.Enabled = false
                     end
+                elseif entry.Highlight then
+                    entry.Highlight.Enabled = false
                 end
             end
         end
@@ -1580,10 +1782,9 @@ local function updateAllESP(camera, viewportSize, screenCenter)
                     end
                 end
                 if entry.Highlight then
-                    local hlCol = item.Visible and Config.Colors.Visible or Config.Colors.Hidden
                     entry.Highlight.Adornee = entry.Character
-                    entry.Highlight.FillColor = hlCol
-                    entry.Highlight.OutlineColor = hlCol
+                    entry.Highlight.FillColor = item.ActiveColor
+                    entry.Highlight.OutlineColor = item.ActiveColor
                     entry.Highlight.FillTransparency = Config.ESP.HighlightFillTransparency
                     entry.Highlight.OutlineTransparency = Config.ESP.HighlightOutlineTransparency
                     entry.Highlight.Enabled = true
@@ -1596,7 +1797,7 @@ local function updateAllESP(camera, viewportSize, screenCenter)
 end
 
 -- ============================================================================
--- [SECTION 7] KINEMATIC PREDICTION AIMBOT & MOBILE TOUCH SAFETY
+-- [SECTION 7] AIMBOT WITH KINEMATIC PREDICTION (WIRED TO ISVALIDTARGET)
 -- ============================================================================
 addConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
     if gameProcessed then
@@ -1620,6 +1821,43 @@ local function isAimbotInputActive()
         return Config.UI.MobileAimLocked
     end
     return State.IsHoldingAim
+end
+
+local function getAimPartForEntry(entry, camera, screenCenter)
+    local mode = Config.Aimbot.TargetPart
+    if mode == "Head" then
+        return getBodyAnchorPart(entry, "Head")
+    elseif mode == "Chest" then
+        return getBodyAnchorPart(entry, "Chest")
+    elseif mode == "HumanoidRootPart" then
+        return getBodyAnchorPart(entry, "Root")
+    else
+        local cands = entry.TargetCandidates
+        local bestPart = nil
+        local bestDist = math.huge
+        local partsToCheck = {
+            entry.Head,
+            entry.Torso,
+            cands.HumanoidRootPart,
+            entry.RootPart,
+        }
+        for _, part in ipairs(partsToCheck) do
+            if part and part.Parent then
+                local vp, onScreen = camera:WorldToViewportPoint(part.Position)
+                if vp.Z > 0 then
+                    local dist = (Vector2.new(vp.X, vp.Y) - screenCenter).Magnitude
+                    if not onScreen then
+                        dist = dist + 2000
+                    end
+                    if dist < bestDist then
+                        bestDist = dist
+                        bestPart = part
+                    end
+                end
+            end
+        end
+        return bestPart or entry.RootPart
+    end
 end
 
 local function getLocalPingSeconds()
@@ -1652,62 +1890,63 @@ local function resolveTargetVelocity(entry, part, dt)
         physVel = part.AssemblyLinearVelocity
     end)
 
-    -- Use AssemblyLinearVelocity when active; fallback to CFrame delta velocity for custom movers
     local rawVel = (physVel.Magnitude >= 0.25) and physVel or frameVel
     entry.EstimatedVel = entry.EstimatedVel:Lerp(rawVel, 0.55)
     return entry.EstimatedVel
 end
 
-local function validateAimEntry(entry, camera, screenCenter)
-    if not entry or not isEntryAlive(entry) then
-        return false, nil, math.huge
-    end
-    if Config.Aimbot.TeamCheck and isTeammate(entry.Player, entry) then
-        return false, nil, math.huge
+local function evaluateAimCandidate(player, camera, screenCenter)
+    local entry = Registry[player]
+    if not entry then
+        return false, nil, nil, math.huge
     end
 
-    local part = getAimPart(entry, camera, screenCenter)
-    if not part or not part.Parent then
-        return false, nil, math.huge
+    local aimPart = getAimPartForEntry(entry, camera, screenCenter)
+    if not aimPart or not aimPart.Parent then
+        return false, nil, nil, math.huge
     end
 
-    local worldDist = (part.Position - camera.CFrame.Position).Magnitude
-    if worldDist > Config.Aimbot.MaxDistance then
-        return false, nil, math.huge
-    end
-
-    local vp, onScreen = camera:WorldToViewportPoint(part.Position)
+    local vp, onScreen = camera:WorldToViewportPoint(aimPart.Position)
     if vp.Z <= 0 or not onScreen then
-        return false, nil, math.huge
+        return false, nil, nil, math.huge
     end
 
     local screenDist = (Vector2.new(vp.X, vp.Y) - screenCenter).Magnitude
     if screenDist > Config.Aimbot.FOVRadius then
-        return false, nil, math.huge
+        return false, nil, nil, math.huge
     end
 
-    if Config.Aimbot.VisibleCheck and not isPartVisible(camera, entry.Character, part) then
-        return false, nil, math.huge
+    local valid, _, _, worldDist = IsValidTarget(player, {
+        checkTeam = Config.Aimbot.TeamCheck,
+        checkVisible = Config.Aimbot.VisibleCheck,
+        maxDistance = Config.Aimbot.MaxDistance,
+        camera = camera,
+        targetPart = aimPart,
+    })
+
+    if not valid then
+        return false, nil, nil, math.huge
     end
 
-    return true, part, screenDist
+    return true, entry, aimPart, screenDist, worldDist
 end
 
 local function updateAimbot(camera, screenCenter, dt)
-    if not Config.Aimbot.Enabled or not isAimbotInputActive() then
+    if not Config.Aimbot.Enabled or not State.LocalAlive or not isAimbotInputActive() then
         State.CurrentAimTarget = nil
         return
     end
 
     local chosenEntry = nil
     local chosenPart = nil
+    local chosenDist = 0
 
     if Config.Aimbot.StickyTarget and State.CurrentAimTarget then
-        local stickyEntry = State.TrackedPlayers[State.CurrentAimTarget]
-        local ok, part = validateAimEntry(stickyEntry, camera, screenCenter)
-        if ok and part then
-            chosenEntry = stickyEntry
+        local ok, entry, part, _, worldDist = evaluateAimCandidate(State.CurrentAimTarget, camera, screenCenter)
+        if ok and entry and part then
+            chosenEntry = entry
             chosenPart = part
+            chosenDist = worldDist
         else
             State.CurrentAimTarget = nil
         end
@@ -1718,20 +1957,23 @@ local function updateAimbot(camera, screenCenter, dt)
         local bestPlayer = nil
         local bestEntry = nil
         local bestPart = nil
+        local bestWorldDist = 0
 
-        for player, entry in pairs(State.TrackedPlayers) do
-            local ok, part, screenDist = validateAimEntry(entry, camera, screenCenter)
-            if ok and part and screenDist < bestScreenDist then
+        for player in pairs(Registry) do
+            local ok, entry, part, screenDist, worldDist = evaluateAimCandidate(player, camera, screenCenter)
+            if ok and entry and part and screenDist < bestScreenDist then
                 bestScreenDist = screenDist
                 bestPlayer = player
                 bestEntry = entry
                 bestPart = part
+                bestWorldDist = worldDist
             end
         end
 
         State.CurrentAimTarget = bestPlayer
         chosenEntry = bestEntry
         chosenPart = bestPart
+        chosenDist = bestWorldDist
     end
 
     if not chosenPart or not chosenEntry then
@@ -1739,18 +1981,14 @@ local function updateAimbot(camera, screenCenter, dt)
     end
 
     local camPos = camera.CFrame.Position
-    local targetPos = chosenPart.Position
-    local worldDist = (targetPos - camPos).Magnitude
-
-    -- Kinematic velocity prediction + optional projectile travel & ping compensation
-    local leadTime = Config.Aimbot.PredictionStrength
+    local leadTime = Config.Aimbot.Prediction
     if Config.Aimbot.ProjectileSpeed > 0 then
-        leadTime = leadTime + (worldDist / Config.Aimbot.ProjectileSpeed)
+        leadTime = leadTime + (chosenDist / Config.Aimbot.ProjectileSpeed)
     end
     leadTime = leadTime + getLocalPingSeconds()
 
     local velocity = resolveTargetVelocity(chosenEntry, chosenPart, dt)
-    local predictedPos = targetPos + (velocity * leadTime)
+    local predictedPos = chosenPart.Position + (velocity * leadTime)
     local targetCFrame = CFrame.lookAt(camPos, predictedPos)
 
     local smoothness = math.clamp(Config.Aimbot.Smoothness, 1, 20)
@@ -1764,9 +2002,9 @@ local function updateAimbot(camera, screenCenter, dt)
 end
 
 -- ============================================================================
--- [SECTION 8] MAIN RENDER LOOP (RENDERSTEPPED PRIORITY + 0.5S SWEEP)
+-- [SECTION 8] MAIN RENDER LOOP & 1.0S PERIODIC SAFETY SYNC
 -- ============================================================================
-local RENDER_STEP_NAME = "TEAM_AKI_RenderStep"
+local RENDER_STEP_NAME = "TEAM_AKI_RenderStep_v3"
 
 pcall(function()
     RunService:UnbindFromRenderStep(RENDER_STEP_NAME)
@@ -1777,23 +2015,36 @@ RunService:BindToRenderStep(RENDER_STEP_NAME, Enum.RenderPriority.Camera.Value +
         return
     end
 
+    State.FrameIndex = State.FrameIndex + 1
+
     local camera = Workspace.CurrentCamera
+    State.Camera = camera
     if not camera then
         return
     end
 
-    -- Triple-layer scanner: fast per-frame binding + 0.5s full reconciliation sweep
+    -- 1.0s Periodic Safety Sync checking Registry integrity against Players:GetPlayers()
     local now = os.clock()
-    local isSweepTick = (now - State.LastReconcileTime) >= RECONCILE_INTERVAL
-    if isSweepTick then
-        State.LastReconcileTime = now
+    if (now - State.LastSafetySync) >= SAFETY_SYNC_INTERVAL then
+        State.LastSafetySync = now
+        pcall(runPeriodicSafetySync)
     end
-    pcall(syncAllPlayers, isSweepTick)
+
+    -- Fast per-frame attachment of any newly created character parts
+    for _, entry in pairs(Registry) do
+        local liveChar = resolveCharacterForPlayer(entry.Player)
+        if liveChar and entry.Character ~= liveChar then
+            bindCharacterToEntry(entry, liveChar)
+        elseif entry.NeedsRescan and entry.Character then
+            entry.NeedsRescan = false
+            cacheCharacterParts(entry, entry.Character)
+        end
+    end
 
     local viewportSize = camera.ViewportSize
     local screenCenter = Vector2.new(viewportSize.X * 0.5, viewportSize.Y * 0.5)
 
-    -- Update FOV Circle (Drawing API when active, ScreenGui fallback otherwise)
+    -- FOV Circle & FOVThickness bound every render step
     local showFov = Config.Aimbot.ShowFOV and Config.Aimbot.Enabled
     local useDrawingFov = shouldUseDrawing() and DrawingFOV ~= nil
 
@@ -1817,16 +2068,15 @@ RunService:BindToRenderStep(RENDER_STEP_NAME, Enum.RenderPriority.Camera.Value +
         FOVStroke.Thickness = Config.Aimbot.FOVThickness
     end
 
-    -- Update Aimbot after CameraScript, then render ESP using updated camera matrix
     pcall(updateAimbot, camera, screenCenter, dt)
     pcall(updateAllESP, camera, viewportSize, screenCenter)
 end)
 
 -- ============================================================================
--- [SECTION 9] REFINED ADAPTIVE DEEP GLASSMORPHIC UI (TEAM AKI)
+-- [SECTION 9] ADAPTIVE DEEP GLASSMORPHIC UI SHELL (TEAM AKI)
 -- ============================================================================
 local MainGui = Instance.new("ScreenGui")
-MainGui.Name = "TEAM_AKI_Hub"
+MainGui.Name = "TEAM_AKI_Hub_v3"
 MainGui.IgnoreGuiInset = true
 MainGui.ResetOnSpawn = false
 MainGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
@@ -1879,7 +2129,6 @@ RootScale.Parent = MainGui
 local BASE_CARD_W = 496
 local BASE_CARD_H = 420
 
--- Layered soft drop shadow behind MainCard
 local CardShadow = Instance.new("Frame")
 CardShadow.Name = "CardShadow"
 CardShadow.AnchorPoint = Vector2.new(0.5, 0.5)
@@ -1922,7 +2171,6 @@ GlassGradient.Color = ColorSequence.new({
 GlassGradient.Rotation = 135
 GlassGradient.Parent = MainCard
 
--- Subtle cyan-indigo refraction sheen along top edge
 local FrostedOverlay = Instance.new("Frame")
 FrostedOverlay.Name = "FrostedOverlay"
 FrostedOverlay.AnchorPoint = Vector2.new(0.5, 0)
@@ -1959,6 +2207,7 @@ local function bindCameraViewport()
         viewportConn = nil
     end
     local cam = Workspace.CurrentCamera
+    State.Camera = cam
     if cam then
         viewportConn = addConnection(cam:GetPropertyChangedSignal("ViewportSize"):Connect(updateResponsiveLayout))
     end
@@ -1968,7 +2217,6 @@ end
 bindCameraViewport()
 addConnection(Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(bindCameraViewport))
 
--- Header Bar
 local HeaderBar = Instance.new("Frame")
 HeaderBar.Name = "HeaderBar"
 HeaderBar.Size = UDim2.new(1, 0, 0, 56)
@@ -1986,7 +2234,6 @@ HeaderDivider.BackgroundTransparency = 0.78
 HeaderDivider.BorderSizePixel = 0
 HeaderDivider.Parent = HeaderBar
 
--- Brand Badge & Accent Glow
 local BrandBadge = Instance.new("Frame")
 BrandBadge.AnchorPoint = Vector2.new(0, 0.5)
 BrandBadge.Position = UDim2.new(0, 16, 0.5, 0)
@@ -2027,7 +2274,7 @@ SubtitleLabel.AnchorPoint = Vector2.new(0, 0.5)
 SubtitleLabel.Position = UDim2.new(0, 118, 0.5, 0)
 SubtitleLabel.Size = UDim2.new(1, -210, 0, 18)
 SubtitleLabel.Font = Enum.Font.GothamMedium
-SubtitleLabel.Text = "Universal Glassmorphic Combat Hub"
+SubtitleLabel.Text = "Event-Synced Combat & ESP Hub"
 SubtitleLabel.TextSize = 11.5
 SubtitleLabel.TextColor3 = Palette.TextSilver
 SubtitleLabel.TextXAlignment = Enum.TextXAlignment.Left
@@ -2074,7 +2321,6 @@ end
 local MinimizeBtn = createHeaderButton("-", Palette.SurfaceSoft)
 local UnloadHeaderBtn = createHeaderButton("×", Palette.Danger)
 
--- Dragging MainCard + CardShadow synced together
 do
     local activeInput = nil
     local dragStart = nil
@@ -2117,7 +2363,6 @@ do
     end))
 end
 
--- Tab Bar (Strictly Centered 4-Tab Grid)
 local TabBar = Instance.new("Frame")
 TabBar.Name = "TabBar"
 TabBar.AnchorPoint = Vector2.new(0.5, 0)
@@ -2242,9 +2487,31 @@ for idx, tabName in ipairs(TabOrder) do
 end
 
 -- ============================================================================
--- [SECTION 10] MODULAR UI COMPONENT BUILDERS (STRICTLY CENTERED GLASS CARDS)
+-- [SECTION 10] MODULAR UI COMPONENT BUILDERS & CONFIG-SYNC BINDING
 -- ============================================================================
 local SyncCallbacks = {}
+local syncMobileAimVisibility = function() end
+
+-- Immediately propagates UI Config mutations across dependent modules
+local function SyncDependentSettings(needsFullReload, reason)
+    if not Config.Aimbot.Enabled then
+        State.CurrentAimTarget = nil
+    end
+    if not Config.ESP.Enabled then
+        for _, entry in pairs(Registry) do
+            if entry.Visuals then entry.Visuals:HideAll() end
+            if entry.Highlight then entry.Highlight.Enabled = false end
+        end
+    elseif not Config.ESP.HighlightESP then
+        for _, entry in pairs(Registry) do
+            if entry.Highlight then entry.Highlight.Enabled = false end
+        end
+    end
+    syncMobileAimVisibility()
+    if needsFullReload then
+        ScheduleReload(reason or "ConfigMutation")
+    end
+end
 
 local function createCardRow(parent, height, order)
     local card = Instance.new("Frame")
@@ -2352,6 +2619,7 @@ local function addToggle(parent, order, title, subtitle, getter, setter)
     switchBtn.Activated:Connect(function()
         setter(not getter())
         sync(false)
+        SyncDependentSettings(false)
     end)
 end
 
@@ -2478,7 +2746,7 @@ local function addSlider(parent, order, title, minVal, maxVal, step, formatFn, g
     return sync
 end
 
-local function addSelector(parent, order, title, options, getter, setter)
+local function addSelector(parent, order, title, options, getter, setter, reloadOnSelect)
     local row = createCardRow(parent, 66, order)
 
     local label = Instance.new("TextLabel")
@@ -2549,6 +2817,7 @@ local function addSelector(parent, order, title, options, getter, setter)
         b.Activated:Connect(function()
             setter(opt)
             sync()
+            SyncDependentSettings(reloadOnSelect == true, "Selector:" .. title)
         end)
 
         btns[opt] = b
@@ -2561,7 +2830,6 @@ end
 -- ============================================================================
 -- [SECTION 11] POPULATE TABS (AIMBOT, ESP VISUALS, COLORS & THICKNESS, SETTINGS)
 -- ============================================================================
-local syncMobileAimVisibility = function() end
 
 -- 1. AIMBOT TAB
 local AimbotPage = TabPages["Aimbot"]
@@ -2569,21 +2837,19 @@ addToggle(AimbotPage, 1, "Enable Aimbot", "Master toggle for camera target lock"
     return Config.Aimbot.Enabled
 end, function(v)
     Config.Aimbot.Enabled = v
-    if not v then State.CurrentAimTarget = nil end
 end)
 
 addSelector(AimbotPage, 2, "Activation Mode", {"Always", "Hold", "Mobile Button"}, function()
     return Config.Aimbot.ActivationMode
 end, function(v)
     Config.Aimbot.ActivationMode = v
-    syncMobileAimVisibility()
-end)
+end, false)
 
-addSelector(AimbotPage, 3, "Target Part", {"Head", "Chest/Torso", "HumanoidRootPart", "Closest"}, function()
+addSelector(AimbotPage, 3, "Target Part", {"Head", "Chest", "HumanoidRootPart", "Closest"}, function()
     return Config.Aimbot.TargetPart
 end, function(v)
     Config.Aimbot.TargetPart = v
-end)
+end, false)
 
 addSlider(AimbotPage, 4, "Smoothness", 1, 20, 1, function(v)
     local n = math.round(v)
@@ -2594,12 +2860,12 @@ end, function(v)
     Config.Aimbot.Smoothness = math.round(v)
 end)
 
-addSlider(AimbotPage, 5, "Prediction Strength (Lead Time)", 0.00, 0.30, 0.01, function(v)
+addSlider(AimbotPage, 5, "Prediction Lead Time", 0.00, 0.30, 0.01, function(v)
     return string.format("%.2fs", v)
 end, function()
-    return Config.Aimbot.PredictionStrength
+    return Config.Aimbot.Prediction
 end, function(v)
-    Config.Aimbot.PredictionStrength = v
+    Config.Aimbot.Prediction = v
 end)
 
 addSlider(AimbotPage, 6, "Projectile Speed (0 = Lead Only)", 0, 2000, 50, function(v)
@@ -2611,7 +2877,7 @@ end, function(v)
     Config.Aimbot.ProjectileSpeed = math.round(v)
 end)
 
-addToggle(AimbotPage, 7, "Ping Auto-Compensation", "Adds half-RTT network ping to prediction lead", function()
+addToggle(AimbotPage, 7, "Ping Auto-Compensation", "Adds half-RTT ping to kinematic lead", function()
     return Config.Aimbot.PingCompensation
 end, function(v)
     Config.Aimbot.PingCompensation = v
@@ -2631,19 +2897,19 @@ end, function(v)
     Config.Aimbot.ShowFOV = v
 end)
 
-addToggle(AimbotPage, 10, "Team Check", "Uses adaptive resolver to skip teammates", function()
+addToggle(AimbotPage, 10, "Team Check", "Skips teammates via shared eligibility pipeline", function()
     return Config.Aimbot.TeamCheck
 end, function(v)
     Config.Aimbot.TeamCheck = v
 end)
 
-addToggle(AimbotPage, 11, "Visible / Wall Check", "Raycasts to ignore enemies behind cover", function()
+addToggle(AimbotPage, 11, "Visible / Wall Check", "Blocks aim lock through solid walls", function()
     return Config.Aimbot.VisibleCheck
 end, function(v)
     Config.Aimbot.VisibleCheck = v
 end)
 
-addToggle(AimbotPage, 12, "Sticky Target Lock", "Maintains lock on valid target inside FOV", function()
+addToggle(AimbotPage, 12, "Sticky Target Lock", "Maintains lock while target remains valid", function()
     return Config.Aimbot.StickyTarget
 end, function(v)
     Config.Aimbot.StickyTarget = v
@@ -2651,7 +2917,7 @@ end)
 
 -- 2. ESP VISUALS TAB
 local EspPage = TabPages["ESP Visuals"]
-addToggle(EspPage, 1, "Master ESP", "Enables or disables all ESP overlays", function()
+addToggle(EspPage, 1, "Master ESP", "Enables or disables all ESP layers", function()
     return Config.ESP.Enabled
 end, function(v)
     Config.ESP.Enabled = v
@@ -2667,7 +2933,7 @@ addSelector(EspPage, 3, "Box Style", {"Corner", "Full"}, function()
     return Config.ESP.BoxStyle
 end, function(v)
     Config.ESP.BoxStyle = v
-end)
+end, false)
 
 addToggle(EspPage, 4, "Health Bar (0% - 100%)", "Vertical sidebar health indicator beside box", function()
     return Config.ESP.HealthBar
@@ -2691,15 +2957,15 @@ addSelector(EspPage, 7, "Tracer Origin -> Anchor", {"Bottom", "Center", "Top"}, 
     return Config.ESP.TracerOrigin
 end, function(v)
     Config.ESP.TracerOrigin = v
-end)
+end, false)
 
-addToggle(EspPage, 8, "360° Off-Screen Alert", "Arrows shift color between Visible and Hidden", function()
+addToggle(EspPage, 8, "360° Off-Screen Alert", "Arrows shift dynamically between Visible and Hidden", function()
     return Config.ESP.Alert360
 end, function(v)
     Config.ESP.Alert360 = v
 end)
 
-addToggle(EspPage, 9, "360° Alert Visible Only", "Hide 360° arrows when enemy is behind cover", function()
+addToggle(EspPage, 9, "360° Alert Visible Only", "Hide 360° arrows when enemy is behind walls", function()
     return Config.ESP.Alert360VisibleOnly
 end, function(v)
     Config.ESP.Alert360VisibleOnly = v
@@ -2717,7 +2983,7 @@ end, function(v)
     Config.ESP.HighlightVisibleOnly = v
 end)
 
-addToggle(EspPage, 12, "Name & Distance", "Shows target display name and stud distance", function()
+addToggle(EspPage, 12, "Name & Distance", "Displays target display name and stud distance", function()
     return Config.ESP.ShowNameDistance
 end, function(v)
     Config.ESP.ShowNameDistance = v
@@ -2735,7 +3001,7 @@ end, function(v)
     Config.ESP.VisibleCheck = v
 end)
 
-addToggle(EspPage, 15, "Color By Visibility", "Tints boxes and tracers by line-of-sight", function()
+addToggle(EspPage, 15, "Color By Visibility", "Tints Box, Tracer & 360° Alert by line-of-sight", function()
     return Config.ESP.ColorByVisibility
 end, function(v)
     Config.ESP.ColorByVisibility = v
@@ -2770,12 +3036,14 @@ end)
 
 local ColorChannelDefs = {
     { Key = "Visible", Label = "Visible" },
-    { Key = "Hidden", Label = "Hidden / Wall" },
-    { Key = "BoxTracer", Label = "Box / Tracer" },
-    { Key = "FOV", Label = "FOV Circle" },
+    { Key = "Hidden", Label = "Hidden" },
+    { Key = "Box", Label = "Box" },
+    { Key = "Tracer", Label = "Tracer" },
+    { Key = "Alert360", Label = "360 Alert" },
+    { Key = "FOV", Label = "FOV Ring" },
 }
 
-local ChannelCard = createCardRow(ColorsPage, 74, 4)
+local ChannelCard = createCardRow(ColorsPage, 98, 4)
 local ChannelTitle = Instance.new("TextLabel")
 ChannelTitle.BackgroundTransparency = 1
 ChannelTitle.Position = UDim2.fromOffset(0, 0)
@@ -2809,7 +3077,7 @@ SwatchStroke.Parent = LiveSwatch
 local ChannelBar = Instance.new("Frame")
 ChannelBar.AnchorPoint = Vector2.new(0.5, 1)
 ChannelBar.Position = UDim2.new(0.5, 0, 1, 0)
-ChannelBar.Size = UDim2.new(1, 0, 0, 28)
+ChannelBar.Size = UDim2.new(1, 0, 0, 54)
 ChannelBar.BackgroundColor3 = Palette.GlassBase
 ChannelBar.BackgroundTransparency = 0.22
 ChannelBar.BorderSizePixel = 0
@@ -2820,9 +3088,16 @@ local ChannelBarCorner = Instance.new("UICorner")
 ChannelBarCorner.CornerRadius = UDim.new(0, 8)
 ChannelBarCorner.Parent = ChannelBar
 
+local ChannelPad = Instance.new("UIPadding")
+ChannelPad.PaddingLeft = UDim.new(0, 4)
+ChannelPad.PaddingRight = UDim.new(0, 4)
+ChannelPad.PaddingTop = UDim.new(0, 4)
+ChannelPad.PaddingBottom = UDim.new(0, 4)
+ChannelPad.Parent = ChannelBar
+
 local ChannelGrid = Instance.new("UIGridLayout")
-ChannelGrid.CellSize = UDim2.new(0.25, -4, 1, -4)
-ChannelGrid.CellPadding = UDim2.fromOffset(4, 0)
+ChannelGrid.CellSize = UDim2.new(0.333, -4, 0, 21)
+ChannelGrid.CellPadding = UDim2.fromOffset(4, 4)
 ChannelGrid.HorizontalAlignment = Enum.HorizontalAlignment.Center
 ChannelGrid.VerticalAlignment = Enum.VerticalAlignment.Center
 ChannelGrid.SortOrder = Enum.SortOrder.LayoutOrder
@@ -2982,18 +3257,19 @@ addSelector(SettingsPage, 1, "Team Check Mode", {"Auto", "Team Property", "TeamC
     return Config.Resolver.TeamCheckMode
 end, function(v)
     Config.Resolver.TeamCheckMode = v
-end)
+end, true)
 
 addSelector(SettingsPage, 2, "ESP Render Engine", {"Auto", "Drawing", "ScreenGui"}, function()
     return Config.ESP.RenderEngine
 end, function(v)
     Config.ESP.RenderEngine = v
-end)
+end, false)
 
 addToggle(SettingsPage, 3, "Workspace Container Scan", "Scans custom Players / Characters / Entities folders", function()
     return Config.Resolver.CustomContainerScan
 end, function(v)
     Config.Resolver.CustomContainerScan = v
+    ScheduleReload("CustomContainerScanToggle")
 end)
 
 addToggle(SettingsPage, 4, "Ignore Transparent Glass & Water", "Allows raycast wall check through glass/water", function()
@@ -3006,7 +3282,6 @@ addToggle(SettingsPage, 5, "Show Mobile Aim Lock Pill", "Displays floating touch
     return Config.UI.ShowMobileAimButton
 end, function(v)
     Config.UI.ShowMobileAimButton = v
-    syncMobileAimVisibility()
 end)
 
 addSlider(SettingsPage, 6, "Max Render Distance", 200, 3500, 50, function(v)
@@ -3028,16 +3303,32 @@ end)
 
 local ActionCard = createCardRow(SettingsPage, 54, 8)
 local ActionGrid = Instance.new("UIGridLayout")
-ActionGrid.CellSize = UDim2.new(0.5, -5, 1, 0)
-ActionGrid.CellPadding = UDim2.fromOffset(10, 0)
+ActionGrid.CellSize = UDim2.new(0.333, -6, 1, 0)
+ActionGrid.CellPadding = UDim2.fromOffset(8, 0)
 ActionGrid.HorizontalAlignment = Enum.HorizontalAlignment.Center
 ActionGrid.VerticalAlignment = Enum.VerticalAlignment.Center
 ActionGrid.Parent = ActionCard
 
+local ForceReloadBtn = Instance.new("TextButton")
+ForceReloadBtn.Text = "Reload All"
+ForceReloadBtn.Font = Enum.Font.GothamMedium
+ForceReloadBtn.TextSize = 11.5
+ForceReloadBtn.TextColor3 = Palette.TextHeader
+ForceReloadBtn.BackgroundColor3 = Palette.PrimaryAccent
+ForceReloadBtn.BackgroundTransparency = 0.25
+ForceReloadBtn.AutoButtonColor = false
+ForceReloadBtn.BorderSizePixel = 0
+ForceReloadBtn.ZIndex = 6
+ForceReloadBtn.Parent = ActionCard
+
+local ForceReloadCorner = Instance.new("UICorner")
+ForceReloadCorner.CornerRadius = UDim.new(0, 8)
+ForceReloadCorner.Parent = ForceReloadBtn
+
 local ResetBtn = Instance.new("TextButton")
 ResetBtn.Text = "Reset Defaults"
 ResetBtn.Font = Enum.Font.GothamMedium
-ResetBtn.TextSize = 12
+ResetBtn.TextSize = 11.5
 ResetBtn.TextColor3 = Palette.TextHeader
 ResetBtn.BackgroundColor3 = Palette.SurfaceSoft
 ResetBtn.AutoButtonColor = false
@@ -3050,9 +3341,9 @@ ResetCorner.CornerRadius = UDim.new(0, 8)
 ResetCorner.Parent = ResetBtn
 
 local UnloadBtn = Instance.new("TextButton")
-UnloadBtn.Text = "Unload TEAM AKI"
+UnloadBtn.Text = "Unload AKI"
 UnloadBtn.Font = Enum.Font.GothamMedium
-UnloadBtn.TextSize = 12
+UnloadBtn.TextSize = 11.5
 UnloadBtn.TextColor3 = Palette.TextHeader
 UnloadBtn.BackgroundColor3 = Palette.Danger
 UnloadBtn.BackgroundTransparency = 0.2
@@ -3091,7 +3382,6 @@ ToggleCorner.Parent = MobileToggle
 local ToggleStroke = applyGlassStroke(MobileToggle, 1.4, 0.35)
 ToggleStroke.Color = Palette.ActiveGlow
 
--- Dedicated Mobile Touch Aim Lock Pill (does not interfere with thumbsticks)
 local MobileAimBtn = Instance.new("TextButton")
 MobileAimBtn.Name = "TEAM_AKI_MobileAim"
 MobileAimBtn.AnchorPoint = Vector2.new(1, 0.5)
@@ -3227,6 +3517,10 @@ addConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
     end
 end))
 
+ForceReloadBtn.Activated:Connect(function()
+    ReloadAllSystems("ManualButton")
+end)
+
 ResetBtn.Activated:Connect(function()
     for k, v in pairs(DefaultConfig.Aimbot) do
         Config.Aimbot[k] = v
@@ -3244,7 +3538,7 @@ ResetBtn.Activated:Connect(function()
         pcall(sync)
     end
     refreshColorControls()
-    syncMobileAimVisibility()
+    SyncDependentSettings(true, "ResetDefaults")
 end)
 
 local function unloadScript()
@@ -3252,10 +3546,13 @@ local function unloadScript()
         return
     end
     State.Unloaded = true
+    State.ReloadToken = State.ReloadToken + 1
 
     pcall(function()
         RunService:UnbindFromRenderStep(RENDER_STEP_NAME)
     end)
+
+    clearLocalCharacterState()
 
     for _, conn in ipairs(State.Connections) do
         pcall(function()
@@ -3265,12 +3562,13 @@ local function unloadScript()
     clearTable(State.Connections)
 
     local trackedCopy = {}
-    for player in pairs(State.TrackedPlayers) do
+    for player in pairs(Registry) do
         table.insert(trackedCopy, player)
     end
     for _, player in ipairs(trackedCopy) do
-        untrackPlayer(player)
+        destroyPlayerEntry(player)
     end
+    clearTable(Registry)
 
     safeDestroyDrawing(DrawingFOV)
     DrawingFOV = nil
