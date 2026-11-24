@@ -1,8 +1,9 @@
 --[[
     ============================================================================
-      TEAM AKI v3 — Event-Driven Full Reload & End-to-End Connected Hub
-      Executors : Mobile Roblox Executors (Delta, Arceus X, Fluxus, Krnl)
-      Targets   : Universal R6 / R15 / Custom Rigs (Rivals, Arsenal, One Shot)
+      TEAM AKI — Rebuilt Universal Combat & ESP Hub (Mobile Roblox Executors)
+      Executors : Delta, Arceus X, Fluxus, Krnl & Universal Luau Executors
+      Fixes     : FFA-Safe Auto Team Resolver, Reliable ScreenGui-First ESP,
+                  Distance-Box Fallback, Event-Driven Registry Sync & Reload
     ============================================================================
 ]]
 
@@ -95,7 +96,7 @@ local Config = {
         TargetPart = "Head",            -- "Head" | "Chest" | "HumanoidRootPart" | "Closest"
         Smoothness = 6,                 -- 1 (instant) .. 20 (smooth)
         Prediction = 0.08,              -- 0.00 .. 0.30 seconds lead time
-        ProjectileSpeed = 0,            -- 0 = pure lead; >0 adds Distance / Speed
+        ProjectileSpeed = 0,            -- 0 = pure lead time; >0 adds Distance / Speed
         PingCompensation = false,
         FOVRadius = 135,                -- pixels
         FOVThickness = 1.8,             -- 1 .. 5 pixels
@@ -103,11 +104,11 @@ local Config = {
         TeamCheck = true,
         VisibleCheck = true,
         StickyTarget = true,
-        MaxDistance = 1500,
+        MaxDistance = 2000,
     },
     ESP = {
         Enabled = true,
-        RenderEngine = "Auto",          -- "Auto" | "Drawing" | "ScreenGui"
+        RenderEngine = "ScreenGui",     -- "ScreenGui" (100% reliable mobile) | "Drawing"
         BoxESP = true,
         BoxStyle = "Corner",            -- "Corner" | "Full"
         BoxThickness = 1.8,             -- 1 .. 5 pixels
@@ -126,12 +127,12 @@ local Config = {
         ColorByVisibility = true,
         ShowNameDistance = true,
         IgnoreGlassWater = true,
-        MaxDistance = 1800,
-        HighlightFillTransparency = 0.65,
-        HighlightOutlineTransparency = 0.12,
+        MaxDistance = 2200,
+        HighlightFillTransparency = 0.62,
+        HighlightOutlineTransparency = 0.10,
     },
     Resolver = {
-        TeamCheckMode = "Auto",         -- "Auto" | "Team Property" | "TeamColor" | "Off"
+        TeamCheckMode = "Auto",         -- "Auto" (FFA-aware) | "Team Property" | "TeamColor" | "Off"
         CustomContainerScan = true,
     },
     Colors = {
@@ -175,8 +176,9 @@ local State = {
     FrameIndex = 0,
     ReloadCount = 0,
     ReloadToken = 0,
-    ReloadPending = false,
     LastSafetySync = 0,
+    LastTeamScan = -1,
+    DetectedTeamScheme = "FFA",
     LastReloadReason = "Startup",
 }
 
@@ -192,10 +194,10 @@ local function notifyColorUpdated()
 end
 
 -- ============================================================================
--- [SECTION 3] POOLED DRAWING & SCREENGUI OVERLAY ENGINE
+-- [SECTION 3] RELIABLE SCREENGUI-FIRST + OPTIONAL DRAWING OVERLAY ENGINE
 -- ============================================================================
 local OverlayGui = Instance.new("ScreenGui")
-OverlayGui.Name = "TEAM_AKI_Overlay_v3"
+OverlayGui.Name = "TEAM_AKI_Overlay"
 OverlayGui.IgnoreGuiInset = true
 OverlayGui.ResetOnSpawn = false
 OverlayGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
@@ -236,6 +238,23 @@ do
     DrawingSupported = ok and res == true
 end
 
+local function safeNewDrawing(kind)
+    local ok, obj = pcall(function()
+        local inst = Drawing.new(kind)
+        if inst ~= nil then
+            inst.Visible = false
+            pcall(function()
+                inst.Transparency = 1
+            end)
+        end
+        return inst
+    end)
+    if ok then
+        return obj
+    end
+    return nil
+end
+
 local function safeDestroyDrawing(obj)
     if not obj then
         return
@@ -251,28 +270,22 @@ local function safeDestroyDrawing(obj)
 end
 
 local function shouldUseDrawing()
-    if not DrawingSupported then
-        return false
-    end
-    if Config.ESP.RenderEngine == "ScreenGui" then
-        return false
-    end
-    return true
+    return DrawingSupported and Config.ESP.RenderEngine == "Drawing"
 end
 
--- Pooled FOV Circle (Drawing primary + ScreenGui fallback)
+-- FOV Circle (ScreenGui + optional Drawing synced cleanly)
 local DrawingFOV = nil
 if DrawingSupported then
-    pcall(function()
-        local ring = Drawing.new("Circle")
-        ring.Visible = false
-        ring.Filled = false
-        ring.NumSides = 64
-        ring.Transparency = 0.88
-        ring.Thickness = Config.Aimbot.FOVThickness
-        ring.Color = Config.Colors.FOV
-        DrawingFOV = ring
-    end)
+    DrawingFOV = safeNewDrawing("Circle")
+    if DrawingFOV then
+        pcall(function()
+            DrawingFOV.Filled = false
+            DrawingFOV.NumSides = 64
+            DrawingFOV.Transparency = 0.88
+            DrawingFOV.Thickness = Config.Aimbot.FOVThickness
+            DrawingFOV.Color = Config.Colors.FOV
+        end)
+    end
 end
 
 local FOVRingFrame = Instance.new("Frame")
@@ -293,7 +306,6 @@ FOVStroke.Transparency = 0.2
 FOVStroke.Color = Config.Colors.FOV
 FOVStroke.Parent = FOVRingFrame
 
--- Creates pooled per-player Drawing + ScreenGui visual handles bound directly to Registry[player]
 local function createRegistryVisualBundle()
     local guiRoot = Instance.new("Folder")
     guiRoot.Parent = EspContainer
@@ -403,59 +415,87 @@ local function createRegistryVisualBundle()
     arrowRight.Parent = arrowHolder
 
     local drawCache = nil
-    if DrawingSupported then
-        local ok, cache = pcall(function()
-            local c = {
-                Box = Drawing.new("Square"),
-                Corners = {},
-                HpBack = Drawing.new("Square"),
-                HpFill = Drawing.new("Square"),
-                HpText = Drawing.new("Text"),
-                Tracer = Drawing.new("Line"),
-                Arrow = Drawing.new("Triangle"),
-                Label = Drawing.new("Text"),
-            }
-            c.Box.Visible = false
-            c.Box.Filled = false
-            for i = 1, 8 do
-                local ln = Drawing.new("Line")
-                ln.Visible = false
-                c.Corners[i] = ln
-            end
-            c.HpBack.Visible = false
-            c.HpBack.Filled = true
-            c.HpBack.Color = Color3.fromRGB(11, 13, 20)
-            c.HpFill.Visible = false
-            c.HpFill.Filled = true
-
-            c.HpText.Visible = false
-            c.HpText.Center = false
-            c.HpText.Outline = true
-            c.HpText.Size = 11
-            c.HpText.Color = Color3.fromRGB(242, 245, 252)
-
-            c.Tracer.Visible = false
-            c.Arrow.Visible = false
-            c.Arrow.Filled = true
-            c.Arrow.Thickness = 1
-
-            c.Label.Visible = false
-            c.Label.Center = true
-            c.Label.Outline = true
-            c.Label.Size = 13
-
-            if Drawing.Fonts and Drawing.Fonts.UI then
-                c.Label.Font = Drawing.Fonts.UI
-                c.HpText.Font = Drawing.Fonts.Monospace or Drawing.Fonts.UI
-            else
-                c.Label.Font = 2
-                c.HpText.Font = 2
-            end
-            return c
-        end)
-        if ok and cache then
-            drawCache = cache
+    local function ensureDrawingCache()
+        if drawCache then
+            return drawCache
         end
+        if not DrawingSupported then
+            return nil
+        end
+
+        local boxObj = safeNewDrawing("Square")
+        local hpBackObj = safeNewDrawing("Square")
+        local hpFillObj = safeNewDrawing("Square")
+        local tracerObj = safeNewDrawing("Line")
+        local labelObj = safeNewDrawing("Text")
+        local hpTextObj = safeNewDrawing("Text")
+        local arrowObj = safeNewDrawing("Triangle")
+
+        if not (boxObj and hpBackObj and hpFillObj and tracerObj and labelObj) then
+            safeDestroyDrawing(boxObj)
+            safeDestroyDrawing(hpBackObj)
+            safeDestroyDrawing(hpFillObj)
+            safeDestroyDrawing(tracerObj)
+            safeDestroyDrawing(labelObj)
+            safeDestroyDrawing(hpTextObj)
+            safeDestroyDrawing(arrowObj)
+            return nil
+        end
+
+        local corners = {}
+        for i = 1, 8 do
+            local ln = safeNewDrawing("Line")
+            if not ln then
+                for j = 1, i - 1 do safeDestroyDrawing(corners[j]) end
+                safeDestroyDrawing(boxObj)
+                safeDestroyDrawing(hpBackObj)
+                safeDestroyDrawing(hpFillObj)
+                safeDestroyDrawing(tracerObj)
+                safeDestroyDrawing(labelObj)
+                safeDestroyDrawing(hpTextObj)
+                safeDestroyDrawing(arrowObj)
+                return nil
+            end
+            corners[i] = ln
+        end
+
+        pcall(function()
+            boxObj.Filled = false
+            hpBackObj.Filled = true
+            hpBackObj.Color = Color3.fromRGB(11, 13, 20)
+            hpFillObj.Filled = true
+            labelObj.Center = true
+            labelObj.Outline = true
+            labelObj.Size = 13
+            if Drawing.Fonts and Drawing.Fonts.UI then
+                labelObj.Font = Drawing.Fonts.UI
+            else
+                labelObj.Font = 2
+            end
+            if hpTextObj then
+                hpTextObj.Center = false
+                hpTextObj.Outline = true
+                hpTextObj.Size = 11
+                hpTextObj.Color = Color3.fromRGB(242, 245, 252)
+                hpTextObj.Font = 2
+            end
+            if arrowObj then
+                arrowObj.Filled = true
+                arrowObj.Thickness = 1
+            end
+        end)
+
+        drawCache = {
+            Box = boxObj,
+            Corners = corners,
+            HpBack = hpBackObj,
+            HpFill = hpFillObj,
+            HpText = hpTextObj,
+            Tracer = tracerObj,
+            Arrow = arrowObj,
+            Label = labelObj,
+        }
+        return drawCache
     end
 
     local function hideDrawing()
@@ -469,9 +509,9 @@ local function createRegistryVisualBundle()
             end
             drawCache.HpBack.Visible = false
             drawCache.HpFill.Visible = false
-            drawCache.HpText.Visible = false
+            if drawCache.HpText then drawCache.HpText.Visible = false end
             drawCache.Tracer.Visible = false
-            drawCache.Arrow.Visible = false
+            if drawCache.Arrow then drawCache.Arrow.Visible = false end
             drawCache.Label.Visible = false
         end)
     end
@@ -489,17 +529,17 @@ local function createRegistryVisualBundle()
     end
 
     return {
-        BoxLines = drawCache and drawCache.Corners or cornerSegs,
-        TracerLine = drawCache and drawCache.Tracer or tracerFrame,
-        HealthBg = drawCache and drawCache.HpBack or hpBack,
-        HealthFill = drawCache and drawCache.HpFill or hpFill,
-        AlertArrow = drawCache and drawCache.Arrow or arrowHolder,
+        BoxLines = cornerSegs,
+        TracerLine = tracerFrame,
+        HealthBg = hpBack,
+        HealthFill = hpFill,
+        AlertArrow = arrowHolder,
         HideAll = function()
             hideGui()
             hideDrawing()
         end,
         Render = function(self, state)
-            local useDraw = shouldUseDrawing() and drawCache ~= nil
+            local useDraw = shouldUseDrawing() and ensureDrawingCache() ~= nil
             if useDraw then
                 hideGui()
                 local d = drawCache
@@ -557,18 +597,20 @@ local function createRegistryVisualBundle()
                         d.HpFill.Size = Vector2.new(barW, fillH)
                         d.HpFill.Color = state.HealthColor
 
-                        if state.ShowHealthText and state.BH >= 16 then
-                            d.HpText.Visible = true
-                            d.HpText.Text = string.format("%d%%", math.round(state.HealthRatio * 100))
-                            d.HpText.Color = state.HealthColor
-                            d.HpText.Position = Vector2.new(barX - 30, math.clamp(barY + (barH - fillH) - 6, barY - 2, barY + barH - 10))
-                        else
-                            d.HpText.Visible = false
+                        if d.HpText then
+                            if state.ShowHealthText and state.BH >= 14 then
+                                d.HpText.Visible = true
+                                d.HpText.Text = string.format("%d%%", math.round(state.HealthRatio * 100))
+                                d.HpText.Color = state.HealthColor
+                                d.HpText.Position = Vector2.new(barX - 30, math.clamp(barY + (barH - fillH) - 6, barY - 2, barY + barH - 10))
+                            else
+                                d.HpText.Visible = false
+                            end
                         end
                     else
                         d.HpBack.Visible = false
                         d.HpFill.Visible = false
-                        d.HpText.Visible = false
+                        if d.HpText then d.HpText.Visible = false end
                     end
 
                     if state.ShowLabel then
@@ -590,24 +632,26 @@ local function createRegistryVisualBundle()
                         d.Tracer.Visible = false
                     end
 
-                    if state.ShowArrow then
-                        local dir = Vector2.new(math.cos(state.ArrowAngle), math.sin(state.ArrowAngle))
-                        local perp = Vector2.new(-dir.Y, dir.X)
-                        local tip = state.ArrowPos
-                        local baseCenter = tip - dir * 14
-                        d.Arrow.Visible = true
-                        d.Arrow.PointA = tip
-                        d.Arrow.PointB = baseCenter + perp * 7
-                        d.Arrow.PointC = baseCenter - perp * 7
-                        d.Arrow.Color = state.ArrowColor
-                    else
-                        d.Arrow.Visible = false
+                    if d.Arrow then
+                        if state.ShowArrow then
+                            local dir = Vector2.new(math.cos(state.ArrowAngle), math.sin(state.ArrowAngle))
+                            local perp = Vector2.new(-dir.Y, dir.X)
+                            local tip = state.ArrowPos
+                            local baseCenter = tip - dir * 14
+                            d.Arrow.Visible = true
+                            d.Arrow.PointA = tip
+                            d.Arrow.PointB = baseCenter + perp * 7
+                            d.Arrow.PointC = baseCenter - perp * 7
+                            d.Arrow.Color = state.ArrowColor
+                        else
+                            d.Arrow.Visible = false
+                        end
                     end
                 end)
                 return
             end
 
-            -- ScreenGui fallback path
+            -- Reliable Native ScreenGui Render Path
             hideDrawing()
 
             if state.ShowBox then
@@ -665,7 +709,7 @@ local function createRegistryVisualBundle()
                 hpFill.Size = UDim2.fromScale(1, state.HealthRatio)
                 hpFill.BackgroundColor3 = state.HealthColor
 
-                if state.ShowHealthText and state.BH >= 16 then
+                if state.ShowHealthText and state.BH >= 14 then
                     hpTextLabel.Visible = true
                     hpTextLabel.Text = string.format("%d%%", math.round(state.HealthRatio * 100))
                     hpTextLabel.TextColor3 = state.HealthColor
@@ -729,7 +773,7 @@ local function createRegistryVisualBundle()
 end
 
 -- ============================================================================
--- [SECTION 4] EVENT-DRIVEN FULL RELOAD SYSTEM & REGISTRY LIFECYCLE
+-- [SECTION 4] EVENT-DRIVEN REGISTRY, CHARACTER RESOLVER & FULL RELOAD
 -- ============================================================================
 local RIG_PART_NAMES = {
     Head = true,
@@ -798,7 +842,7 @@ local function resolveCharacterForPlayer(player)
     end
 
     local wsChild = Workspace:FindFirstChild(targetName)
-    if wsChild and wsChild:IsA("Model") and (wsChild:FindFirstChildOfClass("Humanoid") or wsChild.PrimaryPart) then
+    if wsChild and wsChild:IsA("Model") and (wsChild:FindFirstChildOfClass("Humanoid") or wsChild.PrimaryPart or wsChild:FindFirstChild("HumanoidRootPart") or wsChild:FindFirstChild("Head")) then
         return wsChild
     end
 
@@ -1006,14 +1050,14 @@ local function registerPlayerEntry(player)
     table.insert(entry.PlayerConns, player.CharacterAdded:Connect(function(char)
         if not State.Unloaded then
             bindCharacterToEntry(entry, char)
-            ScheduleReload("RemoteCharacterAdded:" .. player.Name)
+            ScheduleReload("RemoteCharacterAdded:" .. player.Name, false)
         end
     end))
 
     table.insert(entry.PlayerConns, player.CharacterRemoving:Connect(function()
         clearCharacterFromEntry(entry)
         if not State.Unloaded then
-            ScheduleReload("RemoteCharacterRemoving:" .. player.Name)
+            ScheduleReload("RemoteCharacterRemoving:" .. player.Name, false)
         end
     end))
 
@@ -1023,7 +1067,6 @@ local function registerPlayerEntry(player)
     end
 end
 
--- Local Player Character, Humanoid & Camera Re-Binding
 local function clearLocalCharacterState()
     State.LocalCharacter = nil
     State.LocalHumanoid = nil
@@ -1057,19 +1100,18 @@ local function bindLocalCharacter(character)
         table.insert(State.LocalConns, hum.Died:Connect(function()
             State.LocalAlive = false
             State.CurrentAimTarget = nil
-            ScheduleReload("LocalPlayerDied")
+            ScheduleReload("LocalPlayerDied", false)
         end))
     end
 
     if State.LocalHumanoid then
         attachHumanoidDeath(State.LocalHumanoid)
     else
-        -- Wait briefly without yielding inside RenderStep for Humanoid readiness
         table.insert(State.LocalConns, character.ChildAdded:Connect(function(child)
             if State.Unloaded then return end
             if child:IsA("Humanoid") then
                 attachHumanoidDeath(child)
-                ScheduleReload("LocalHumanoidReady")
+                ScheduleReload("LocalHumanoidReady", false)
             elseif child.Name == "HumanoidRootPart" and child:IsA("BasePart") then
                 State.LocalRootPart = child
             end
@@ -1079,40 +1121,41 @@ local function bindLocalCharacter(character)
     table.insert(State.LocalConns, character.AncestryChanged:Connect(function(_, newParent)
         if not newParent and not State.Unloaded then
             clearLocalCharacterState()
-            ScheduleReload("LocalCharacterRemoved")
+            ScheduleReload("LocalCharacterRemoved", false)
         end
     end))
 end
 
--- Centralized Debounced Full Reload (tears down stale/orphaned state & rebuilds Registry from scratch)
-ReloadAllSystems = function(reason)
+-- Full Reload: resets stale entries without flashing healthy players unless hardReset == true
+ReloadAllSystems = function(reason, hardReset)
     if State.Unloaded then
         return
     end
 
-    State.ReloadPending = false
     State.ReloadCount = State.ReloadCount + 1
-    State.LastReloadReason = reason or "Manual"
+    State.LastReloadReason = reason or "Event"
     State.CurrentAimTarget = nil
     State.Camera = Workspace.CurrentCamera
+    State.LastTeamScan = -1
 
-    -- 1. Clean teardown of all existing Registry entries and leftover Highlights
-    local existingPlayers = {}
-    for player in pairs(Registry) do
-        table.insert(existingPlayers, player)
-    end
-    for _, player in ipairs(existingPlayers) do
-        destroyPlayerEntry(player)
-    end
-    clearTable(Registry)
+    if hardReset then
+        local existing = {}
+        for player in pairs(Registry) do
+            table.insert(existing, player)
+        end
+        for _, player in ipairs(existing) do
+            destroyPlayerEntry(player)
+        end
+        clearTable(Registry)
 
-    for _, hl in ipairs(HighlightContainer:GetChildren()) do
-        pcall(function()
-            hl:Destroy()
-        end)
+        for _, hl in ipairs(HighlightContainer:GetChildren()) do
+            pcall(function()
+                hl:Destroy()
+            end)
+        end
     end
 
-    -- 2. Re-bind LocalPlayer character if missing or changed
+    -- Re-bind LocalPlayer character & humanoid
     local liveLocalChar = LocalPlayer.Character
     if liveLocalChar and liveLocalChar.Parent then
         if State.LocalCharacter ~= liveLocalChar then
@@ -1120,111 +1163,135 @@ ReloadAllSystems = function(reason)
         else
             State.LocalHumanoid = liveLocalChar:FindFirstChildOfClass("Humanoid") or State.LocalHumanoid
             State.LocalRootPart = liveLocalChar:FindFirstChild("HumanoidRootPart") or liveLocalChar.PrimaryPart or State.LocalRootPart
+            if State.LocalHumanoid then
+                State.LocalAlive = (State.LocalHumanoid.Health > 0)
+            end
         end
     end
 
-    -- 3. Rebuild complete active Registry from current Players:GetPlayers()
+    -- Reconcile every active player in Players:GetPlayers()
+    local seen = {}
     for _, player in ipairs(Players:GetPlayers()) do
         if player ~= LocalPlayer then
-            registerPlayerEntry(player)
+            seen[player] = true
+            local entry = Registry[player]
+            if not entry then
+                registerPlayerEntry(player)
+                entry = Registry[player]
+            end
+            if entry then
+                local liveChar = resolveCharacterForPlayer(player)
+                if liveChar and liveChar.Parent then
+                    if entry.Character ~= liveChar then
+                        bindCharacterToEntry(entry, liveChar)
+                    else
+                        cacheCharacterParts(entry, liveChar)
+                    end
+                elseif entry.Character ~= nil then
+                    clearCharacterFromEntry(entry)
+                end
+            end
         end
+    end
+
+    -- Clean up any player who left
+    local toRemove = {}
+    for player in pairs(Registry) do
+        if not seen[player] then
+            table.insert(toRemove, player)
+        end
+    end
+    for _, player in ipairs(toRemove) do
+        destroyPlayerEntry(player)
     end
 end
 
-ScheduleReload = function(reason)
+ScheduleReload = function(reason, hardReset)
     if State.Unloaded then
         return
     end
     State.ReloadToken = State.ReloadToken + 1
     local myToken = State.ReloadToken
-    State.ReloadPending = true
     State.LastReloadReason = reason or "Event"
 
     task.delay(0.06, function()
         if not State.Unloaded and State.ReloadToken == myToken then
-            ReloadAllSystems(reason)
+            ReloadAllSystems(reason, hardReset == true)
         end
     end)
 end
 
--- Wire all mandatory player & local-player lifecycle events
 addConnection(Players.PlayerAdded:Connect(function(player)
     if not State.Unloaded then
         registerPlayerEntry(player)
-        ScheduleReload("PlayerAdded:" .. player.Name)
+        ScheduleReload("PlayerAdded:" .. player.Name, false)
     end
 end))
 
 addConnection(Players.PlayerRemoving:Connect(function(player)
     destroyPlayerEntry(player)
     if not State.Unloaded then
-        ScheduleReload("PlayerRemoving:" .. player.Name)
+        ScheduleReload("PlayerRemoving:" .. player.Name, false)
     end
 end))
 
 addConnection(LocalPlayer.CharacterAdded:Connect(function(char)
     if not State.Unloaded then
         bindLocalCharacter(char)
-        ScheduleReload("LocalPlayerRespawned")
+        ScheduleReload("LocalPlayerRespawned", false)
     end
 end))
 
 addConnection(LocalPlayer.CharacterRemoving:Connect(function()
     clearLocalCharacterState()
     if not State.Unloaded then
-        ScheduleReload("LocalPlayerCharacterRemoving")
+        ScheduleReload("LocalCharacterRemoving", false)
     end
 end))
 
--- Initial startup population & local character bind
 if LocalPlayer.Character then
     bindLocalCharacter(LocalPlayer.Character)
 end
-ReloadAllSystems("InitialBootstrap")
+ReloadAllSystems("InitialBootstrap", true)
 
--- 1.0s Periodic Safety Sync: repairs any missed player or stale character automatically
 local function runPeriodicSafetySync()
-    local currentPlayers = Players:GetPlayers()
     local seen = {}
-    local mismatchReason = nil
+    local needsReload = false
 
-    for _, player in ipairs(currentPlayers) do
+    for _, player in ipairs(Players:GetPlayers()) do
         if player ~= LocalPlayer then
             seen[player] = true
             local entry = Registry[player]
             if not entry then
-                mismatchReason = "PeriodicMissingPlayer:" .. player.Name
+                needsReload = true
                 break
             end
             local liveChar = resolveCharacterForPlayer(player)
             if liveChar and entry.Character ~= liveChar then
-                mismatchReason = "PeriodicCharMismatch:" .. player.Name
+                needsReload = true
                 break
             elseif (not liveChar) and entry.Character ~= nil then
                 clearCharacterFromEntry(entry)
-            elseif entry.NeedsRescan or (liveChar and (not entry.RootPart or not entry.RootPart.Parent)) then
-                entry.NeedsRescan = false
-                cacheCharacterParts(entry, liveChar)
             end
         end
     end
 
-    if not mismatchReason then
+    if not needsReload then
         for player in pairs(Registry) do
             if not seen[player] then
-                mismatchReason = "PeriodicOrphanedPlayer"
+                needsReload = true
                 break
             end
         end
     end
 
-    if mismatchReason then
-        ReloadAllSystems(mismatchReason)
+    if needsReload then
+        ReloadAllSystems("PeriodicSafetySync", false)
     end
 end
 
 -- ============================================================================
--- [SECTION 5] SHARED ELIGIBILITY, VISIBILITY & COLOR RESOLVER PIPELINE
+-- [SECTION 5] FFA-SAFE TEAM RESOLVER, SHARED ELIGIBILITY & VISIBILITY PIPELINE
 -- ============================================================================
 local function readTeamAttribute(inst)
     if not inst then
@@ -1238,19 +1305,86 @@ local function readTeamAttribute(inst)
     return v
 end
 
-local function readOverheadTagColor(char)
-    if not char then
-        return nil
+local NON_COMBAT_TEAM_NAMES = {
+    lobby = true,
+    spectator = true,
+    spectators = true,
+    afk = true,
+    waiting = true,
+    dead = true,
+    ffa = true,
+    ["free for all"] = true,
+    players = true,
+    playing = true,
+    alive = true,
+    ingame = true,
+    ["in-game"] = true,
+    neutral = true,
+    none = true,
+}
+
+local function isCombatTeam(teamObj)
+    if not teamObj then
+        return false
     end
-    for _, desc in ipairs(char:GetDescendants()) do
-        if desc:IsA("BillboardGui") then
-            local lbl = desc:FindFirstChildOfClass("TextLabel")
-            if lbl and lbl.Visible then
-                return lbl.TextColor3
+    local lowerName = string.lower(teamObj.Name)
+    return not NON_COMBAT_TEAM_NAMES[lowerName]
+end
+
+-- Detects whether this server actually has >= 2 distinct combat teams (prevents FFA false teammate filtering!)
+local function refreshDetectedTeamScheme()
+    local now = os.clock()
+    if State.LastTeamScan >= 0 and (now - State.LastTeamScan) < 0.75 then
+        return State.DetectedTeamScheme
+    end
+    State.LastTeamScan = now
+
+    local distinctTeams = {}
+    local teamCount = 0
+    local distinctColors = {}
+    local colorCount = 0
+    local distinctAttrs = {}
+    local attrCount = 0
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if isCombatTeam(plr.Team) and not plr.Neutral then
+            if not distinctTeams[plr.Team] then
+                distinctTeams[plr.Team] = true
+                teamCount = teamCount + 1
+            end
+        end
+        if not plr.Neutral and (plr.Team == nil or isCombatTeam(plr.Team)) then
+            local colKey = plr.TeamColor.Name
+            if not distinctColors[colKey] then
+                distinctColors[colKey] = true
+                colorCount = colorCount + 1
+            end
+        end
+        local attr = readTeamAttribute(plr)
+        if attr == nil and plr.Character then
+            attr = readTeamAttribute(plr.Character)
+        end
+        if attr ~= nil then
+            local ak = tostring(attr)
+            if not distinctAttrs[ak] then
+                distinctAttrs[ak] = true
+                attrCount = attrCount + 1
             end
         end
     end
-    return nil
+
+    if teamCount >= 2 then
+        State.DetectedTeamScheme = "Team"
+    elseif attrCount >= 2 then
+        State.DetectedTeamScheme = "Attribute"
+    elseif colorCount >= 2 and #Teams:GetTeams() >= 2 then
+        State.DetectedTeamScheme = "TeamColor"
+    else
+        -- Free-for-all or single-team lobby: never hide enemies as teammates
+        State.DetectedTeamScheme = "FFA"
+    end
+
+    return State.DetectedTeamScheme
 end
 
 local function isTeammate(player, entry)
@@ -1264,10 +1398,8 @@ local function isTeammate(player, entry)
     end
 
     if mode == "Team Property" then
-        if LocalPlayer.Team ~= nil and player.Team ~= nil then
-            if not LocalPlayer.Neutral and not player.Neutral then
-                return LocalPlayer.Team == player.Team
-            end
+        if LocalPlayer.Team ~= nil and player.Team ~= nil and not LocalPlayer.Neutral and not player.Neutral then
+            return LocalPlayer.Team == player.Team
         end
         return false
     end
@@ -1279,41 +1411,27 @@ local function isTeammate(player, entry)
         return false
     end
 
-    if LocalPlayer.Team ~= nil and player.Team ~= nil then
-        if not LocalPlayer.Neutral and not player.Neutral then
+    -- "Auto" FFA-aware mode
+    local scheme = refreshDetectedTeamScheme()
+    if scheme == "FFA" then
+        return false
+    elseif scheme == "Team" then
+        if isCombatTeam(LocalPlayer.Team) and isCombatTeam(player.Team) and not LocalPlayer.Neutral and not player.Neutral then
             return LocalPlayer.Team == player.Team
         end
-    end
-
-    if not LocalPlayer.Neutral and not player.Neutral and #Teams:GetTeams() > 0 then
-        if LocalPlayer.TeamColor == player.TeamColor then
-            return true
+        return false
+    elseif scheme == "TeamColor" then
+        if not LocalPlayer.Neutral and not player.Neutral then
+            return LocalPlayer.TeamColor == player.TeamColor
         end
-    end
-
-    local localAttr = readTeamAttribute(LocalPlayer)
-    local targetAttr = readTeamAttribute(player)
-    if localAttr ~= nil and targetAttr ~= nil then
-        return localAttr == targetAttr
-    end
-
-    local localChar = State.LocalCharacter or LocalPlayer.Character
-    local targetChar = (entry and entry.Character) or player.Character
-    if localChar and targetChar then
-        local cLocal = readTeamAttribute(localChar)
-        local cTarget = readTeamAttribute(targetChar)
-        if cLocal ~= nil and cTarget ~= nil then
-            return cLocal == cTarget
+        return false
+    elseif scheme == "Attribute" then
+        local lAttr = readTeamAttribute(LocalPlayer) or readTeamAttribute(State.LocalCharacter or LocalPlayer.Character)
+        local tAttr = readTeamAttribute(player) or readTeamAttribute((entry and entry.Character) or player.Character)
+        if lAttr ~= nil and tAttr ~= nil then
+            return lAttr == tAttr
         end
-
-        local lTag = readOverheadTagColor(localChar)
-        local tTag = readOverheadTagColor(targetChar)
-        if lTag and tTag then
-            local diff = math.abs(lTag.R - tTag.R) + math.abs(lTag.G - tTag.G) + math.abs(lTag.B - tTag.B)
-            if diff < 0.05 then
-                return true
-            end
-        end
+        return false
     end
 
     return false
@@ -1450,7 +1568,6 @@ local function raycastPartVisible(camera, targetCharacter, targetPart)
     return false
 end
 
--- Shared Visibility & Color Resolver: single raycast evaluation per target/frame
 local function GetTargetVisualState(player, targetPart)
     local entry = Registry[player]
     if not entry then
@@ -1492,7 +1609,6 @@ local function GetTargetVisualState(player, targetPart)
     return result
 end
 
--- Shared Target Eligibility Pipeline used by BOTH Aimbot and ESP
 local function IsValidTarget(player, opts)
     if not player or player == LocalPlayer then
         return false, nil, nil, math.huge
@@ -1533,9 +1649,9 @@ local function IsValidTarget(player, opts)
 end
 
 -- ============================================================================
--- [SECTION 6] REBUILT ESP RENDERER (CORNER BOX, HEALTH BAR, ANCHOR TRACERS, 360 & HL)
+-- [SECTION 6] REBUILT ESP RENDERER (WITH PROPORTIONAL DISTANCE BOX FALLBACK)
 -- ============================================================================
-local function computeScreenBox(camera, entry)
+local function computeScreenBox(camera, entry, rootVP, worldDist)
     local minX, minY = math.huge, math.huge
     local maxX, maxY = -math.huge, -math.huge
     local anyInFront = false
@@ -1591,12 +1707,21 @@ local function computeScreenBox(camera, entry)
         end
     end
 
-    if not anyInFront or minX >= maxX or minY >= maxY then
-        return false, 0, 0, 0, 0
+    if anyInFront and minX < maxX and minY < maxY then
+        local pad = 3
+        local w = math.max((maxX - minX) + pad * 2, 8)
+        local h = math.max((maxY - minY) + pad * 2, 12)
+        return true, minX - pad, minY - pad, w, h
     end
 
-    local pad = 3
-    return true, minX - pad, minY - pad, (maxX - minX) + pad * 2, (maxY - minY) + pad * 2
+    -- Fallback proportional 2D box anchored around RootPart projection
+    if rootVP and rootVP.Z > 0 then
+        local h = math.clamp(2100 / math.max(worldDist, 4), 14, 320)
+        local w = h * 0.58
+        return true, rootVP.X - w * 0.5, rootVP.Y - h * 0.5, w, h
+    end
+
+    return false, 0, 0, 0, 0
 end
 
 local function getHealthColor(ratio)
@@ -1638,14 +1763,12 @@ local function updateAllESP(camera, viewportSize, screenCenter)
 
                 local boxValid, bx, by, bw, bh = false, 0, 0, 0, 0
                 if not isBehind then
-                    boxValid, bx, by, bw, bh = computeScreenBox(camera, entry)
+                    boxValid, bx, by, bw, bh = computeScreenBox(camera, entry, rootVP, worldDist)
                 end
 
-                -- 1. Sidebar Health Bar (0% - 100%)
                 local _, _, hpRatio = getCharacterHealth(entry)
                 local hpColor = getHealthColor(hpRatio)
 
-                -- 2. Anchor-Matched Tracer Wiring (Bottom->Feet, Center->Chest, Top->Head)
                 local showTracer = Config.ESP.TracerESP and (not isBehind) and rootOnScreen
                 local tracerFrom = Vector2.new(viewportSize.X * 0.5, viewportSize.Y)
                 local tracerTo = boxValid and Vector2.new(bx + bw * 0.5, by + bh) or screenPos
@@ -1691,7 +1814,6 @@ local function updateAllESP(camera, viewportSize, screenCenter)
                     end
                 end
 
-                -- 3. 360-Degree Off-Screen Alert wired to GetTargetVisualState
                 local showArrow = false
                 local arrowPos = Vector2.zero
                 local arrowAngle = 0
@@ -1742,7 +1864,6 @@ local function updateAllESP(camera, viewportSize, screenCenter)
                     ArrowColor = arrowColor,
                 })
 
-                -- 4. Highlight ESP wired directly to GetTargetVisualState
                 if Config.ESP.HighlightESP then
                     local hlAllowed = (not Config.ESP.HighlightVisibleOnly) or visState.isVisible
                     if hlAllowed then
@@ -1932,7 +2053,7 @@ local function evaluateAimCandidate(player, camera, screenCenter)
 end
 
 local function updateAimbot(camera, screenCenter, dt)
-    if not Config.Aimbot.Enabled or not State.LocalAlive or not isAimbotInputActive() then
+    if not Config.Aimbot.Enabled or not isAimbotInputActive() then
         State.CurrentAimTarget = nil
         return
     end
@@ -2002,9 +2123,9 @@ local function updateAimbot(camera, screenCenter, dt)
 end
 
 -- ============================================================================
--- [SECTION 8] MAIN RENDER LOOP & 1.0S PERIODIC SAFETY SYNC
+-- [SECTION 8] MAIN RENDER LOOP & EVERY-FRAME PLAYER COVERAGE SYNC
 -- ============================================================================
-local RENDER_STEP_NAME = "TEAM_AKI_RenderStep_v3"
+local RENDER_STEP_NAME = "TEAM_AKI_RenderStep"
 
 pcall(function()
     RunService:UnbindFromRenderStep(RENDER_STEP_NAME)
@@ -2023,28 +2144,44 @@ RunService:BindToRenderStep(RENDER_STEP_NAME, Enum.RenderPriority.Camera.Value +
         return
     end
 
-    -- 1.0s Periodic Safety Sync checking Registry integrity against Players:GetPlayers()
+    -- 1.0s periodic safety sync
     local now = os.clock()
     if (now - State.LastSafetySync) >= SAFETY_SYNC_INTERVAL then
         State.LastSafetySync = now
         pcall(runPeriodicSafetySync)
     end
 
-    -- Fast per-frame attachment of any newly created character parts
-    for _, entry in pairs(Registry) do
-        local liveChar = resolveCharacterForPlayer(entry.Player)
-        if liveChar and entry.Character ~= liveChar then
-            bindCharacterToEntry(entry, liveChar)
-        elseif entry.NeedsRescan and entry.Character then
-            entry.NeedsRescan = false
-            cacheCharacterParts(entry, entry.Character)
+    -- Fast per-frame player & character guarantee so zero spawned players are ever missed
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            local entry = Registry[player]
+            if not entry then
+                registerPlayerEntry(player)
+                entry = Registry[player]
+            end
+            if entry then
+                local liveChar = resolveCharacterForPlayer(player)
+                if liveChar and liveChar.Parent then
+                    if entry.Character ~= liveChar then
+                        bindCharacterToEntry(entry, liveChar)
+                    elseif entry.NeedsRescan
+                        or (not entry.RootPart)
+                        or (not entry.RootPart.Parent)
+                        or (#entry.RigParts == 0 and (now - entry.LastScanTime) > 0.25)
+                    then
+                        entry.NeedsRescan = false
+                        cacheCharacterParts(entry, liveChar)
+                    end
+                elseif entry.Character ~= nil then
+                    clearCharacterFromEntry(entry)
+                end
+            end
         end
     end
 
     local viewportSize = camera.ViewportSize
     local screenCenter = Vector2.new(viewportSize.X * 0.5, viewportSize.Y * 0.5)
 
-    -- FOV Circle & FOVThickness bound every render step
     local showFov = Config.Aimbot.ShowFOV and Config.Aimbot.Enabled
     local useDrawingFov = shouldUseDrawing() and DrawingFOV ~= nil
 
@@ -2076,7 +2213,7 @@ end)
 -- [SECTION 9] ADAPTIVE DEEP GLASSMORPHIC UI SHELL (TEAM AKI)
 -- ============================================================================
 local MainGui = Instance.new("ScreenGui")
-MainGui.Name = "TEAM_AKI_Hub_v3"
+MainGui.Name = "TEAM_AKI_Hub"
 MainGui.IgnoreGuiInset = true
 MainGui.ResetOnSpawn = false
 MainGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
@@ -2274,7 +2411,7 @@ SubtitleLabel.AnchorPoint = Vector2.new(0, 0.5)
 SubtitleLabel.Position = UDim2.new(0, 118, 0.5, 0)
 SubtitleLabel.Size = UDim2.new(1, -210, 0, 18)
 SubtitleLabel.Font = Enum.Font.GothamMedium
-SubtitleLabel.Text = "Event-Synced Combat & ESP Hub"
+SubtitleLabel.Text = "Universal Combat & ESP Hub"
 SubtitleLabel.TextSize = 11.5
 SubtitleLabel.TextColor3 = Palette.TextSilver
 SubtitleLabel.TextXAlignment = Enum.TextXAlignment.Left
@@ -2492,7 +2629,6 @@ end
 local SyncCallbacks = {}
 local syncMobileAimVisibility = function() end
 
--- Immediately propagates UI Config mutations across dependent modules
 local function SyncDependentSettings(needsFullReload, reason)
     if not Config.Aimbot.Enabled then
         State.CurrentAimTarget = nil
@@ -2507,9 +2643,10 @@ local function SyncDependentSettings(needsFullReload, reason)
             if entry.Highlight then entry.Highlight.Enabled = false end
         end
     end
+    State.LastTeamScan = -1
     syncMobileAimVisibility()
     if needsFullReload then
-        ScheduleReload(reason or "ConfigMutation")
+        ScheduleReload(reason or "ConfigMutation", false)
     end
 end
 
@@ -2897,7 +3034,7 @@ end, function(v)
     Config.Aimbot.ShowFOV = v
 end)
 
-addToggle(AimbotPage, 10, "Team Check", "Skips teammates via shared eligibility pipeline", function()
+addToggle(AimbotPage, 10, "Team Check", "Skips teammates (FFA-safe Auto mode)", function()
     return Config.Aimbot.TeamCheck
 end, function(v)
     Config.Aimbot.TeamCheck = v
@@ -2989,7 +3126,7 @@ end, function(v)
     Config.ESP.ShowNameDistance = v
 end)
 
-addToggle(EspPage, 13, "ESP Team Check", "Hides ESP elements for teammates", function()
+addToggle(EspPage, 13, "ESP Team Check", "Hides ESP elements for teammates (FFA-safe)", function()
     return Config.ESP.TeamCheck
 end, function(v)
     Config.ESP.TeamCheck = v
@@ -3259,7 +3396,7 @@ end, function(v)
     Config.Resolver.TeamCheckMode = v
 end, true)
 
-addSelector(SettingsPage, 2, "ESP Render Engine", {"Auto", "Drawing", "ScreenGui"}, function()
+addSelector(SettingsPage, 2, "ESP Render Engine", {"ScreenGui", "Drawing"}, function()
     return Config.ESP.RenderEngine
 end, function(v)
     Config.ESP.RenderEngine = v
@@ -3269,7 +3406,7 @@ addToggle(SettingsPage, 3, "Workspace Container Scan", "Scans custom Players / C
     return Config.Resolver.CustomContainerScan
 end, function(v)
     Config.Resolver.CustomContainerScan = v
-    ScheduleReload("CustomContainerScanToggle")
+    ScheduleReload("CustomContainerScanToggle", false)
 end)
 
 addToggle(SettingsPage, 4, "Ignore Transparent Glass & Water", "Allows raycast wall check through glass/water", function()
@@ -3518,7 +3655,7 @@ addConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
 end))
 
 ForceReloadBtn.Activated:Connect(function()
-    ReloadAllSystems("ManualButton")
+    ReloadAllSystems("ManualButton", true)
 end)
 
 ResetBtn.Activated:Connect(function()
