@@ -112,12 +112,12 @@ local Config = {
     },
     TriggerBot = {
         Enabled = false,
-        FireMode = "Auto",              -- "Auto" | "Tool Only" | "Mouse1" | "VirtualInput"
+        FireMode = "Safe Auto",         -- "Safe Auto" | "Tool Only" | "Shoot Btn" | "Mouse1 (PC)"
         TargetFilter = "Any Part",      -- "Any Part" | "Head & Chest" | "Head Only"
         HoldToFire = false,             -- true = hold trigger while locked; false = timed tap shots
         ReactionDelay = 0.03,           -- 0.00 .. 0.30 seconds
         ShotCooldown = 0.09,            -- 0.02 .. 0.60 seconds
-        CrosshairTolerance = 6,         -- 0 .. 28 px proximity sweep when ray misses edge
+        CrosshairTolerance = 2,         -- 0 .. 28 px proximity sweep when ray misses edge
         TeamCheck = true,
         VisibleCheck = true,
         MaxDistance = 1200,
@@ -197,13 +197,17 @@ local State = {
     TriggerAcquireTime = 0,
     LastTriggerFire = 0,
     TriggerHolding = false,
+    TriggerMouseHeld = false,
+    TriggerVimHeld = false,
     TriggerToolRef = nil,
+    CachedShootButton = nil,
     ColorListeners = {},
     FrameIndex = 0,
     LastRenderTick = 0,
     ReloadCount = 0,
     ReloadToken = 0,
     LastSafetySync = 0,
+    LastWorkspaceDeepScan = 0,
     LastTeamScan = -1,
     DetectedTeamScheme = "FFA",
     LastReloadReason = "Startup",
@@ -1056,7 +1060,51 @@ local function cacheCharacterParts(entry, character)
         or entry.Head
         or character.PrimaryPart
         or rigParts[1]
+        or character:FindFirstChildWhichIsA("BasePart", true)
     entry.LastScanTime = os.clock()
+end
+
+-- Deep arbitrary-depth Workspace descendant scan used only for players whose Character isn't bound yet
+local function deepWorkspaceScanForMissingPlayers(missingPlayers)
+    local foundMap = {}
+    if not missingPlayers or #missingPlayers == 0 or not Config.Resolver.CustomContainerScan then
+        return foundMap
+    end
+
+    local remaining = {}
+    local remainingCount = 0
+    for _, plr in ipairs(missingPlayers) do
+        if plr and plr ~= LocalPlayer and plr.Parent == Players then
+            remaining[plr] = true
+            remainingCount = remainingCount + 1
+        end
+    end
+    if remainingCount == 0 then
+        return foundMap
+    end
+
+    for _, desc in ipairs(Workspace:GetDescendants()) do
+        if desc:IsA("Model") and desc ~= State.LocalCharacter then
+            for plr in pairs(remaining) do
+                local ok, alive = isCandidateModelForPlayer(desc, plr)
+                if ok then
+                    if alive or not foundMap[plr] then
+                        foundMap[plr] = desc
+                    end
+                    if alive then
+                        remaining[plr] = nil
+                        remainingCount = remainingCount - 1
+                        break
+                    end
+                end
+            end
+            if remainingCount == 0 then
+                break
+            end
+        end
+    end
+
+    return foundMap
 end
 
 local function destroyHighlight(entry)
@@ -1359,6 +1407,7 @@ ReloadAllSystems = function(reason, hardReset)
 
     -- Reconcile every active player in Players:GetPlayers()
     local seen = {}
+    local missingPlayers = {}
     for _, player in ipairs(Players:GetPlayers()) do
         if player ~= LocalPlayer then
             seen[player] = true
@@ -1389,9 +1438,22 @@ ReloadAllSystems = function(reason, hardReset)
                         cacheCharacterParts(entry, liveChar)
                         attachRemoteHumanoidDeath(entry)
                     end
-                elseif entry.Character ~= nil then
-                    clearCharacterFromEntry(entry)
+                else
+                    if entry.Character ~= nil then
+                        clearCharacterFromEntry(entry)
+                    end
+                    table.insert(missingPlayers, player)
                 end
+            end
+        end
+    end
+
+    if #missingPlayers > 0 then
+        local recovered = deepWorkspaceScanForMissingPlayers(missingPlayers)
+        for player, liveChar in pairs(recovered) do
+            local entry = Registry[player]
+            if entry and liveChar and liveChar.Parent then
+                bindCharacterToEntry(entry, liveChar)
             end
         end
     end
@@ -1480,7 +1542,18 @@ local NON_COMBAT_TEAM_NAMES = {
     ghost = true,
     ffa = true,
     ["free for all"] = true,
+    player = true,
     players = true,
+    participant = true,
+    participants = true,
+    contestant = true,
+    contestants = true,
+    spawned = true,
+    active = true,
+    match = true,
+    game = true,
+    everyone = true,
+    all = true,
     playing = true,
     alive = true,
     ingame = true,
@@ -1525,7 +1598,7 @@ local function playerHasLivingWorkspaceChar(plr)
     local ch = plr and plr.Character
     if ch and ch.Parent and ch:IsDescendantOf(Workspace) then
         local hum = ch:FindFirstChildOfClass("Humanoid")
-        if hum and hum.Health <= 0 then
+        if hum and hum.MaxHealth > 0 and hum.Health <= 0 then
             local customAlive = (ch:GetAttribute("Alive") == true) or (type(ch:GetAttribute("Health")) == "number" and ch:GetAttribute("Health") > 0)
             if not customAlive then
                 return false
@@ -1689,7 +1762,7 @@ local function isEntryAlive(entry)
 
     local hum = entry.Humanoid
     if hum and hum.Parent then
-        if hum.Health <= 0 then
+        if hum.MaxHealth > 0 and hum.Health <= 0 then
             local customAlive = (char:GetAttribute("Alive") == true) or (type(char:GetAttribute("Health")) == "number" and char:GetAttribute("Health") > 0)
             if not customAlive then
                 return false
@@ -1930,14 +2003,16 @@ local function computeScreenBox(camera, entry, rootVP, worldDist)
     if anyInFront and minX < maxX and minY < maxY then
         local pad = 3
         local vpSize = camera.ViewportSize
+        local rawW = (maxX - minX) + pad * 2
+        local rawH = (maxY - minY) + pad * 2
         local x1 = math.clamp(minX - pad, -40, vpSize.X + 40)
         local y1 = math.clamp(minY - pad, -40, vpSize.Y + 40)
         local x2 = math.clamp(maxX + pad, -40, vpSize.X + 40)
         local y2 = math.clamp(maxY + pad, -40, vpSize.Y + 40)
         local w = x2 - x1
         local h = y2 - y1
-        if w >= 8 and h >= 12 and w <= vpSize.X * 1.4 and h <= vpSize.Y * 1.4 then
-            return true, x1, y1, w, h
+        if w >= 6 and h >= 10 and rawW <= vpSize.X * 1.4 and rawH <= vpSize.Y * 1.4 then
+            return true, x1, y1, math.max(w, 8), math.max(h, 12)
         end
     end
 
@@ -1959,7 +2034,7 @@ local function getHealthColor(ratio)
     end
 end
 
-local MAX_ACTIVE_HIGHLIGHTS = 28
+local MAX_ACTIVE_HIGHLIGHTS = 20
 
 local function updateAllESP(camera, viewportSize, screenCenter)
     local highlightCandidates = {}
@@ -2353,69 +2428,246 @@ local function updateAimbot(camera, screenCenter, dt)
     end
 end
 
--- Advanced Trigger Bot Engine (Raycast + Tolerance Sweep + Multi-Executor Fire)
-releaseTriggerFire = function()
-    if not State.TriggerHolding then
-        return
+-- Advanced Trigger Bot Engine (Mobile-Safe Tool & Shoot-Button Signals — never steals thumbstick touch)
+local function fireButtonSignalList(signalObj)
+    if not signalObj then
+        return false
     end
-    State.TriggerHolding = false
+    if type(firesignal) == "function" then
+        local ok = pcall(firesignal, signalObj)
+        if ok then
+            return true
+        end
+    end
+    if type(getconnections) == "function" then
+        local ok, conns = pcall(getconnections, signalObj)
+        if ok and type(conns) == "table" and #conns > 0 then
+            for _, conn in ipairs(conns) do
+                pcall(function()
+                    if type(conn.Fire) == "function" then
+                        conn:Fire()
+                    elseif type(conn.Function) == "function" then
+                        conn.Function()
+                    end
+                end)
+            end
+            return true
+        end
+    end
+    return false
+end
+
+local function isGuiButtonVisibleOnScreen(btn)
+    if not btn or not btn:IsA("GuiButton") or not btn.Visible then
+        return false
+    end
+    local anc = btn.Parent
+    while anc and anc:IsA("GuiObject") do
+        if not anc.Visible then
+            return false
+        end
+        anc = anc.Parent
+    end
+    local sg = btn:FindFirstAncestorOfClass("ScreenGui")
+    if not sg or not sg.Enabled then
+        return false
+    end
+    local sgName = sg.Name
+    if sgName == "TouchGui" or string.sub(sgName, 1, 8) == "TEAM_AKI" then
+        return false
+    end
+    local sz = btn.AbsoluteSize
+    return sz.X >= 18 and sz.Y >= 18
+end
+
+local function scoreShootButtonCandidate(btn)
+    local bName = string.lower(btn.Name or "")
+    local labelText = ""
+    if btn:IsA("TextButton") then
+        labelText = string.lower(btn.Text or "")
+    else
+        local tl = btn:FindFirstChildWhichIsA("TextLabel", true)
+        if tl then
+            labelText = string.lower(tl.Text or "")
+        end
+    end
+
+    if string.find(bName, "switch", 1, true)
+        or string.find(bName, "reload", 1, true)
+        or string.find(bName, "aim", 1, true)
+        or string.find(bName, "scope", 1, true)
+        or string.find(bName, "jump", 1, true)
+        or string.find(bName, "crouch", 1, true)
+        or string.find(bName, "edit", 1, true)
+        or string.find(labelText, "switch", 1, true)
+        or string.find(labelText, "reload", 1, true)
+        or string.find(labelText, "aim", 1, true)
+    then
+        return 0
+    end
+
+    local score = 0
+    if bName == "shoot" or bName == "fire" or bName == "shootbutton" or bName == "firebutton" then
+        score = score + 100
+    elseif string.find(bName, "shoot", 1, true) or string.find(bName, "fire", 1, true) or string.find(bName, "attack", 1, true) then
+        score = score + 70
+    end
+    if labelText == "shoot" or labelText == "fire" then
+        score = score + 100
+    elseif string.find(labelText, "shoot", 1, true) or string.find(labelText, "fire", 1, true) then
+        score = score + 65
+    end
+    return score
+end
+
+local function findMobileShootButton()
+    local cached = State.CachedShootButton
+    if cached and cached.Parent and isGuiButtonVisibleOnScreen(cached) then
+        return cached
+    end
+
+    local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if not pg then
+        State.CachedShootButton = nil
+        return nil
+    end
+
+    local bestBtn = nil
+    local bestScore = 0
+    for _, inst in ipairs(pg:GetDescendants()) do
+        if inst:IsA("GuiButton") and isGuiButtonVisibleOnScreen(inst) then
+            local sc = scoreShootButtonCandidate(inst)
+            if sc > bestScore then
+                bestScore = sc
+                bestBtn = inst
+            end
+        end
+    end
+
+    State.CachedShootButton = bestBtn
+    return bestBtn
+end
+
+local function fireShootButtonSignals(btn, holdMode)
+    if not btn or not btn.Parent then
+        return false
+    end
+    local fired = false
+    if fireButtonSignalList(btn.MouseButton1Down) then
+        fired = true
+    end
+    if fireButtonSignalList(btn.Activated) then
+        fired = true
+    end
+    if fireButtonSignalList(btn.MouseButton1Click) then
+        fired = true
+    end
+    if fired and not holdMode then
+        task.delay(0.03, function()
+            if btn and btn.Parent then
+                fireButtonSignalList(btn.MouseButton1Up)
+            end
+        end)
+    end
+    return fired
+end
+
+releaseTriggerFire = function()
     if State.TriggerToolRef and State.TriggerToolRef.Parent then
         pcall(function()
             State.TriggerToolRef:Deactivate()
         end)
     end
     State.TriggerToolRef = nil
-    if type(mouse1release) == "function" then
-        pcall(mouse1release)
+
+    if State.TriggerHolding and State.CachedShootButton and State.CachedShootButton.Parent then
+        fireButtonSignalList(State.CachedShootButton.MouseButton1Up)
     end
-    if VirtualInputManager then
-        pcall(function()
-            local cam = State.Camera or Workspace.CurrentCamera
-            local vp = cam and cam.ViewportSize or Vector2.new(640, 360)
-            VirtualInputManager:SendMouseButtonEvent(vp.X * 0.5, vp.Y * 0.5, 0, false, game, 1)
-        end)
+
+    if State.TriggerMouseHeld then
+        State.TriggerMouseHeld = false
+        if type(mouse1release) == "function" then
+            pcall(mouse1release)
+        end
     end
+
+    if State.TriggerVimHeld then
+        State.TriggerVimHeld = false
+        if VirtualInputManager then
+            pcall(function()
+                local cam = State.Camera or Workspace.CurrentCamera
+                local vp = cam and cam.ViewportSize or Vector2.new(640, 360)
+                VirtualInputManager:SendMouseButtonEvent(vp.X * 0.5, vp.Y * 0.5, 0, false, game, 1)
+            end)
+        end
+    end
+
+    State.TriggerHolding = false
 end
 
 local function triggerOnceOrPress(screenCenter, holdMode)
     local mode = Config.TriggerBot.FireMode
+    local isTouchDevice = UserInputService.TouchEnabled
     local localChar = State.LocalCharacter or LocalPlayer.Character
     local equippedTool = localChar and localChar:FindFirstChildOfClass("Tool") or nil
     local fired = false
 
-    if (mode == "Auto" or mode == "Tool Only") and equippedTool then
+    -- 1) Tool:Activate() is safe on all platforms and never touches UI or thumbstick input
+    if (mode == "Safe Auto" or mode == "Auto" or mode == "Tool Only") and equippedTool then
         local ok = pcall(function()
             equippedTool:Activate()
         end)
         if ok then
             State.TriggerToolRef = equippedTool
             fired = true
+            if not holdMode then
+                task.delay(0.03, function()
+                    if equippedTool and equippedTool.Parent and not State.TriggerHolding then
+                        pcall(function()
+                            equippedTool:Deactivate()
+                        end)
+                    end
+                end)
+            end
         end
     end
 
-    if (mode == "Auto" or mode == "Mouse1") then
+    -- 2) Mobile Shoot GUI button signals (fires existing Shoot/Fire button handlers cleanly, zero screen clicks!)
+    if mode == "Shoot Btn" or ((mode == "Safe Auto" or mode == "Auto") and isTouchDevice) then
+        local shootBtn = findMobileShootButton()
+        if shootBtn and fireShootButtonSignals(shootBtn, holdMode) then
+            fired = true
+        end
+    end
+
+    -- 3) Mouse1 / VirtualInput ONLY allowed on non-touch PC or when explicitly selected as "Mouse1 (PC)"
+    local allowDesktopMouse = (mode == "Mouse1 (PC)" or mode == "Mouse1" or mode == "VirtualInput")
+        or ((mode == "Safe Auto" or mode == "Auto") and (not isTouchDevice))
+
+    if allowDesktopMouse and (mode ~= "Tool Only" and mode ~= "Shoot Btn") then
         if holdMode and type(mouse1press) == "function" then
             pcall(mouse1press)
+            State.TriggerMouseHeld = true
             fired = true
         elseif (not holdMode) and type(mouse1click) == "function" then
             pcall(mouse1click)
             fired = true
         elseif type(mouse1press) == "function" then
             pcall(mouse1press)
+            State.TriggerMouseHeld = true
             task.delay(0.025, function()
+                State.TriggerMouseHeld = false
                 if type(mouse1release) == "function" then
                     pcall(mouse1release)
                 end
             end)
             fired = true
-        end
-    end
-
-    if mode == "VirtualInput" or (mode == "Auto" and not fired) then
-        if VirtualInputManager then
+        elseif VirtualInputManager then
             pcall(function()
                 VirtualInputManager:SendMouseButtonEvent(screenCenter.X, screenCenter.Y, 0, true, game, 1)
-                if not holdMode then
+                if holdMode then
+                    State.TriggerVimHeld = true
+                else
                     task.delay(0.025, function()
                         pcall(function()
                             VirtualInputManager:SendMouseButtonEvent(screenCenter.X, screenCenter.Y, 0, false, game, 1)
@@ -2657,6 +2909,7 @@ local function onRenderStepFrame(dt)
     end
 
     -- Fast per-frame player, respawn & teleport guarantee so zero spawned players are ever missed
+    local missingInFrame = nil
     for _, player in ipairs(Players:GetPlayers()) do
         if player ~= LocalPlayer then
             local entry = Registry[player]
@@ -2694,9 +2947,26 @@ local function onRenderStepFrame(dt)
                             entry.LastKnownWorldPos = curPos
                         end
                     end
-                elseif entry.Character ~= nil then
-                    clearCharacterFromEntry(entry)
+                else
+                    if entry.Character ~= nil then
+                        clearCharacterFromEntry(entry)
+                    end
+                    if not missingInFrame then
+                        missingInFrame = {}
+                    end
+                    table.insert(missingInFrame, player)
                 end
+            end
+        end
+    end
+
+    if missingInFrame and (now - (State.LastWorkspaceDeepScan or 0)) >= 0.75 then
+        State.LastWorkspaceDeepScan = now
+        local recovered = deepWorkspaceScanForMissingPlayers(missingInFrame)
+        for plr, liveChar in pairs(recovered) do
+            local entry = Registry[plr]
+            if entry and liveChar and liveChar.Parent then
+                bindCharacterToEntry(entry, liveChar)
             end
         end
     end
@@ -3107,9 +3377,10 @@ local function createTabPage(name)
     page.Size = UDim2.fromScale(1, 1)
     page.BackgroundTransparency = 1
     page.BorderSizePixel = 0
-    page.ScrollBarThickness = 3
+    page.ScrollBarThickness = 5
     page.ScrollBarImageColor3 = Palette.PrimaryAccent
-    page.ScrollBarImageTransparency = 0.4
+    page.ScrollBarImageTransparency = 0.35
+    page.ElasticBehavior = Enum.ElasticBehavior.WhenScrollable
     page.CanvasSize = UDim2.fromOffset(0, 0)
     page.AutomaticCanvasSize = Enum.AutomaticSize.Y
     page.Visible = (name == Config.UI.ActiveTab)
@@ -3124,9 +3395,9 @@ local function createTabPage(name)
 
     local pad = Instance.new("UIPadding")
     pad.PaddingTop = UDim.new(0, 2)
-    pad.PaddingBottom = UDim.new(0, 8)
+    pad.PaddingBottom = UDim.new(0, 10)
     pad.PaddingLeft = UDim.new(0, 2)
-    pad.PaddingRight = UDim.new(0, 6)
+    pad.PaddingRight = UDim.new(0, 8)
     pad.Parent = page
 
     TabPages[name] = page
@@ -3210,6 +3481,57 @@ local function SyncDependentSettings(needsFullReload, reason)
     if needsFullReload then
         ScheduleReload(reason or "ConfigMutation", false)
     end
+end
+
+-- Scroll-guarded tap handler so vertical scrolling on mobile never triggers accidental mis-touches
+local function bindSafeTap(btn, scrollParent, callback)
+    local isScrollingFrame = scrollParent and scrollParent:IsA("ScrollingFrame")
+    local trackedInput = nil
+    local startPos = nil
+    local startCanvasY = 0
+    local maxMove = 0
+
+    btn.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            trackedInput = input
+            startPos = input.Position
+            startCanvasY = isScrollingFrame and scrollParent.CanvasPosition.Y or 0
+            maxMove = 0
+        end
+    end)
+
+    addConnection(UserInputService.InputChanged:Connect(function(input)
+        if not trackedInput or not startPos then
+            return
+        end
+        if input == trackedInput or (trackedInput.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseMovement) then
+            local dist = (Vector2.new(input.Position.X, input.Position.Y) - Vector2.new(startPos.X, startPos.Y)).Magnitude
+            if dist > maxMove then
+                maxMove = dist
+            end
+        end
+    end))
+
+    addConnection(UserInputService.InputEnded:Connect(function(input)
+        if input == trackedInput then
+            local dist = startPos and (Vector2.new(input.Position.X, input.Position.Y) - Vector2.new(startPos.X, startPos.Y)).Magnitude or 0
+            if dist > maxMove then
+                maxMove = dist
+            end
+            trackedInput = nil
+        end
+    end))
+
+    btn.Activated:Connect(function()
+        local canvasDelta = isScrollingFrame and math.abs(scrollParent.CanvasPosition.Y - startCanvasY) or 0
+        local wasCleanTap = (maxMove <= 8) and (canvasDelta <= 4)
+        trackedInput = nil
+        startPos = nil
+        maxMove = 0
+        if wasCleanTap then
+            callback()
+        end
+    end)
 end
 
 local function createCardRow(parent, height, order)
@@ -3315,7 +3637,7 @@ local function addToggle(parent, order, title, subtitle, getter, setter)
         sync(true)
     end)
 
-    switchBtn.Activated:Connect(function()
+    bindSafeTap(switchBtn, parent, function()
         setter(not getter())
         sync(false)
         SyncDependentSettings(false)
@@ -3449,15 +3771,19 @@ local function addSlider(parent, order, title, minVal, maxVal, step, formatFn, g
         sync()
     end
 
-    minusBtn.Activated:Connect(function()
+    bindSafeTap(minusBtn, parent, function()
         applyValue(getter() - step)
     end)
 
-    plusBtn.Activated:Connect(function()
+    bindSafeTap(plusBtn, parent, function()
         applyValue(getter() + step)
     end)
 
-    local activeInput = nil
+    local isScrollableParent = parent and parent:IsA("ScrollingFrame")
+    local pendingInput = nil
+    local dragStartPos = nil
+    local startCanvasY = 0
+    local dragging = false
 
     local function updateFromInput(posX)
         local absPos = track.AbsolutePosition.X
@@ -3467,27 +3793,66 @@ local function addSlider(parent, order, title, minVal, maxVal, step, formatFn, g
     end
 
     trackHitbox.InputBegan:Connect(function(input)
-        if not activeInput and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
-            activeInput = input
-            if parent:IsA("ScrollingFrame") then
-                parent.ScrollingEnabled = false
+        if not pendingInput and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+            pendingInput = input
+            dragStartPos = input.Position
+            startCanvasY = isScrollableParent and parent.CanvasPosition.Y or 0
+            dragging = false
+            -- On mouse desktop click, allow immediate drag; on touch wait until horizontal drag intent is proven
+            if input.UserInputType == Enum.UserInputType.MouseButton1 then
+                dragging = true
+                if isScrollableParent then
+                    parent.ScrollingEnabled = false
+                end
+                updateFromInput(input.Position.X)
             end
-            updateFromInput(input.Position.X)
         end
     end)
 
     addConnection(UserInputService.InputChanged:Connect(function(input)
-        if activeInput then
-            if input == activeInput or (activeInput.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseMovement) then
+        if not pendingInput or not dragStartPos then
+            return
+        end
+        if input == pendingInput or (pendingInput.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseMovement) then
+            local dx = math.abs(input.Position.X - dragStartPos.X)
+            local dy = math.abs(input.Position.Y - dragStartPos.Y)
+            local canvasDelta = isScrollableParent and math.abs(parent.CanvasPosition.Y - startCanvasY) or 0
+
+            if not dragging then
+                if canvasDelta > 4 or (dy > 7 and dy > dx) then
+                    -- User is scrolling vertically; release immediately so panel scrolls smoothly
+                    pendingInput = nil
+                    dragStartPos = nil
+                    dragging = false
+                    if isScrollableParent then
+                        parent.ScrollingEnabled = true
+                    end
+                    return
+                elseif dx > 7 and dx >= dy then
+                    dragging = true
+                    if isScrollableParent then
+                        parent.ScrollingEnabled = false
+                    end
+                    updateFromInput(input.Position.X)
+                end
+            else
                 updateFromInput(input.Position.X)
             end
         end
     end))
 
     addConnection(UserInputService.InputEnded:Connect(function(input)
-        if input == activeInput then
-            activeInput = nil
-            if parent:IsA("ScrollingFrame") then
+        if input == pendingInput then
+            local dx = dragStartPos and math.abs(input.Position.X - dragStartPos.X) or 0
+            local dy = dragStartPos and math.abs(input.Position.Y - dragStartPos.Y) or 0
+            local canvasDelta = isScrollableParent and math.abs(parent.CanvasPosition.Y - startCanvasY) or 0
+            if (not dragging) and dx <= 7 and dy <= 7 and canvasDelta <= 4 then
+                updateFromInput(input.Position.X)
+            end
+            pendingInput = nil
+            dragStartPos = nil
+            dragging = false
+            if isScrollableParent then
                 parent.ScrollingEnabled = true
             end
         end
@@ -3564,7 +3929,7 @@ local function addSelector(parent, order, title, options, getter, setter, reload
         bc.CornerRadius = UDim.new(0, 6)
         bc.Parent = b
 
-        b.Activated:Connect(function()
+        bindSafeTap(b, parent, function()
             setter(opt)
             sync()
             SyncDependentSettings(reloadOnSelect == true, "Selector:" .. title)
@@ -3681,7 +4046,7 @@ end, function(v)
     Config.TriggerBot.TargetFilter = v
 end, false)
 
-addSelector(TriggerPage, 3, "Fire Method", {"Auto", "Tool Only", "Mouse1", "VirtualInput"}, function()
+addSelector(TriggerPage, 3, "Fire Method", {"Safe Auto", "Tool Only", "Shoot Btn", "Mouse1 (PC)"}, function()
     return Config.TriggerBot.FireMode
 end, function(v)
     Config.TriggerBot.FireMode = v
@@ -3962,7 +4327,7 @@ for idx, def in ipairs(ColorChannelDefs) do
     bc.CornerRadius = UDim.new(0, 6)
     bc.Parent = b
 
-    b.Activated:Connect(function()
+    bindSafeTap(b, ColorsPage, function()
         Config.UI.SelectedColorKey = def.Key
         refreshColorControls()
     end)
@@ -4064,7 +4429,7 @@ for _, swatchColor in ipairs(PresetPalette) do
     ss.Color = Palette.TextHeader
     ss.Parent = sb
 
-    sb.Activated:Connect(function()
+    bindSafeTap(sb, ColorsPage, function()
         Config.Colors[Config.UI.SelectedColorKey] = swatchColor
         refreshColorControls()
     end)
@@ -4426,7 +4791,7 @@ addConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
     end
 end))
 
-ForceReloadBtn.Activated:Connect(function()
+bindSafeTap(ForceReloadBtn, SettingsPage, function()
     ReloadAllSystems("ManualButton", true)
     ForceReloadBtn.Text = "Reloaded!"
     task.delay(0.8, function()
@@ -4436,7 +4801,7 @@ ForceReloadBtn.Activated:Connect(function()
     end)
 end)
 
-ResetBtn.Activated:Connect(function()
+bindSafeTap(ResetBtn, SettingsPage, function()
     for k, v in pairs(DefaultConfig.Aimbot) do
         Config.Aimbot[k] = v
     end
@@ -4520,4 +4885,4 @@ end
 globalEnv.TEAM_AKI_UNLOAD = unloadScript
 
 UnloadHeaderBtn.Activated:Connect(unloadScript)
-UnloadBtn.Activated:Connect(unloadScript)
+bindSafeTap(UnloadBtn, SettingsPage, unloadScript)
