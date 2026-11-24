@@ -1,12 +1,11 @@
 --[[
     ============================================================================
-      TEAM AKI — Adaptive Glassmorphic Combat & Visual Suite
-      Target Platforms: Mobile Roblox Executors (Delta, Arceus X, Fluxus, Krnl)
+      TEAM AKI v2 — Adaptive Glassmorphic UI, Universal Aimbot & Rebuilt ESP
+      Target Executors: Mobile Roblox Executors (Delta, Arceus X, Fluxus, Krnl)
       Compatibility: Universal R6 / R15 / Custom Rigs (Rivals, Arsenal, One Shot)
     ============================================================================
 ]]
 
--- Wait for game data model if injected early at startup
 if not game:IsLoaded() then
     pcall(function()
         game.Loaded:Wait()
@@ -14,7 +13,7 @@ if not game:IsLoaded() then
 end
 
 -- ============================================================================
--- [SECTION 1] CLEANUP OF PREVIOUS INSTANCE & ENVIRONMENT SHIMS
+-- [SECTION 1] CLEANUP OF PREVIOUS INSTANCE & EXECUTOR SHIMS
 -- ============================================================================
 local globalEnv = (type(getgenv) == "function" and getgenv()) or _G
 
@@ -88,47 +87,55 @@ end
 local Config = {
     Aimbot = {
         Enabled = false,
-        ActivationMode = "Always", -- "Always" | "Hold"
-        TargetPart = "Head",       -- "Head" | "Torso" | "Closest"
-        Smoothness = 0.28,         -- 0.05 (smooth) .. 1.00 (snappy)
-        FOVRadius = 135,           -- pixels
+        ActivationMode = "Always",      -- "Always" | "Hold"
+        TargetPart = "Head",            -- "Head" | "Torso" | "HumanoidRootPart" | "Closest"
+        Smoothness = 0.25,              -- 0.05 (smooth) .. 1.00 (snappy)
+        FOVRadius = 135,                -- pixels
+        FOVThickness = 1.6,             -- pixels
         ShowFOV = true,
         TeamCheck = true,
         VisibleCheck = true,
         StickyTarget = true,
-        MaxDistance = 1200,
+        MaxDistance = 1500,
     },
     ESP = {
         Enabled = true,
+        RenderEngine = "ScreenGui",     -- "ScreenGui" (notch-safe mobile) | "Drawing"
         BoxESP = true,
+        BoxStyle = "Corner",            -- "Corner" | "Full"
+        BoxThickness = 1.8,             -- pixels
+        HealthBar = true,               -- 0% - 100% vertical sidebar
         TracerESP = true,
-        TracerOrigin = "Bottom",   -- "Bottom" | "Center" | "Top"
-        Alert360 = true,           -- Out-of-FOV / 360-degree directional indicator
+        TracerOrigin = "Bottom",        -- "Bottom" | "Center" | "Top"
+        LineThickness = 1.5,            -- pixels
+        Alert360 = true,                -- 360-degree out-of-FOV indicator
+        Alert360VisibleOnly = false,    -- If true, hides 360 alerts for targets behind walls
         AlertRingRadius = 155,
         HighlightESP = true,
+        HighlightVisibleOnly = false,   -- If true, hides Highlight behind walls; else tints Visible/Hidden
         TeamCheck = true,
-        VisibleCheck = false,      -- If true, hides ESP behind walls; if false, tints by visibility
-        ColorByVisibility = true,  -- Uses Visible / Hidden colors dynamically
+        VisibleCheck = false,           -- Master ESP visible-only filter
+        ColorByVisibility = true,       -- Tints Box/Label/Alert/Highlight by visibility
         ShowNameDistance = true,
-        MaxDistance = 1500,
-        BoxThickness = 1.6,
-        TracerThickness = 1.4,
-        HighlightFillTransparency = 0.68,
-        HighlightOutlineTransparency = 0.15,
+        MaxDistance = 1800,
+        HighlightFillTransparency = 0.66,
+        HighlightOutlineTransparency = 0.12,
     },
     Colors = {
-        Enemy = Color3.fromRGB(244, 63, 94),       -- Crimson Rose
-        Visible = Color3.fromRGB(52, 211, 153),    -- Emerald Mint
-        Hidden = Color3.fromRGB(251, 146, 60),     -- Amber Orange
-        Tracer = Color3.fromRGB(96, 165, 250),     -- Electric Sky
-        Alert360 = Color3.fromRGB(248, 113, 113),  -- Alert Coral
-        Highlight = Color3.fromRGB(56, 189, 248),  -- Cyan Highlight
-        FOV = Color3.fromRGB(125, 211, 252),       -- Soft Ice Blue
+        Box = Color3.fromRGB(96, 165, 250),              -- Default Box / Corner Box
+        Visible = Color3.fromRGB(52, 211, 153),          -- Visible Target Tint
+        Hidden = Color3.fromRGB(251, 146, 60),           -- Behind-Wall Target Tint
+        Line = Color3.fromRGB(125, 211, 252),            -- Tracer Line
+        HighlightVisible = Color3.fromRGB(52, 211, 153), -- Highlight when unobstructed
+        HighlightHidden = Color3.fromRGB(244, 63, 94),   -- Highlight when behind cover
+        AlertVisible = Color3.fromRGB(56, 189, 248),     -- 360 Alert when unobstructed
+        AlertHidden = Color3.fromRGB(248, 113, 113),     -- 360 Alert when behind cover
+        FOV = Color3.fromRGB(125, 211, 252),             -- FOV Circle
     },
     UI = {
         Visible = true,
         ActiveTab = "Aimbot",
-        SelectedColorKey = "Enemy",
+        SelectedColorKey = "Box",
     },
 }
 
@@ -159,10 +166,10 @@ local function notifyColorUpdated()
 end
 
 -- ============================================================================
--- [SECTION 3] DRAWING & SCREEN-GUI HYBRID OVERLAY ENGINE
+-- [SECTION 3] HYBRID OVERLAY ENGINE (POOLED SCREENGUI + OPTIONAL DRAWING API)
 -- ============================================================================
 local OverlayGui = Instance.new("ScreenGui")
-OverlayGui.Name = "TEAM_AKI_Overlay"
+OverlayGui.Name = "TEAM_AKI_Overlay_v2"
 OverlayGui.IgnoreGuiInset = true
 OverlayGui.ResetOnSpawn = false
 OverlayGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
@@ -174,7 +181,7 @@ local EspContainer = Instance.new("Folder")
 EspContainer.Name = "ESP_Elements"
 EspContainer.Parent = OverlayGui
 
--- Highlight instances require CoreGui or Workspace ancestry to render reliably across executors
+-- Highlight instances require CoreGui or Workspace ancestry to render reliably
 local HighlightContainer = Instance.new("Folder")
 HighlightContainer.Name = "TEAM_AKI_Highlights"
 local okHighlightParent = pcall(function()
@@ -184,25 +191,25 @@ if not okHighlightParent or not HighlightContainer.Parent then
     HighlightContainer.Parent = Workspace
 end
 
--- Probe whether native executor Drawing API works reliably (supports both table & userdata)
+-- Probe native Drawing API safely (handles both table and userdata implementations)
 local DrawingSupported = false
 do
-    local ok, result = pcall(function()
+    local ok, res = pcall(function()
         if Drawing and type(Drawing.new) == "function" then
-            local sq = Drawing.new("Square")
-            if sq ~= nil then
-                sq.Visible = false
-                if type(sq.Remove) == "function" then
-                    sq:Remove()
-                elseif type(sq.Destroy) == "function" then
-                    sq:Destroy()
+            local ln = Drawing.new("Line")
+            if ln ~= nil then
+                ln.Visible = false
+                if type(ln.Remove) == "function" then
+                    ln:Remove()
+                elseif type(ln.Destroy) == "function" then
+                    ln:Destroy()
                 end
                 return true
             end
         end
         return false
     end)
-    DrawingSupported = ok and result == true
+    DrawingSupported = ok and res == true
 end
 
 local function safeDestroyDrawing(obj)
@@ -218,279 +225,421 @@ local function safeDestroyDrawing(obj)
     end)
 end
 
--- ScreenGui fallback primitives (used automatically if Drawing API is unavailable or fails)
-local function createFallbackBox()
-    local frame = Instance.new("Frame")
-    frame.BackgroundTransparency = 1
-    frame.BorderSizePixel = 0
-    frame.Visible = false
-    frame.Parent = EspContainer
-
-    local stroke = Instance.new("UIStroke")
-    stroke.Thickness = Config.ESP.BoxThickness
-    stroke.Color = Config.Colors.Enemy
-    stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
-    stroke.Parent = frame
-
-    return {
-        Frame = frame,
-        Stroke = stroke,
-        Set = function(self, visible, x, y, w, h, color, thickness)
-            self.Frame.Visible = visible
-            if visible then
-                self.Frame.Position = UDim2.fromOffset(x, y)
-                self.Frame.Size = UDim2.fromOffset(w, h)
-                self.Stroke.Color = color
-                self.Stroke.Thickness = thickness
-            end
-        end,
-        Destroy = function(self)
-            pcall(function()
-                self.Frame:Destroy()
-            end)
-        end,
-    }
+local function shouldUseDrawing()
+    return DrawingSupported and Config.ESP.RenderEngine == "Drawing"
 end
 
-local function createFallbackLine()
-    local frame = Instance.new("Frame")
-    frame.AnchorPoint = Vector2.new(0.5, 0.5)
-    frame.BorderSizePixel = 0
-    frame.Visible = false
-    frame.Parent = EspContainer
+-- Helper to create a pooled 2D Box + Corner Box + Health Bar + Tracer + 360 Arrow + Label per player
+local function createPlayerVisuals()
+    -- ScreenGui pooled frames (always ready, zero per-frame allocations)
+    local guiRoot = Instance.new("Folder")
+    guiRoot.Parent = EspContainer
 
-    return {
-        Frame = frame,
-        Set = function(self, visible, fromPos, toPos, color, thickness)
-            self.Frame.Visible = visible
-            if visible then
-                local delta = toPos - fromPos
-                local length = delta.Magnitude
-                local mid = (fromPos + toPos) * 0.5
-                self.Frame.Position = UDim2.fromOffset(mid.X, mid.Y)
-                self.Frame.Size = UDim2.fromOffset(math.max(length, 1), math.max(thickness, 1))
-                self.Frame.Rotation = math.deg(math.atan2(delta.Y, delta.X))
-                self.Frame.BackgroundColor3 = color
-            end
-        end,
-        Destroy = function(self)
-            pcall(function()
-                self.Frame:Destroy()
-            end)
-        end,
-    }
-end
+    -- Full Box Frame
+    local fullBoxFrame = Instance.new("Frame")
+    fullBoxFrame.BackgroundTransparency = 1
+    fullBoxFrame.BorderSizePixel = 0
+    fullBoxFrame.Visible = false
+    fullBoxFrame.Parent = guiRoot
 
-local function createFallbackLabel()
-    local label = Instance.new("TextLabel")
-    label.BackgroundTransparency = 1
-    label.AnchorPoint = Vector2.new(0.5, 1)
-    label.Size = UDim2.fromOffset(200, 18)
-    label.Font = Enum.Font.GothamMedium
-    label.TextSize = 12
-    label.TextColor3 = Color3.new(1, 1, 1)
-    label.TextStrokeTransparency = 0.35
-    label.TextStrokeColor3 = Color3.new(0, 0, 0)
-    label.Visible = false
-    label.Parent = EspContainer
+    local fullBoxStroke = Instance.new("UIStroke")
+    fullBoxStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    fullBoxStroke.Thickness = Config.ESP.BoxThickness
+    fullBoxStroke.Color = Config.Colors.Box
+    fullBoxStroke.Parent = fullBoxFrame
 
-    return {
-        Label = label,
-        Set = function(self, visible, x, y, text, color)
-            self.Label.Visible = visible
-            if visible then
-                self.Label.Position = UDim2.fromOffset(x, y - 2)
-                self.Label.Text = text
-                self.Label.TextColor3 = color
-            end
-        end,
-        Destroy = function(self)
-            pcall(function()
-                self.Label:Destroy()
-            end)
-        end,
-    }
-end
-
-local function createFallbackArrow()
-    local holder = Instance.new("Frame")
-    holder.BackgroundTransparency = 1
-    holder.AnchorPoint = Vector2.new(0.5, 0.5)
-    holder.Size = UDim2.fromOffset(16, 16)
-    holder.Visible = false
-    holder.Parent = EspContainer
-
-    local leftArm = Instance.new("Frame")
-    leftArm.BorderSizePixel = 0
-    leftArm.AnchorPoint = Vector2.new(0.5, 0.5)
-    leftArm.Position = UDim2.fromScale(0.35, 0.5)
-    leftArm.Size = UDim2.fromOffset(10, 3)
-    leftArm.Rotation = -45
-    leftArm.Parent = holder
-
-    local rightArm = Instance.new("Frame")
-    rightArm.BorderSizePixel = 0
-    rightArm.AnchorPoint = Vector2.new(0.5, 0.5)
-    rightArm.Position = UDim2.fromScale(0.65, 0.5)
-    rightArm.Size = UDim2.fromOffset(10, 3)
-    rightArm.Rotation = 45
-    rightArm.Parent = holder
-
-    return {
-        Holder = holder,
-        Left = leftArm,
-        Right = rightArm,
-        Set = function(self, visible, tipPos, angleRad, color)
-            self.Holder.Visible = visible
-            if visible then
-                self.Holder.Position = UDim2.fromOffset(tipPos.X, tipPos.Y)
-                self.Holder.Rotation = math.deg(angleRad) + 90
-                self.Left.BackgroundColor3 = color
-                self.Right.BackgroundColor3 = color
-            end
-        end,
-        Destroy = function(self)
-            pcall(function()
-                self.Holder:Destroy()
-            end)
-        end,
-    }
-end
-
-local function createBoxWrapper()
-    if DrawingSupported then
-        local ok, sq = pcall(Drawing.new, "Square")
-        if ok and sq then
-            pcall(function()
-                sq.Visible = false
-                sq.Filled = false
-                sq.Thickness = Config.ESP.BoxThickness
-            end)
-            return {
-                _obj = sq,
-                Set = function(self, visible, x, y, w, h, color, thickness)
-                    pcall(function()
-                        self._obj.Visible = visible
-                        if visible then
-                            self._obj.Position = Vector2.new(x, y)
-                            self._obj.Size = Vector2.new(w, h)
-                            self._obj.Color = color
-                            self._obj.Thickness = thickness
-                        end
-                    end)
-                end,
-                Destroy = function(self)
-                    safeDestroyDrawing(self._obj)
-                end,
-            }
-        end
+    -- 8 Corner Bracket Segments (2 per corner: horizontal + vertical)
+    local cornerSegs = {}
+    for i = 1, 8 do
+        local seg = Instance.new("Frame")
+        seg.BorderSizePixel = 0
+        seg.Visible = false
+        seg.ZIndex = 2
+        seg.Parent = guiRoot
+        cornerSegs[i] = seg
     end
-    return createFallbackBox()
-end
 
-local function createLineWrapper()
-    if DrawingSupported then
-        local ok, ln = pcall(Drawing.new, "Line")
-        if ok and ln then
-            pcall(function()
+    -- Health Bar (0% - 100% sidebar with dark backing)
+    local hpBack = Instance.new("Frame")
+    hpBack.BackgroundColor3 = Color3.fromRGB(10, 12, 18)
+    hpBack.BackgroundTransparency = 0.25
+    hpBack.BorderSizePixel = 0
+    hpBack.Visible = false
+    hpBack.ZIndex = 2
+    hpBack.Parent = guiRoot
+
+    local hpBackStroke = Instance.new("UIStroke")
+    hpBackStroke.Thickness = 1
+    hpBackStroke.Color = Color3.fromRGB(0, 0, 0)
+    hpBackStroke.Transparency = 0.35
+    hpBackStroke.Parent = hpBack
+
+    local hpFill = Instance.new("Frame")
+    hpFill.AnchorPoint = Vector2.new(0, 1)
+    hpFill.Position = UDim2.fromScale(0, 1)
+    hpFill.Size = UDim2.fromScale(1, 1)
+    hpFill.BorderSizePixel = 0
+    hpFill.ZIndex = 3
+    hpFill.Parent = hpBack
+
+    -- Tracer Line Frame
+    local tracerFrame = Instance.new("Frame")
+    tracerFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+    tracerFrame.BorderSizePixel = 0
+    tracerFrame.Visible = false
+    tracerFrame.ZIndex = 1
+    tracerFrame.Parent = guiRoot
+
+    -- Name & Distance TextLabel
+    local nameLabel = Instance.new("TextLabel")
+    nameLabel.BackgroundTransparency = 1
+    nameLabel.AnchorPoint = Vector2.new(0.5, 1)
+    nameLabel.Size = UDim2.fromOffset(220, 18)
+    nameLabel.Font = Enum.Font.GothamMedium
+    nameLabel.TextSize = 12
+    nameLabel.TextColor3 = Color3.new(1, 1, 1)
+    nameLabel.TextStrokeTransparency = 0.3
+    nameLabel.TextStrokeColor3 = Color3.new(0, 0, 0)
+    nameLabel.Visible = false
+    nameLabel.ZIndex = 3
+    nameLabel.Parent = guiRoot
+
+    -- 360-Degree Directional Chevron
+    local arrowHolder = Instance.new("Frame")
+    arrowHolder.BackgroundTransparency = 1
+    arrowHolder.AnchorPoint = Vector2.new(0.5, 0.5)
+    arrowHolder.Size = UDim2.fromOffset(18, 18)
+    arrowHolder.Visible = false
+    arrowHolder.ZIndex = 4
+    arrowHolder.Parent = guiRoot
+
+    local arrowLeft = Instance.new("Frame")
+    arrowLeft.BorderSizePixel = 0
+    arrowLeft.AnchorPoint = Vector2.new(0.5, 0.5)
+    arrowLeft.Position = UDim2.fromScale(0.35, 0.5)
+    arrowLeft.Size = UDim2.fromOffset(11, 3)
+    arrowLeft.Rotation = -45
+    arrowLeft.ZIndex = 4
+    arrowLeft.Parent = arrowHolder
+
+    local arrowRight = Instance.new("Frame")
+    arrowRight.BorderSizePixel = 0
+    arrowRight.AnchorPoint = Vector2.new(0.5, 0.5)
+    arrowRight.Position = UDim2.fromScale(0.65, 0.5)
+    arrowRight.Size = UDim2.fromOffset(11, 3)
+    arrowRight.Rotation = 45
+    arrowRight.ZIndex = 4
+    arrowRight.Parent = arrowHolder
+
+    -- Optional native Drawing primitives (lazy-initialized if Drawing mode is selected)
+    local drawCache = nil
+    local function ensureDrawingCache()
+        if drawCache then
+            return drawCache
+        end
+        if not DrawingSupported then
+            return nil
+        end
+        local ok, cache = pcall(function()
+            local c = {
+                Box = Drawing.new("Square"),
+                Corners = {},
+                HpBack = Drawing.new("Square"),
+                HpFill = Drawing.new("Square"),
+                Tracer = Drawing.new("Line"),
+                Arrow = Drawing.new("Triangle"),
+                Label = Drawing.new("Text"),
+            }
+            c.Box.Visible = false
+            c.Box.Filled = false
+            for i = 1, 8 do
+                local ln = Drawing.new("Line")
                 ln.Visible = false
-                ln.Thickness = Config.ESP.TracerThickness
-            end)
-            return {
-                _obj = ln,
-                Set = function(self, visible, fromPos, toPos, color, thickness)
-                    pcall(function()
-                        self._obj.Visible = visible
-                        if visible then
-                            self._obj.From = fromPos
-                            self._obj.To = toPos
-                            self._obj.Color = color
-                            self._obj.Thickness = thickness
-                        end
-                    end)
-                end,
-                Destroy = function(self)
-                    safeDestroyDrawing(self._obj)
-                end,
-            }
+                c.Corners[i] = ln
+            end
+            c.HpBack.Visible = false
+            c.HpBack.Filled = true
+            c.HpBack.Color = Color3.fromRGB(10, 12, 18)
+            c.HpFill.Visible = false
+            c.HpFill.Filled = true
+            c.Tracer.Visible = false
+            c.Arrow.Visible = false
+            c.Arrow.Filled = true
+            c.Arrow.Thickness = 1
+            c.Label.Visible = false
+            c.Label.Center = true
+            c.Label.Outline = true
+            c.Label.Size = 13
+            if Drawing.Fonts and Drawing.Fonts.UI then
+                c.Label.Font = Drawing.Fonts.UI
+            else
+                c.Label.Font = 2
+            end
+            return c
+        end)
+        if ok and cache then
+            drawCache = cache
+            return drawCache
         end
+        return nil
     end
-    return createFallbackLine()
-end
 
-local function createArrowWrapper()
-    if DrawingSupported then
-        local ok, tri = pcall(Drawing.new, "Triangle")
-        if ok and tri then
-            pcall(function()
-                tri.Visible = false
-                tri.Filled = true
-                tri.Thickness = 1
-            end)
-            return {
-                _obj = tri,
-                Set = function(self, visible, tipPos, angleRad, color)
-                    pcall(function()
-                        self._obj.Visible = visible
-                        if visible then
-                            local dir = Vector2.new(math.cos(angleRad), math.sin(angleRad))
-                            local perp = Vector2.new(-dir.Y, dir.X)
-                            local arrowLen = 14
-                            local halfWidth = 7
-                            local baseCenter = tipPos - dir * arrowLen
-                            self._obj.PointA = tipPos
-                            self._obj.PointB = baseCenter + perp * halfWidth
-                            self._obj.PointC = baseCenter - perp * halfWidth
-                            self._obj.Color = color
-                        end
-                    end)
-                end,
-                Destroy = function(self)
-                    safeDestroyDrawing(self._obj)
-                end,
-            }
+    local function hideDrawing()
+        if not drawCache then
+            return
         end
+        pcall(function()
+            drawCache.Box.Visible = false
+            for i = 1, 8 do
+                drawCache.Corners[i].Visible = false
+            end
+            drawCache.HpBack.Visible = false
+            drawCache.HpFill.Visible = false
+            drawCache.Tracer.Visible = false
+            drawCache.Arrow.Visible = false
+            drawCache.Label.Visible = false
+        end)
     end
-    return createFallbackArrow()
-end
 
-local function createLabelWrapper()
-    if DrawingSupported then
-        local ok, txt = pcall(Drawing.new, "Text")
-        if ok and txt then
-            pcall(function()
-                txt.Visible = false
-                txt.Center = true
-                txt.Outline = true
-                txt.Size = 13
-                if Drawing.Fonts and Drawing.Fonts.UI then
-                    txt.Font = Drawing.Fonts.UI
+    local function hideGui()
+        fullBoxFrame.Visible = false
+        for i = 1, 8 do
+            cornerSegs[i].Visible = false
+        end
+        hpBack.Visible = false
+        tracerFrame.Visible = false
+        nameLabel.Visible = false
+        arrowHolder.Visible = false
+    end
+
+    return {
+        HideAll = function()
+            hideGui()
+            hideDrawing()
+        end,
+        Render = function(self, state)
+            local useDraw = shouldUseDrawing() and ensureDrawingCache() ~= nil
+            if useDraw then
+                hideGui()
+                local d = drawCache
+                pcall(function()
+                    -- 1. Box (Full or Corner)
+                    if state.ShowBox then
+                        local x, y, w, h = state.BX, state.BY, state.BW, state.BH
+                        local t = state.BoxThickness
+                        local col = state.BoxColor
+                        if state.BoxStyle == "Full" then
+                            d.Box.Visible = true
+                            d.Box.Position = Vector2.new(x, y)
+                            d.Box.Size = Vector2.new(w, h)
+                            d.Box.Color = col
+                            d.Box.Thickness = t
+                            for i = 1, 8 do d.Corners[i].Visible = false end
+                        else
+                            d.Box.Visible = false
+                            local cw = math.clamp(w * 0.25, 4, 22)
+                            local ch = math.clamp(h * 0.22, 4, 22)
+                            local segs = {
+                                { Vector2.new(x, y), Vector2.new(x + cw, y) },
+                                { Vector2.new(x, y), Vector2.new(x, y + ch) },
+                                { Vector2.new(x + w, y), Vector2.new(x + w - cw, y) },
+                                { Vector2.new(x + w, y), Vector2.new(x + w, y + ch) },
+                                { Vector2.new(x, y + h), Vector2.new(x + cw, y + h) },
+                                { Vector2.new(x, y + h), Vector2.new(x, y + h - ch) },
+                                { Vector2.new(x + w, y + h), Vector2.new(x + w - cw, y + h) },
+                                { Vector2.new(x + w, y + h), Vector2.new(x + w, y + h - ch) },
+                            }
+                            for i = 1, 8 do
+                                local ln = d.Corners[i]
+                                ln.Visible = true
+                                ln.From = segs[i][1]
+                                ln.To = segs[i][2]
+                                ln.Color = col
+                                ln.Thickness = t
+                            end
+                        end
+                    else
+                        d.Box.Visible = false
+                        for i = 1, 8 do d.Corners[i].Visible = false end
+                    end
+
+                    -- 2. Health Bar (0% - 100%)
+                    if state.ShowHealth then
+                        local barX = state.BX - 6
+                        local barY = state.BY
+                        local barW = 3
+                        local barH = math.max(state.BH, 2)
+                        local fillH = barH * state.HealthRatio
+                        d.HpBack.Visible = true
+                        d.HpBack.Position = Vector2.new(barX - 1, barY - 1)
+                        d.HpBack.Size = Vector2.new(barW + 2, barH + 2)
+                        d.HpFill.Visible = fillH > 0.5
+                        d.HpFill.Position = Vector2.new(barX, barY + (barH - fillH))
+                        d.HpFill.Size = Vector2.new(barW, fillH)
+                        d.HpFill.Color = state.HealthColor
+                    else
+                        d.HpBack.Visible = false
+                        d.HpFill.Visible = false
+                    end
+
+                    -- 3. Label
+                    if state.ShowLabel then
+                        d.Label.Visible = true
+                        d.Label.Position = Vector2.new(state.BX + state.BW * 0.5, state.BY - 16)
+                        d.Label.Text = state.LabelText
+                        d.Label.Color = state.BoxColor
+                    else
+                        d.Label.Visible = false
+                    end
+
+                    -- 4. Tracer
+                    if state.ShowTracer then
+                        d.Tracer.Visible = true
+                        d.Tracer.From = state.TracerFrom
+                        d.Tracer.To = state.TracerTo
+                        d.Tracer.Color = state.TracerColor
+                        d.Tracer.Thickness = state.LineThickness
+                    else
+                        d.Tracer.Visible = false
+                    end
+
+                    -- 5. 360 Alert Arrow
+                    if state.ShowArrow then
+                        local dir = Vector2.new(math.cos(state.ArrowAngle), math.sin(state.ArrowAngle))
+                        local perp = Vector2.new(-dir.Y, dir.X)
+                        local tip = state.ArrowPos
+                        local baseCenter = tip - dir * 14
+                        d.Arrow.Visible = true
+                        d.Arrow.PointA = tip
+                        d.Arrow.PointB = baseCenter + perp * 7
+                        d.Arrow.PointC = baseCenter - perp * 7
+                        d.Arrow.Color = state.ArrowColor
+                    else
+                        d.Arrow.Visible = false
+                    end
+                end)
+                return
+            end
+
+            -- ScreenGui Render Path (notch-safe & reliable across all mobile executors)
+            hideDrawing()
+
+            -- 1. Box (Full or Corner)
+            if state.ShowBox then
+                local x, y, w, h = state.BX, state.BY, state.BW, state.BH
+                local t = math.max(state.BoxThickness, 1)
+                local col = state.BoxColor
+
+                if state.BoxStyle == "Full" then
+                    fullBoxFrame.Visible = true
+                    fullBoxFrame.Position = UDim2.fromOffset(x, y)
+                    fullBoxFrame.Size = UDim2.fromOffset(w, h)
+                    fullBoxStroke.Color = col
+                    fullBoxStroke.Thickness = t
+                    for i = 1, 8 do cornerSegs[i].Visible = false end
                 else
-                    txt.Font = 2
+                    fullBoxFrame.Visible = false
+                    local cw = math.clamp(w * 0.25, 4, 22)
+                    local ch = math.clamp(h * 0.22, 4, 22)
+
+                    -- Top-Left H & V
+                    cornerSegs[1].Position = UDim2.fromOffset(x, y)
+                    cornerSegs[1].Size = UDim2.fromOffset(cw, t)
+                    cornerSegs[2].Position = UDim2.fromOffset(x, y)
+                    cornerSegs[2].Size = UDim2.fromOffset(t, ch)
+
+                    -- Top-Right H & V
+                    cornerSegs[3].Position = UDim2.fromOffset(x + w - cw, y)
+                    cornerSegs[3].Size = UDim2.fromOffset(cw, t)
+                    cornerSegs[4].Position = UDim2.fromOffset(x + w - t, y)
+                    cornerSegs[4].Size = UDim2.fromOffset(t, ch)
+
+                    -- Bottom-Left H & V
+                    cornerSegs[5].Position = UDim2.fromOffset(x, y + h - t)
+                    cornerSegs[5].Size = UDim2.fromOffset(cw, t)
+                    cornerSegs[6].Position = UDim2.fromOffset(x, y + h - ch)
+                    cornerSegs[6].Size = UDim2.fromOffset(t, ch)
+
+                    -- Bottom-Right H & V
+                    cornerSegs[7].Position = UDim2.fromOffset(x + w - cw, y + h - t)
+                    cornerSegs[7].Size = UDim2.fromOffset(cw, t)
+                    cornerSegs[8].Position = UDim2.fromOffset(x + w - t, y + h - ch)
+                    cornerSegs[8].Size = UDim2.fromOffset(t, ch)
+
+                    for i = 1, 8 do
+                        cornerSegs[i].BackgroundColor3 = col
+                        cornerSegs[i].Visible = true
+                    end
                 end
+            else
+                fullBoxFrame.Visible = false
+                for i = 1, 8 do cornerSegs[i].Visible = false end
+            end
+
+            -- 2. Health Bar Sidebar (0% - 100%)
+            if state.ShowHealth then
+                hpBack.Visible = true
+                hpBack.Position = UDim2.fromOffset(state.BX - 6, state.BY)
+                hpBack.Size = UDim2.fromOffset(3, math.max(state.BH, 2))
+                hpFill.Size = UDim2.fromScale(1, state.HealthRatio)
+                hpFill.BackgroundColor3 = state.HealthColor
+            else
+                hpBack.Visible = false
+            end
+
+            -- 3. Name & Distance
+            if state.ShowLabel then
+                nameLabel.Visible = true
+                nameLabel.Position = UDim2.fromOffset(state.BX + state.BW * 0.5, state.BY - 3)
+                nameLabel.Text = state.LabelText
+                nameLabel.TextColor3 = state.BoxColor
+            else
+                nameLabel.Visible = false
+            end
+
+            -- 4. Tracer Line
+            if state.ShowTracer then
+                local delta = state.TracerTo - state.TracerFrom
+                local mid = (state.TracerFrom + state.TracerTo) * 0.5
+                tracerFrame.Visible = true
+                tracerFrame.Position = UDim2.fromOffset(mid.X, mid.Y)
+                tracerFrame.Size = UDim2.fromOffset(math.max(delta.Magnitude, 1), math.max(state.LineThickness, 1))
+                tracerFrame.Rotation = math.deg(math.atan2(delta.Y, delta.X))
+                tracerFrame.BackgroundColor3 = state.TracerColor
+            else
+                tracerFrame.Visible = false
+            end
+
+            -- 5. 360 Alert Chevron
+            if state.ShowArrow then
+                arrowHolder.Visible = true
+                arrowHolder.Position = UDim2.fromOffset(state.ArrowPos.X, state.ArrowPos.Y)
+                arrowHolder.Rotation = math.deg(state.ArrowAngle) + 90
+                arrowLeft.BackgroundColor3 = state.ArrowColor
+                arrowRight.BackgroundColor3 = state.ArrowColor
+            else
+                arrowHolder.Visible = false
+            end
+        end,
+        Destroy = function()
+            pcall(function()
+                guiRoot:Destroy()
             end)
-            return {
-                _obj = txt,
-                Set = function(self, visible, x, y, content, color)
-                    pcall(function()
-                        self._obj.Visible = visible
-                        if visible then
-                            self._obj.Position = Vector2.new(x, y - 16)
-                            self._obj.Text = content
-                            self._obj.Color = color
-                        end
-                    end)
-                end,
-                Destroy = function(self)
-                    safeDestroyDrawing(self._obj)
-                end,
-            }
-        end
-    end
-    return createFallbackLabel()
+            if drawCache then
+                safeDestroyDrawing(drawCache.Box)
+                for i = 1, 8 do safeDestroyDrawing(drawCache.Corners[i]) end
+                safeDestroyDrawing(drawCache.HpBack)
+                safeDestroyDrawing(drawCache.HpFill)
+                safeDestroyDrawing(drawCache.Tracer)
+                safeDestroyDrawing(drawCache.Arrow)
+                safeDestroyDrawing(drawCache.Label)
+                drawCache = nil
+            end
+        end,
+    }
 end
 
--- Screen-centered crisp FOV Ring (consistent across all mobile DPI scales)
+-- Screen-centered crisp FOV Circle
 local FOVRingFrame = Instance.new("Frame")
 FOVRingFrame.Name = "FOVRing"
 FOVRingFrame.AnchorPoint = Vector2.new(0.5, 0.5)
@@ -504,13 +653,13 @@ FOVCorner.CornerRadius = UDim.new(1, 0)
 FOVCorner.Parent = FOVRingFrame
 
 local FOVStroke = Instance.new("UIStroke")
-FOVStroke.Thickness = 1.5
-FOVStroke.Transparency = 0.25
+FOVStroke.Thickness = Config.Aimbot.FOVThickness
+FOVStroke.Transparency = 0.22
 FOVStroke.Color = Config.Colors.FOV
 FOVStroke.Parent = FOVRingFrame
 
 -- ============================================================================
--- [SECTION 4] PLAYER & CHARACTER LIFECYCLE TRACKER (R6 / R15 / CUSTOM RIGS)
+-- [SECTION 4] FULL PLAYER COVERAGE & DYNAMIC RIG LIFECYCLE TRACKER
 -- ============================================================================
 local RIG_PART_NAMES = {
     Head = true,
@@ -562,10 +711,18 @@ local function cacheCharacterParts(entry, character)
         end
     end
 
+    -- Fallback for custom character models without standard R6/R15 part names
     if #rigParts == 0 then
-        for _, child in ipairs(character:GetChildren()) do
-            if child:IsA("BasePart") then
-                table.insert(rigParts, child)
+        for _, desc in ipairs(character:GetDescendants()) do
+            if desc:IsA("BasePart") and desc.Transparency < 1 then
+                table.insert(rigParts, desc)
+            end
+        end
+    end
+    if #rigParts == 0 then
+        for _, desc in ipairs(character:GetDescendants()) do
+            if desc:IsA("BasePart") then
+                table.insert(rigParts, desc)
             end
         end
     end
@@ -576,28 +733,18 @@ local function cacheCharacterParts(entry, character)
     entry.RootPart = targetCandidates.HumanoidRootPart
         or targetCandidates.UpperTorso
         or targetCandidates.Torso
+        or targetCandidates.Head
         or character.PrimaryPart
         or rigParts[1]
+    entry.LastScanTime = os.clock()
 end
 
-local function ensureHighlight(entry, character)
-    if entry.Highlight and entry.Highlight.Parent then
-        entry.Highlight.Adornee = character
-        return
-    end
-    local ok, hl = pcall(function()
-        local instance = Instance.new("Highlight")
-        instance.Name = "AKI_HL_" .. entry.Player.Name
-        instance.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-        instance.FillTransparency = Config.ESP.HighlightFillTransparency
-        instance.OutlineTransparency = Config.ESP.HighlightOutlineTransparency
-        instance.Enabled = false
-        instance.Adornee = character
-        instance.Parent = HighlightContainer
-        return instance
-    end)
-    if ok and hl then
-        entry.Highlight = hl
+local function destroyHighlight(entry)
+    if entry.Highlight then
+        pcall(function()
+            entry.Highlight:Destroy()
+        end)
+        entry.Highlight = nil
     end
 end
 
@@ -615,17 +762,8 @@ local function clearCharacterState(entry)
     end
     clearTable(entry.CharConns)
 
-    if entry.Highlight then
-        pcall(function()
-            entry.Highlight:Destroy()
-        end)
-        entry.Highlight = nil
-    end
-
-    entry.Box:Set(false, 0, 0, 0, 0, Config.Colors.Enemy, 1)
-    entry.Tracer:Set(false, Vector2.zero, Vector2.zero, Config.Colors.Tracer, 1)
-    entry.Arrow:Set(false, Vector2.zero, 0, Config.Colors.Alert360)
-    entry.Label:Set(false, 0, 0, "", Color3.new(1, 1, 1))
+    destroyHighlight(entry)
+    entry.Visuals:HideAll()
 end
 
 local function bindCharacter(entry, character)
@@ -636,33 +774,22 @@ local function bindCharacter(entry, character)
 
     entry.Character = character
     cacheCharacterParts(entry, character)
-    ensureHighlight(entry, character)
 
-    local function refreshSoon()
+    local function onDescendantChanged(desc)
         if entry.Character == character and character.Parent and not State.Unloaded then
-            cacheCharacterParts(entry, character)
+            if desc:IsA("BasePart") or desc:IsA("Humanoid") then
+                entry.NeedsRescan = true
+            end
         end
     end
 
-    table.insert(entry.CharConns, character.ChildAdded:Connect(function(child)
-        if child:IsA("BasePart") or child:IsA("Humanoid") then
-            refreshSoon()
-        end
-    end))
-
-    table.insert(entry.CharConns, character.ChildRemoved:Connect(function(child)
-        if child:IsA("BasePart") or child:IsA("Humanoid") then
-            refreshSoon()
-        end
-    end))
-
+    table.insert(entry.CharConns, character.DescendantAdded:Connect(onDescendantChanged))
+    table.insert(entry.CharConns, character.DescendantRemoving:Connect(onDescendantChanged))
     table.insert(entry.CharConns, character.AncestryChanged:Connect(function(_, newParent)
         if not newParent then
             clearCharacterState(entry)
         end
     end))
-
-    task.delay(0.25, refreshSoon)
 end
 
 local function trackPlayer(player)
@@ -678,10 +805,9 @@ local function trackPlayer(player)
         RigParts = {},
         TargetCandidates = {},
         Highlight = nil,
-        Box = createBoxWrapper(),
-        Tracer = createLineWrapper(),
-        Arrow = createArrowWrapper(),
-        Label = createLabelWrapper(),
+        NeedsRescan = false,
+        LastScanTime = 0,
+        Visuals = createPlayerVisuals(),
         PlayerConns = {},
         CharConns = {},
     }
@@ -720,11 +846,7 @@ local function untrackPlayer(player)
     end
     clearTable(entry.PlayerConns)
 
-    entry.Box:Destroy()
-    entry.Tracer:Destroy()
-    entry.Arrow:Destroy()
-    entry.Label:Destroy()
-
+    entry.Visuals:Destroy()
     State.TrackedPlayers[player] = nil
 end
 
@@ -734,37 +856,72 @@ end
 addConnection(Players.PlayerAdded:Connect(trackPlayer))
 addConnection(Players.PlayerRemoving:Connect(untrackPlayer))
 
+-- Self-healing synchronization called every frame so no player or delayed character is ever skipped
+local function syncAllPlayers()
+    local seen = {}
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            seen[player] = true
+            local entry = State.TrackedPlayers[player]
+            if not entry then
+                trackPlayer(player)
+                entry = State.TrackedPlayers[player]
+            end
+
+            if entry then
+                local liveChar = player.Character
+                if liveChar and liveChar.Parent then
+                    if entry.Character ~= liveChar then
+                        bindCharacter(entry, liveChar)
+                    elseif entry.NeedsRescan
+                        or (not entry.RootPart)
+                        or (not entry.RootPart.Parent)
+                        or (not entry.Humanoid)
+                        or (not entry.Humanoid.Parent)
+                        or (#entry.RigParts == 0 and (os.clock() - entry.LastScanTime) > 0.25)
+                    then
+                        entry.NeedsRescan = false
+                        cacheCharacterParts(entry, liveChar)
+                    end
+                elseif entry.Character ~= nil then
+                    clearCharacterState(entry)
+                end
+            end
+        end
+    end
+
+    -- Cleanup any orphaned entries whose player left silently
+    for player in pairs(State.TrackedPlayers) do
+        if not seen[player] then
+            untrackPlayer(player)
+        end
+    end
+end
+
 -- ============================================================================
--- [SECTION 5] TEAM CHECK, ALIVE CHECK, TARGET PART & RAYCAST VISIBILITY LOGIC
+-- [SECTION 5] SHARED TARGET LOGIC (TEAM CHECK, HEALTH, RAYCAST VISIBILITY)
 -- ============================================================================
 local function isTeammate(player)
     if player == LocalPlayer then
         return true
     end
 
-    -- Standard Roblox Team object check
     if LocalPlayer.Team ~= nil and player.Team ~= nil then
         if not LocalPlayer.Neutral and not player.Neutral then
             return LocalPlayer.Team == player.Team
         end
     end
 
-    -- TeamColor check only when Teams service defines teams & neither is Neutral
     if not LocalPlayer.Neutral and not player.Neutral and #Teams:GetTeams() > 0 then
         if LocalPlayer.TeamColor == player.TeamColor then
             return true
         end
     end
 
-    -- Attribute fallback for custom team-based shooters (e.g. Rivals / custom rounds)
     local localAttr = LocalPlayer:GetAttribute("Team")
-    if localAttr == nil then
-        localAttr = LocalPlayer:GetAttribute("TeamId")
-    end
+    if localAttr == nil then localAttr = LocalPlayer:GetAttribute("TeamId") end
     local targetAttr = player:GetAttribute("Team")
-    if targetAttr == nil then
-        targetAttr = player:GetAttribute("TeamId")
-    end
+    if targetAttr == nil then targetAttr = player:GetAttribute("TeamId") end
     if localAttr ~= nil and targetAttr ~= nil and localAttr == targetAttr then
         return true
     end
@@ -780,6 +937,28 @@ local function isTeammate(player)
     return false
 end
 
+local function getCharacterHealth(entry)
+    local hum = entry.Humanoid
+    if hum and hum.Parent then
+        local maxHp = hum.MaxHealth > 0 and hum.MaxHealth or 100
+        local hp = math.clamp(hum.Health, 0, maxHp)
+        return hp, maxHp, math.clamp(hp / maxHp, 0, 1)
+    end
+
+    local char = entry.Character
+    if char then
+        local attrHp = char:GetAttribute("Health")
+        local attrMax = char:GetAttribute("MaxHealth")
+        if type(attrHp) == "number" then
+            local maxHp = (type(attrMax) == "number" and attrMax > 0) and attrMax or 100
+            local hp = math.clamp(attrHp, 0, maxHp)
+            return hp, maxHp, math.clamp(hp / maxHp, 0, 1)
+        end
+    end
+
+    return 100, 100, 1
+end
+
 local function isEntryAlive(entry)
     local char = entry.Character
     if not char or not char.Parent then
@@ -791,11 +970,8 @@ local function isEntryAlive(entry)
     end
 
     local hum = entry.Humanoid
-    if hum then
-        if not hum.Parent or hum.Health <= 0 then
-            return false
-        end
-        if hum:GetState() == Enum.HumanoidStateType.Dead then
+    if hum and hum.Parent then
+        if hum.Health <= 0 or hum:GetState() == Enum.HumanoidStateType.Dead then
             return false
         end
     end
@@ -818,6 +994,11 @@ local function getAimPart(entry, camera, screenCenter)
             or (cands.HumanoidRootPart and cands.HumanoidRootPart.Parent and cands.HumanoidRootPart)
             or (cands.Head and cands.Head.Parent and cands.Head)
             or entry.RootPart
+    elseif mode == "HumanoidRootPart" then
+        return (cands.HumanoidRootPart and cands.HumanoidRootPart.Parent and cands.HumanoidRootPart)
+            or (cands.UpperTorso and cands.UpperTorso.Parent and cands.UpperTorso)
+            or (cands.Torso and cands.Torso.Parent and cands.Torso)
+            or entry.RootPart
     else
         local bestPart = nil
         local bestDist = math.huge
@@ -829,9 +1010,9 @@ local function getAimPart(entry, camera, screenCenter)
         }
         for _, part in ipairs(partsToCheck) do
             if part and part.Parent then
-                local screenPos, onScreen = camera:WorldToViewportPoint(part.Position)
-                if screenPos.Z > 0 then
-                    local dist = (Vector2.new(screenPos.X, screenPos.Y) - screenCenter).Magnitude
+                local vp, onScreen = camera:WorldToViewportPoint(part.Position)
+                if vp.Z > 0 then
+                    local dist = (Vector2.new(vp.X, vp.Y) - screenCenter).Magnitude
                     if not onScreen then
                         dist = dist + 2000
                     end
@@ -851,6 +1032,10 @@ RayParams.FilterType = Enum.RaycastFilterType.Exclude
 RayParams.IgnoreWater = true
 
 local function isPartVisible(camera, targetCharacter, targetPart)
+    if not targetCharacter or not targetPart or not targetPart.Parent then
+        return false
+    end
+
     local origin = camera.CFrame.Position
     local targetPos = targetPart.Position
     local delta = targetPos - origin
@@ -859,7 +1044,7 @@ local function isPartVisible(camera, targetCharacter, targetPart)
         return true
     end
 
-    local filterList = {OverlayGui, camera}
+    local filterList = {OverlayGui, HighlightContainer, camera}
     if LocalPlayer.Character then
         table.insert(filterList, LocalPlayer.Character)
     end
@@ -867,8 +1052,7 @@ local function isPartVisible(camera, targetCharacter, targetPart)
     local currentOrigin = origin
     local dirUnit = delta.Unit
 
-    -- Up to 4 pierce steps to pass through non-colliding FX or invisible trigger volumes
-    for _ = 1, 4 do
+    for _ = 1, 5 do
         local remaining = (targetPos - currentOrigin).Magnitude
         if remaining < 0.05 then
             return true
@@ -876,15 +1060,11 @@ local function isPartVisible(camera, targetCharacter, targetPart)
 
         RayParams.FilterDescendantsInstances = filterList
         local result = Workspace:Raycast(currentOrigin, dirUnit * remaining, RayParams)
-        if not result then
+        if not result or not result.Instance then
             return true
         end
 
         local hitPart = result.Instance
-        if not hitPart then
-            return true
-        end
-
         if hitPart:IsDescendantOf(targetCharacter) then
             return true
         end
@@ -901,7 +1081,7 @@ local function isPartVisible(camera, targetCharacter, targetPart)
 end
 
 -- ============================================================================
--- [SECTION 6] BOUNDING BOX PROJECTION & ESP RENDERER
+-- [SECTION 6] REBUILT ESP PROJECTION, HEALTH BAR, 360 ALERT & HIGHLIGHT POOL
 -- ============================================================================
 local function computeScreenBox(camera, entry)
     local minX, minY = math.huge, math.huge
@@ -909,19 +1089,44 @@ local function computeScreenBox(camera, entry)
     local anyInFront = false
 
     local parts = entry.RigParts
-    if #parts == 0 and entry.RootPart then
-        parts = {entry.RootPart}
+    local validParts = 0
+    if #parts > 0 then
+        for _, part in ipairs(parts) do
+            if part and part.Parent then
+                validParts = validParts + 1
+                local cf = part.CFrame
+                local half = part.Size * 0.5
+                for sx = -1, 1, 2 do
+                    for sy = -1, 1, 2 do
+                        for sz = -1, 1, 2 do
+                            local corner = cf:PointToWorldSpace(Vector3.new(half.X * sx, half.Y * sy, half.Z * sz))
+                            local vp = camera:WorldToViewportPoint(corner)
+                            if vp.Z > 0 then
+                                anyInFront = true
+                                if vp.X < minX then minX = vp.X end
+                                if vp.Y < minY then minY = vp.Y end
+                                if vp.X > maxX then maxX = vp.X end
+                                if vp.Y > maxY then maxY = vp.Y end
+                            end
+                        end
+                    end
+                end
+            end
+        end
     end
 
-    for _, part in ipairs(parts) do
-        if part and part.Parent then
-            local cf = part.CFrame
-            local half = part.Size * 0.5
+    if validParts == 0 and entry.Character then
+        -- Fallback using Model:GetBoundingBox() if rig parts aren't matched or are temporarily unparented
+        local ok, cf, size = pcall(function()
+            return entry.Character:GetBoundingBox()
+        end)
+        if ok and cf and size then
+            local half = size * 0.5
             for sx = -1, 1, 2 do
                 for sy = -1, 1, 2 do
                     for sz = -1, 1, 2 do
-                        local worldCorner = cf:PointToWorldSpace(Vector3.new(half.X * sx, half.Y * sy, half.Z * sz))
-                        local vp = camera:WorldToViewportPoint(worldCorner)
+                        local corner = cf:PointToWorldSpace(Vector3.new(half.X * sx, half.Y * sy, half.Z * sz))
+                        local vp = camera:WorldToViewportPoint(corner)
                         if vp.Z > 0 then
                             anyInFront = true
                             if vp.X < minX then minX = vp.X end
@@ -943,128 +1148,178 @@ local function computeScreenBox(camera, entry)
     return true, minX - pad, minY - pad, (maxX - minX) + pad * 2, (maxY - minY) + pad * 2
 end
 
-local function hideEntryVisuals(entry)
-    entry.Box:Set(false, 0, 0, 0, 0, Config.Colors.Enemy, 1)
-    entry.Tracer:Set(false, Vector2.zero, Vector2.zero, Config.Colors.Tracer, 1)
-    entry.Arrow:Set(false, Vector2.zero, 0, Config.Colors.Alert360)
-    entry.Label:Set(false, 0, 0, "", Color3.new(1, 1, 1))
-    if entry.Highlight then
-        entry.Highlight.Enabled = false
+local function getHealthColor(ratio)
+    if ratio >= 0.5 then
+        return Color3.fromRGB(250, 204, 21):Lerp(Color3.fromRGB(52, 211, 153), (ratio - 0.5) * 2)
+    else
+        return Color3.fromRGB(239, 68, 68):Lerp(Color3.fromRGB(250, 204, 21), ratio * 2)
     end
 end
 
-local function updateESPForEntry(entry, camera, viewportSize, screenCenter)
-    if not Config.ESP.Enabled or not isEntryAlive(entry) then
-        hideEntryVisuals(entry)
-        return
-    end
+local MAX_ACTIVE_HIGHLIGHTS = 28
 
-    if Config.ESP.TeamCheck and isTeammate(entry.Player) then
-        hideEntryVisuals(entry)
-        return
-    end
+local function updateAllESP(camera, viewportSize, screenCenter)
+    local highlightCandidates = {}
 
-    local rootPart = entry.RootPart
-    local worldDist = (rootPart.Position - camera.CFrame.Position).Magnitude
-    if worldDist > Config.ESP.MaxDistance then
-        hideEntryVisuals(entry)
-        return
-    end
-
-    local checkPart = entry.TargetCandidates.Head or rootPart
-    local visible = isPartVisible(camera, entry.Character, checkPart)
-
-    if Config.ESP.VisibleCheck and not visible then
-        hideEntryVisuals(entry)
-        return
-    end
-
-    local activeColor = Config.Colors.Enemy
-    if Config.ESP.ColorByVisibility then
-        activeColor = visible and Config.Colors.Visible or Config.Colors.Hidden
-    end
-
-    local rootVP, rootOnScreen = camera:WorldToViewportPoint(rootPart.Position)
-    local isBehindCamera = rootVP.Z <= 0
-    local targetScreenPos = Vector2.new(rootVP.X, rootVP.Y)
-
-    -- 1. Box ESP & Name/Distance Label
-    local boxValid, bx, by, bw, bh = false, 0, 0, 0, 0
-    if (Config.ESP.BoxESP or Config.ESP.ShowNameDistance) and not isBehindCamera then
-        boxValid, bx, by, bw, bh = computeScreenBox(camera, entry)
-    end
-
-    if Config.ESP.BoxESP and boxValid then
-        entry.Box:Set(true, bx, by, bw, bh, activeColor, Config.ESP.BoxThickness)
-    else
-        entry.Box:Set(false, 0, 0, 0, 0, activeColor, 1)
-    end
-
-    if Config.ESP.ShowNameDistance and boxValid then
-        local text = string.format("%s [%.0fm]", entry.Player.DisplayName, worldDist)
-        entry.Label:Set(true, bx + bw * 0.5, by, text, activeColor)
-    else
-        entry.Label:Set(false, 0, 0, "", activeColor)
-    end
-
-    -- 2. Tracer (Line ESP)
-    if Config.ESP.TracerESP and not isBehindCamera and rootOnScreen then
-        local originPos
-        if Config.ESP.TracerOrigin == "Top" then
-            originPos = Vector2.new(viewportSize.X * 0.5, 0)
-        elseif Config.ESP.TracerOrigin == "Center" then
-            originPos = screenCenter
+    for _, entry in pairs(State.TrackedPlayers) do
+        if not Config.ESP.Enabled or not isEntryAlive(entry) then
+            entry.Visuals:HideAll()
+            if entry.Highlight then entry.Highlight.Enabled = false end
+        elseif Config.ESP.TeamCheck and isTeammate(entry.Player) then
+            entry.Visuals:HideAll()
+            if entry.Highlight then entry.Highlight.Enabled = false end
         else
-            originPos = Vector2.new(viewportSize.X * 0.5, viewportSize.Y)
+            local rootPart = entry.RootPart
+            local worldDist = (rootPart.Position - camera.CFrame.Position).Magnitude
+
+            if worldDist > Config.ESP.MaxDistance then
+                entry.Visuals:HideAll()
+                if entry.Highlight then entry.Highlight.Enabled = false end
+            else
+                local checkPart = entry.TargetCandidates.Head or rootPart
+                local visible = isPartVisible(camera, entry.Character, checkPart)
+
+                if Config.ESP.VisibleCheck and not visible then
+                    entry.Visuals:HideAll()
+                    if entry.Highlight then entry.Highlight.Enabled = false end
+                else
+                    local boxColor = Config.Colors.Box
+                    if Config.ESP.ColorByVisibility then
+                        boxColor = visible and Config.Colors.Visible or Config.Colors.Hidden
+                    end
+
+                    local rootVP, rootOnScreen = camera:WorldToViewportPoint(rootPart.Position)
+                    local isBehind = rootVP.Z <= 0
+                    local screenPos = Vector2.new(rootVP.X, rootVP.Y)
+
+                    local boxValid, bx, by, bw, bh = false, 0, 0, 0, 0
+                    if not isBehind then
+                        boxValid, bx, by, bw, bh = computeScreenBox(camera, entry)
+                    end
+
+                    -- 1. Health ratio (0% - 100%)
+                    local _, _, hpRatio = getCharacterHealth(entry)
+                    local hpColor = getHealthColor(hpRatio)
+
+                    -- 2. Tracer origin & anchor
+                    local showTracer = Config.ESP.TracerESP and (not isBehind) and rootOnScreen
+                    local tracerFrom = Vector2.new(viewportSize.X * 0.5, viewportSize.Y)
+                    if Config.ESP.TracerOrigin == "Top" then
+                        tracerFrom = Vector2.new(viewportSize.X * 0.5, 0)
+                    elseif Config.ESP.TracerOrigin == "Center" then
+                        tracerFrom = screenCenter
+                    end
+                    local tracerTo = boxValid and Vector2.new(bx + bw * 0.5, by + bh) or screenPos
+
+                    -- 3. 360-Degree Alert with Visible Check support
+                    local showArrow = false
+                    local arrowPos = Vector2.zero
+                    local arrowAngle = 0
+                    local arrowColor = visible and Config.Colors.AlertVisible or Config.Colors.AlertHidden
+
+                    if Config.ESP.Alert360 then
+                        local alertAllowed = (not Config.ESP.Alert360VisibleOnly) or visible
+                        if alertAllowed then
+                            local localSpace = camera.CFrame:PointToObjectSpace(rootPart.Position)
+                            local screenDir = Vector2.new(localSpace.X, -localSpace.Y)
+                            local distFromCenter = (screenPos - screenCenter).Magnitude
+                            local outOfFOV = isBehind or (not rootOnScreen) or (distFromCenter > Config.Aimbot.FOVRadius)
+                            if outOfFOV and screenDir.Magnitude > 0.001 then
+                                showArrow = true
+                                arrowAngle = math.atan2(screenDir.Y, screenDir.X)
+                                local ringR = math.min(
+                                    Config.ESP.AlertRingRadius,
+                                    math.min(viewportSize.X, viewportSize.Y) * 0.42
+                                )
+                                arrowPos = screenCenter + Vector2.new(math.cos(arrowAngle), math.sin(arrowAngle)) * ringR
+                            end
+                        end
+                    end
+
+                    entry.Visuals:Render({
+                        ShowBox = Config.ESP.BoxESP and boxValid,
+                        BoxStyle = Config.ESP.BoxStyle,
+                        BoxThickness = Config.ESP.BoxThickness,
+                        BoxColor = boxColor,
+                        BX = bx,
+                        BY = by,
+                        BW = bw,
+                        BH = bh,
+                        ShowHealth = Config.ESP.HealthBar and boxValid,
+                        HealthRatio = hpRatio,
+                        HealthColor = hpColor,
+                        ShowLabel = Config.ESP.ShowNameDistance and boxValid,
+                        LabelText = string.format("%s [%.0fm]", entry.Player.DisplayName, worldDist),
+                        ShowTracer = showTracer,
+                        TracerFrom = tracerFrom,
+                        TracerTo = tracerTo,
+                        TracerColor = Config.Colors.Line,
+                        LineThickness = Config.ESP.LineThickness,
+                        ShowArrow = showArrow,
+                        ArrowPos = arrowPos,
+                        ArrowAngle = arrowAngle,
+                        ArrowColor = arrowColor,
+                    })
+
+                    -- 4. Queue Highlight candidate (respects HighlightVisibleOnly & Highlight engine cap)
+                    if Config.ESP.HighlightESP then
+                        local hlAllowed = (not Config.ESP.HighlightVisibleOnly) or visible
+                        if hlAllowed then
+                            table.insert(highlightCandidates, {
+                                Entry = entry,
+                                Dist = worldDist,
+                                Visible = visible,
+                            })
+                        elseif entry.Highlight then
+                            entry.Highlight.Enabled = false
+                        end
+                    elseif entry.Highlight then
+                        entry.Highlight.Enabled = false
+                    end
+                end
+            end
         end
-        local anchorTo = boxValid and Vector2.new(bx + bw * 0.5, by + bh) or targetScreenPos
-        entry.Tracer:Set(true, originPos, anchorTo, Config.Colors.Tracer, Config.ESP.TracerThickness)
-    else
-        entry.Tracer:Set(false, Vector2.zero, Vector2.zero, Config.Colors.Tracer, 1)
     end
 
-    -- 3. 360-Degree Alert / Out-of-FOV Indicator
-    if Config.ESP.Alert360 then
-        local localSpace = camera.CFrame:PointToObjectSpace(rootPart.Position)
-        local screenDir = Vector2.new(localSpace.X, -localSpace.Y)
-        local distFromCenter = (targetScreenPos - screenCenter).Magnitude
-        local outOfFOV = isBehindCamera
-            or (not rootOnScreen)
-            or (distFromCenter > Config.Aimbot.FOVRadius)
+    -- Apply Highlights sorted by closest distance up to Roblox's safe engine cap
+    if Config.ESP.Enabled and Config.ESP.HighlightESP and #highlightCandidates > 0 then
+        table.sort(highlightCandidates, function(a, b)
+            return a.Dist < b.Dist
+        end)
 
-        if outOfFOV and screenDir.Magnitude > 0.001 then
-            local angle = math.atan2(screenDir.Y, screenDir.X)
-            local ringRadius = math.min(
-                Config.ESP.AlertRingRadius,
-                math.min(viewportSize.X, viewportSize.Y) * 0.42
-            )
-            local tipPos = screenCenter + Vector2.new(math.cos(angle), math.sin(angle)) * ringRadius
-            entry.Arrow:Set(true, tipPos, angle, Config.Colors.Alert360)
-        else
-            entry.Arrow:Set(false, Vector2.zero, 0, Config.Colors.Alert360)
+        for idx, item in ipairs(highlightCandidates) do
+            local entry = item.Entry
+            if idx <= MAX_ACTIVE_HIGHLIGHTS then
+                if not entry.Highlight or not entry.Highlight.Parent then
+                    local ok, hl = pcall(function()
+                        local instance = Instance.new("Highlight")
+                        instance.Name = "AKI_HL_" .. entry.Player.Name
+                        instance.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+                        instance.Parent = HighlightContainer
+                        return instance
+                    end)
+                    if ok and hl then
+                        entry.Highlight = hl
+                    end
+                end
+                if entry.Highlight then
+                    local hlCol = item.Visible and Config.Colors.HighlightVisible or Config.Colors.HighlightHidden
+                    entry.Highlight.Adornee = entry.Character
+                    entry.Highlight.FillColor = hlCol
+                    entry.Highlight.OutlineColor = hlCol
+                    entry.Highlight.FillTransparency = Config.ESP.HighlightFillTransparency
+                    entry.Highlight.OutlineTransparency = Config.ESP.HighlightOutlineTransparency
+                    entry.Highlight.Enabled = true
+                end
+            else
+                destroyHighlight(entry)
+            end
         end
-    else
-        entry.Arrow:Set(false, Vector2.zero, 0, Config.Colors.Alert360)
-    end
-
-    -- 4. Highlight ESP
-    if Config.ESP.HighlightESP then
-        ensureHighlight(entry, entry.Character)
-        if entry.Highlight then
-            local hlColor = Config.ESP.ColorByVisibility and activeColor or Config.Colors.Highlight
-            entry.Highlight.FillColor = hlColor
-            entry.Highlight.OutlineColor = hlColor
-            entry.Highlight.FillTransparency = Config.ESP.HighlightFillTransparency
-            entry.Highlight.OutlineTransparency = Config.ESP.HighlightOutlineTransparency
-            entry.Highlight.Enabled = true
-        end
-    elseif entry.Highlight then
-        entry.Highlight.Enabled = false
     end
 end
 
 -- ============================================================================
--- [SECTION 7] ADVANCED MOBILE-FRIENDLY AIMBOT CONTROLLER
+-- [SECTION 7] UNIVERSAL MOBILE-FRIENDLY AIMBOT CONTROLLER
 -- ============================================================================
 addConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
     if gameProcessed then
@@ -1176,9 +1431,9 @@ local function updateAimbot(camera, screenCenter, dt)
 end
 
 -- ============================================================================
--- [SECTION 8] MAIN RENDER LOOP (POST-CAMERA PRIORITY)
+-- [SECTION 8] MAIN RENDER LOOP (POST-CAMERA PRIORITY & FULL PLAYER SYNC)
 -- ============================================================================
-local RENDER_STEP_NAME = "TEAM_AKI_RenderStep"
+local RENDER_STEP_NAME = "TEAM_AKI_RenderStep_v2"
 
 pcall(function()
     RunService:UnbindFromRenderStep(RENDER_STEP_NAME)
@@ -1194,35 +1449,34 @@ RunService:BindToRenderStep(RENDER_STEP_NAME, Enum.RenderPriority.Camera.Value +
         return
     end
 
+    -- Ensure every player & newly spawned character is tracked & healed automatically
+    pcall(syncAllPlayers)
+
     local viewportSize = camera.ViewportSize
     local screenCenter = Vector2.new(viewportSize.X * 0.5, viewportSize.Y * 0.5)
 
-    -- Update FOV Ring
+    -- Update FOV Circle & Thickness
     local showFov = Config.Aimbot.ShowFOV and Config.Aimbot.Enabled
     FOVRingFrame.Visible = showFov
     if showFov then
         local diameter = Config.Aimbot.FOVRadius * 2
         FOVRingFrame.Size = UDim2.fromOffset(diameter, diameter)
         FOVStroke.Color = Config.Colors.FOV
+        FOVStroke.Thickness = Config.Aimbot.FOVThickness
     end
 
-    -- Update Aimbot after Roblox CameraScript
+    -- Update Aimbot after CameraScript
     pcall(updateAimbot, camera, screenCenter, dt)
 
-    -- Update ESP after camera update so boxes & tracers match exact frame
-    for _, entry in pairs(State.TrackedPlayers) do
-        local ok = pcall(updateESPForEntry, entry, camera, viewportSize, screenCenter)
-        if not ok then
-            hideEntryVisuals(entry)
-        end
-    end
+    -- Update ESP using final camera state
+    pcall(updateAllESP, camera, viewportSize, screenCenter)
 end)
 
 -- ============================================================================
--- [SECTION 9] ADAPTIVE DEEP GLASSMORPHIC GUI (TEAM AKI)
+-- [SECTION 9] ADAPTIVE DEEP GLASSMORPHIC UI (TEAM AKI)
 -- ============================================================================
 local MainGui = Instance.new("ScreenGui")
-MainGui.Name = "TEAM_AKI_Hub"
+MainGui.Name = "TEAM_AKI_Hub_v2"
 MainGui.IgnoreGuiInset = true
 MainGui.ResetOnSpawn = false
 MainGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
@@ -1231,10 +1485,10 @@ protectGui(MainGui)
 MainGui.Parent = getSafeGuiParent()
 
 local Palette = {
-    ObsidianBase = Color3.fromRGB(10, 12, 18),
-    CardSurface = Color3.fromRGB(17, 21, 31),
-    ElevatedSurface = Color3.fromRGB(24, 30, 44),
-    StrokeCool = Color3.fromRGB(115, 145, 195),
+    ObsidianBase = Color3.fromRGB(8, 10, 16),
+    CardSurface = Color3.fromRGB(16, 20, 30),
+    ElevatedSurface = Color3.fromRGB(23, 29, 44),
+    StrokeCool = Color3.fromRGB(120, 152, 205),
     Accent = Color3.fromRGB(56, 189, 248),
     AccentDeep = Color3.fromRGB(37, 99, 235),
     TextPrimary = Color3.fromRGB(241, 245, 249),
@@ -1250,29 +1504,88 @@ local function tween(obj, duration, props)
     return tw
 end
 
--- Responsive UIScale based on viewport dimensions (supports phones, tablets, desktops)
 local RootScale = Instance.new("UIScale")
 RootScale.Parent = MainGui
 
-local function updateResponsiveScale()
+local BASE_CARD_W = 472
+local BASE_CARD_H = 404
+
+-- Layered soft drop shadow behind MainCard
+local CardShadow = Instance.new("Frame")
+CardShadow.Name = "CardShadow"
+CardShadow.AnchorPoint = Vector2.new(0.5, 0.5)
+CardShadow.Position = UDim2.new(0.5, 0, 0.5, 6)
+CardShadow.Size = UDim2.fromOffset(BASE_CARD_W + 18, BASE_CARD_H + 18)
+CardShadow.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+CardShadow.BackgroundTransparency = 0.58
+CardShadow.BorderSizePixel = 0
+CardShadow.ZIndex = 1
+CardShadow.Parent = MainGui
+
+local ShadowCorner = Instance.new("UICorner")
+ShadowCorner.CornerRadius = UDim.new(0, 24)
+ShadowCorner.Parent = CardShadow
+
+local MainCard = Instance.new("Frame")
+MainCard.Name = "MainCard"
+MainCard.AnchorPoint = Vector2.new(0.5, 0.5)
+MainCard.Position = UDim2.fromScale(0.5, 0.5)
+MainCard.Size = UDim2.fromOffset(BASE_CARD_W, BASE_CARD_H)
+MainCard.BackgroundColor3 = Palette.ObsidianBase
+MainCard.BackgroundTransparency = 0.14
+MainCard.BorderSizePixel = 0
+MainCard.ClipsDescendants = true
+MainCard.ZIndex = 2
+MainCard.Parent = MainGui
+
+local MainCorner = Instance.new("UICorner")
+MainCorner.CornerRadius = UDim.new(0, 18)
+MainCorner.Parent = MainCard
+
+local MainStroke = Instance.new("UIStroke")
+MainStroke.Thickness = 1.25
+MainStroke.Transparency = 0.58
+MainStroke.Color = Palette.StrokeCool
+MainStroke.Parent = MainCard
+
+local GlassGradient = Instance.new("UIGradient")
+GlassGradient.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(22, 28, 44)),
+    ColorSequenceKeypoint.new(0.5, Color3.fromRGB(10, 13, 21)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(16, 20, 32)),
+})
+GlassGradient.Rotation = 135
+GlassGradient.Parent = MainCard
+
+-- Frosted inner top sheen
+local FrostedOverlay = Instance.new("Frame")
+FrostedOverlay.Name = "FrostedOverlay"
+FrostedOverlay.AnchorPoint = Vector2.new(0.5, 0)
+FrostedOverlay.Position = UDim2.new(0.5, 0, 0, -52)
+FrostedOverlay.Size = UDim2.new(0.82, 0, 0, 105)
+FrostedOverlay.BackgroundColor3 = Palette.Accent
+FrostedOverlay.BackgroundTransparency = 0.91
+FrostedOverlay.BorderSizePixel = 0
+FrostedOverlay.ZIndex = 2
+FrostedOverlay.Parent = MainCard
+
+local FrostCorner = Instance.new("UICorner")
+FrostCorner.CornerRadius = UDim.new(1, 0)
+FrostCorner.Parent = FrostedOverlay
+
+local function updateResponsiveLayout()
     local cam = Workspace.CurrentCamera
     if not cam then
         return
     end
     local vp = cam.ViewportSize
-    local minDim = math.min(vp.X, vp.Y)
-    local scale = 1
-    if minDim < 420 then
-        scale = math.clamp(minDim / 460, 0.68, 0.92)
-    elseif minDim < 720 then
-        scale = math.clamp(minDim / 680, 0.85, 1.0)
-    else
-        scale = 1.0
-    end
+    -- Fit both width and height cleanly across portrait phones, landscape phones, tablets, desktops
+    local maxScaleX = (vp.X * 0.92) / BASE_CARD_W
+    local maxScaleY = (vp.Y * 0.86) / BASE_CARD_H
+    local scale = math.clamp(math.min(maxScaleX, maxScaleY), 0.62, 1.05)
     RootScale.Scale = scale
 end
 
-updateResponsiveScale()
 local viewportConn = nil
 local function bindCameraViewport()
     if viewportConn then
@@ -1283,102 +1596,56 @@ local function bindCameraViewport()
     end
     local cam = Workspace.CurrentCamera
     if cam then
-        viewportConn = addConnection(cam:GetPropertyChangedSignal("ViewportSize"):Connect(updateResponsiveScale))
+        viewportConn = addConnection(cam:GetPropertyChangedSignal("ViewportSize"):Connect(updateResponsiveLayout))
     end
-    updateResponsiveScale()
+    updateResponsiveLayout()
 end
 
 bindCameraViewport()
 addConnection(Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(bindCameraViewport))
 
--- Main Centered Card Container
-local MainCard = Instance.new("Frame")
-MainCard.Name = "MainCard"
-MainCard.AnchorPoint = Vector2.new(0.5, 0.5)
-MainCard.Position = UDim2.fromScale(0.5, 0.5)
-MainCard.Size = UDim2.fromOffset(470, 390)
-MainCard.BackgroundColor3 = Palette.ObsidianBase
-MainCard.BackgroundTransparency = 0.14
-MainCard.BorderSizePixel = 0
-MainCard.ClipsDescendants = true
-MainCard.Parent = MainGui
-
-local MainCorner = Instance.new("UICorner")
-MainCorner.CornerRadius = UDim.new(0, 18)
-MainCorner.Parent = MainCard
-
-local MainStroke = Instance.new("UIStroke")
-MainStroke.Thickness = 1.2
-MainStroke.Transparency = 0.62
-MainStroke.Color = Palette.StrokeCool
-MainStroke.Parent = MainCard
-
-local GlassGradient = Instance.new("UIGradient")
-GlassGradient.Color = ColorSequence.new({
-    ColorSequenceKeypoint.new(0, Color3.fromRGB(22, 28, 42)),
-    ColorSequenceKeypoint.new(0.55, Color3.fromRGB(12, 15, 24)),
-    ColorSequenceKeypoint.new(1, Color3.fromRGB(16, 20, 32)),
-})
-GlassGradient.Rotation = 135
-GlassGradient.Parent = MainCard
-
-local DepthGlow = Instance.new("Frame")
-DepthGlow.Name = "DepthGlow"
-DepthGlow.AnchorPoint = Vector2.new(0.5, 0)
-DepthGlow.Position = UDim2.new(0.5, 0, 0, -45)
-DepthGlow.Size = UDim2.new(0.75, 0, 0, 90)
-DepthGlow.BackgroundColor3 = Palette.Accent
-DepthGlow.BackgroundTransparency = 0.90
-DepthGlow.BorderSizePixel = 0
-DepthGlow.ZIndex = 0
-DepthGlow.Parent = MainCard
-
-local GlowCorner = Instance.new("UICorner")
-GlowCorner.CornerRadius = UDim.new(1, 0)
-GlowCorner.Parent = DepthGlow
-
--- Header Bar (Draggable with multi-touch isolation)
+-- Header Bar
 local HeaderBar = Instance.new("Frame")
 HeaderBar.Name = "HeaderBar"
-HeaderBar.Size = UDim2.new(1, 0, 0, 52)
+HeaderBar.Size = UDim2.new(1, 0, 0, 54)
 HeaderBar.BackgroundColor3 = Palette.CardSurface
-HeaderBar.BackgroundTransparency = 0.35
+HeaderBar.BackgroundTransparency = 0.32
 HeaderBar.BorderSizePixel = 0
-HeaderBar.ZIndex = 2
+HeaderBar.ZIndex = 3
 HeaderBar.Parent = MainCard
 
 local HeaderDivider = Instance.new("Frame")
 HeaderDivider.Size = UDim2.new(1, 0, 0, 1)
 HeaderDivider.Position = UDim2.new(0, 0, 1, -1)
 HeaderDivider.BackgroundColor3 = Palette.StrokeCool
-HeaderDivider.BackgroundTransparency = 0.78
+HeaderDivider.BackgroundTransparency = 0.76
 HeaderDivider.BorderSizePixel = 0
 HeaderDivider.Parent = HeaderBar
 
 local TitleLabel = Instance.new("TextLabel")
 TitleLabel.Name = "BrandTitle"
 TitleLabel.BackgroundTransparency = 1
-TitleLabel.Position = UDim2.fromOffset(18, 8)
+TitleLabel.Position = UDim2.fromOffset(18, 9)
 TitleLabel.Size = UDim2.fromOffset(220, 20)
 TitleLabel.Font = Enum.Font.GothamBold
 TitleLabel.Text = "TEAM AKI"
 TitleLabel.TextSize = 16
 TitleLabel.TextColor3 = Palette.TextPrimary
 TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
-TitleLabel.ZIndex = 3
+TitleLabel.ZIndex = 4
 TitleLabel.Parent = HeaderBar
 
 local SubtitleLabel = Instance.new("TextLabel")
 SubtitleLabel.Name = "BrandSubtitle"
 SubtitleLabel.BackgroundTransparency = 1
-SubtitleLabel.Position = UDim2.fromOffset(18, 28)
-SubtitleLabel.Size = UDim2.fromOffset(250, 16)
+SubtitleLabel.Position = UDim2.fromOffset(18, 29)
+SubtitleLabel.Size = UDim2.fromOffset(260, 16)
 SubtitleLabel.Font = Enum.Font.Gotham
-SubtitleLabel.Text = "Universal Aimbot & Visual Suite"
+SubtitleLabel.Text = "Universal Aimbot & Rebuilt ESP"
 SubtitleLabel.TextSize = 11
 SubtitleLabel.TextColor3 = Palette.TextMuted
 SubtitleLabel.TextXAlignment = Enum.TextXAlignment.Left
-SubtitleLabel.ZIndex = 3
+SubtitleLabel.ZIndex = 4
 SubtitleLabel.Parent = HeaderBar
 
 local HeaderActions = Instance.new("Frame")
@@ -1386,7 +1653,7 @@ HeaderActions.BackgroundTransparency = 1
 HeaderActions.AnchorPoint = Vector2.new(1, 0.5)
 HeaderActions.Position = UDim2.new(1, -14, 0.5, 0)
 HeaderActions.Size = UDim2.fromOffset(72, 30)
-HeaderActions.ZIndex = 3
+HeaderActions.ZIndex = 4
 HeaderActions.Parent = HeaderBar
 
 local HeaderActionsLayout = Instance.new("UIListLayout")
@@ -1400,13 +1667,13 @@ local function createHeaderButton(symbol, bg)
     local btn = Instance.new("TextButton")
     btn.Size = UDim2.fromOffset(30, 30)
     btn.BackgroundColor3 = bg
-    btn.BackgroundTransparency = 0.35
+    btn.BackgroundTransparency = 0.3
     btn.Font = Enum.Font.GothamBold
     btn.Text = symbol
     btn.TextSize = 15
     btn.TextColor3 = Palette.TextPrimary
     btn.AutoButtonColor = false
-    btn.ZIndex = 4
+    btn.ZIndex = 5
     btn.Parent = HeaderActions
 
     local c = Instance.new("UICorner")
@@ -1425,6 +1692,7 @@ end
 local MinimizeBtn = createHeaderButton("-", Palette.ElevatedSurface)
 local UnloadHeaderBtn = createHeaderButton("×", Palette.Danger)
 
+-- Dragging MainCard + CardShadow synced together
 do
     local activeInput = nil
     local dragStart = nil
@@ -1443,11 +1711,18 @@ do
             if input == activeInput or (activeInput.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseMovement) then
                 local scale = math.max(RootScale.Scale, 0.5)
                 local delta = (input.Position - dragStart) / scale
-                MainCard.Position = UDim2.new(
+                local nextPos = UDim2.new(
                     startPos.X.Scale,
                     startPos.X.Offset + delta.X,
                     startPos.Y.Scale,
                     startPos.Y.Offset + delta.Y
+                )
+                MainCard.Position = nextPos
+                CardShadow.Position = UDim2.new(
+                    nextPos.X.Scale,
+                    nextPos.X.Offset,
+                    nextPos.Y.Scale,
+                    nextPos.Y.Offset + 6
                 )
             end
         end
@@ -1460,16 +1735,16 @@ do
     end))
 end
 
--- Tab Navigation Bar
+-- Tab Bar
 local TabBar = Instance.new("Frame")
 TabBar.Name = "TabBar"
 TabBar.AnchorPoint = Vector2.new(0.5, 0)
-TabBar.Position = UDim2.new(0.5, 0, 0, 62)
+TabBar.Position = UDim2.new(0.5, 0, 0, 64)
 TabBar.Size = UDim2.new(1, -28, 0, 36)
 TabBar.BackgroundColor3 = Palette.CardSurface
-TabBar.BackgroundTransparency = 0.25
+TabBar.BackgroundTransparency = 0.22
 TabBar.BorderSizePixel = 0
-TabBar.ZIndex = 2
+TabBar.ZIndex = 3
 TabBar.Parent = MainCard
 
 local TabBarCorner = Instance.new("UICorner")
@@ -1478,7 +1753,7 @@ TabBarCorner.Parent = TabBar
 
 local TabBarStroke = Instance.new("UIStroke")
 TabBarStroke.Thickness = 1
-TabBarStroke.Transparency = 0.78
+TabBarStroke.Transparency = 0.76
 TabBarStroke.Color = Palette.StrokeCool
 TabBarStroke.Parent = TabBar
 
@@ -1497,14 +1772,13 @@ TabGrid.VerticalAlignment = Enum.VerticalAlignment.Center
 TabGrid.SortOrder = Enum.SortOrder.LayoutOrder
 TabGrid.Parent = TabBar
 
--- Content Area (Tab Pages)
 local ContentHolder = Instance.new("Frame")
 ContentHolder.Name = "ContentHolder"
 ContentHolder.AnchorPoint = Vector2.new(0.5, 0)
-ContentHolder.Position = UDim2.new(0.5, 0, 0, 108)
-ContentHolder.Size = UDim2.new(1, -28, 1, -122)
+ContentHolder.Position = UDim2.new(0.5, 0, 0, 110)
+ContentHolder.Size = UDim2.new(1, -28, 1, -124)
 ContentHolder.BackgroundTransparency = 1
-ContentHolder.ZIndex = 2
+ContentHolder.ZIndex = 3
 ContentHolder.Parent = MainCard
 
 local TabPages = {}
@@ -1523,7 +1797,7 @@ local function createTabPage(name)
     page.CanvasSize = UDim2.fromOffset(0, 0)
     page.AutomaticCanvasSize = Enum.AutomaticSize.Y
     page.Visible = (name == Config.UI.ActiveTab)
-    page.ZIndex = 2
+    page.ZIndex = 3
     page.Parent = ContentHolder
 
     local list = Instance.new("UIListLayout")
@@ -1572,7 +1846,7 @@ for idx, tabName in ipairs(TabOrder) do
     btn.BackgroundColor3 = (tabName == Config.UI.ActiveTab) and Palette.AccentDeep or Palette.CardSurface
     btn.BackgroundTransparency = (tabName == Config.UI.ActiveTab) and 0.15 or 1
     btn.TextColor3 = (tabName == Config.UI.ActiveTab) and Palette.TextPrimary or Palette.TextMuted
-    btn.ZIndex = 3
+    btn.ZIndex = 4
     btn.Parent = TabBar
 
     local corner = Instance.new("UICorner")
@@ -1596,9 +1870,9 @@ local function createCardRow(parent, height, order)
     card.LayoutOrder = order
     card.Size = UDim2.new(1, 0, 0, height)
     card.BackgroundColor3 = Palette.CardSurface
-    card.BackgroundTransparency = 0.25
+    card.BackgroundTransparency = 0.24
     card.BorderSizePixel = 0
-    card.ZIndex = 3
+    card.ZIndex = 4
     card.Parent = parent
 
     local corner = Instance.new("UICorner")
@@ -1626,7 +1900,7 @@ local function addToggle(parent, order, title, subtitle, getter, setter)
     label.TextSize = 13
     label.TextColor3 = Palette.TextPrimary
     label.TextXAlignment = Enum.TextXAlignment.Left
-    label.ZIndex = 4
+    label.ZIndex = 5
     label.Parent = row
 
     if subtitle then
@@ -1639,7 +1913,7 @@ local function addToggle(parent, order, title, subtitle, getter, setter)
         sub.TextSize = 11
         sub.TextColor3 = Palette.TextMuted
         sub.TextXAlignment = Enum.TextXAlignment.Left
-        sub.ZIndex = 4
+        sub.ZIndex = 5
         sub.Parent = row
     end
 
@@ -1650,7 +1924,7 @@ local function addToggle(parent, order, title, subtitle, getter, setter)
     switchBtn.Text = ""
     switchBtn.AutoButtonColor = false
     switchBtn.BorderSizePixel = 0
-    switchBtn.ZIndex = 4
+    switchBtn.ZIndex = 5
     switchBtn.Parent = row
 
     local swCorner = Instance.new("UICorner")
@@ -1662,7 +1936,7 @@ local function addToggle(parent, order, title, subtitle, getter, setter)
     knob.Size = UDim2.fromOffset(18, 18)
     knob.BackgroundColor3 = Palette.TextPrimary
     knob.BorderSizePixel = 0
-    knob.ZIndex = 5
+    knob.ZIndex = 6
     knob.Parent = switchBtn
 
     local knobCorner = Instance.new("UICorner")
@@ -1705,7 +1979,7 @@ local function addSlider(parent, order, title, minVal, maxVal, step, formatFn, g
     label.TextSize = 13
     label.TextColor3 = Palette.TextPrimary
     label.TextXAlignment = Enum.TextXAlignment.Left
-    label.ZIndex = 4
+    label.ZIndex = 5
     label.Parent = row
 
     local valueLabel = Instance.new("TextLabel")
@@ -1717,7 +1991,7 @@ local function addSlider(parent, order, title, minVal, maxVal, step, formatFn, g
     valueLabel.TextSize = 12
     valueLabel.TextColor3 = Palette.Accent
     valueLabel.TextXAlignment = Enum.TextXAlignment.Right
-    valueLabel.ZIndex = 4
+    valueLabel.ZIndex = 5
     valueLabel.Parent = row
 
     local trackHitbox = Instance.new("TextButton")
@@ -1727,7 +2001,7 @@ local function addSlider(parent, order, title, minVal, maxVal, step, formatFn, g
     trackHitbox.AnchorPoint = Vector2.new(0.5, 0)
     trackHitbox.Position = UDim2.new(0.5, 0, 0, 32)
     trackHitbox.Size = UDim2.new(1, -28, 0, 22)
-    trackHitbox.ZIndex = 5
+    trackHitbox.ZIndex = 6
     trackHitbox.Parent = row
 
     local track = Instance.new("Frame")
@@ -1736,7 +2010,7 @@ local function addSlider(parent, order, title, minVal, maxVal, step, formatFn, g
     track.Size = UDim2.new(1, 0, 0, 6)
     track.BackgroundColor3 = Palette.ToggleOff
     track.BorderSizePixel = 0
-    track.ZIndex = 4
+    track.ZIndex = 5
     track.Parent = trackHitbox
 
     local trackCorner = Instance.new("UICorner")
@@ -1747,7 +2021,7 @@ local function addSlider(parent, order, title, minVal, maxVal, step, formatFn, g
     fill.Size = UDim2.fromScale(0.5, 1)
     fill.BackgroundColor3 = Palette.Accent
     fill.BorderSizePixel = 0
-    fill.ZIndex = 5
+    fill.ZIndex = 6
     fill.Parent = track
 
     local fillCorner = Instance.new("UICorner")
@@ -1760,7 +2034,7 @@ local function addSlider(parent, order, title, minVal, maxVal, step, formatFn, g
     thumb.Size = UDim2.fromOffset(14, 14)
     thumb.BackgroundColor3 = Palette.TextPrimary
     thumb.BorderSizePixel = 0
-    thumb.ZIndex = 6
+    thumb.ZIndex = 7
     thumb.Parent = track
 
     local thumbCorner = Instance.new("UICorner")
@@ -1827,7 +2101,7 @@ local function addSelector(parent, order, title, options, getter, setter)
     label.TextSize = 13
     label.TextColor3 = Palette.TextPrimary
     label.TextXAlignment = Enum.TextXAlignment.Left
-    label.ZIndex = 4
+    label.ZIndex = 5
     label.Parent = row
 
     local bar = Instance.new("Frame")
@@ -1837,7 +2111,7 @@ local function addSelector(parent, order, title, options, getter, setter)
     bar.BackgroundColor3 = Palette.ObsidianBase
     bar.BackgroundTransparency = 0.2
     bar.BorderSizePixel = 0
-    bar.ZIndex = 4
+    bar.ZIndex = 5
     bar.Parent = row
 
     local barCorner = Instance.new("UICorner")
@@ -1871,10 +2145,10 @@ local function addSelector(parent, order, title, options, getter, setter)
         b.LayoutOrder = i
         b.Text = opt
         b.Font = Enum.Font.GothamMedium
-        b.TextSize = 11
+        b.TextSize = 10.5
         b.AutoButtonColor = false
         b.BorderSizePixel = 0
-        b.ZIndex = 5
+        b.ZIndex = 6
         b.Parent = bar
 
         local bc = Instance.new("UICorner")
@@ -1912,7 +2186,7 @@ end, function(v)
     Config.Aimbot.ActivationMode = v
 end)
 
-addSelector(AimbotPage, 3, "Target Bone", {"Head", "Torso", "Closest"}, function()
+addSelector(AimbotPage, 3, "Target Part", {"Head", "Torso", "HumanoidRootPart", "Closest"}, function()
     return Config.Aimbot.TargetPart
 end, function(v)
     Config.Aimbot.TargetPart = v
@@ -1934,25 +2208,33 @@ end, function(v)
     Config.Aimbot.FOVRadius = v
 end)
 
-addToggle(AimbotPage, 6, "Show FOV Ring", "Draws a centered FOV ring around the reticle", function()
+addSlider(AimbotPage, 6, "FOV Thickness", 0.8, 5.0, 0.2, function(v)
+    return string.format("%.1f px", v)
+end, function()
+    return Config.Aimbot.FOVThickness
+end, function(v)
+    Config.Aimbot.FOVThickness = v
+end)
+
+addToggle(AimbotPage, 7, "Show FOV Ring", "Draws a centered FOV ring around the reticle", function()
     return Config.Aimbot.ShowFOV
 end, function(v)
     Config.Aimbot.ShowFOV = v
 end)
 
-addToggle(AimbotPage, 7, "Team Check", "Ignores teammates on matching teams", function()
+addToggle(AimbotPage, 8, "Team Check", "Ignores teammates on matching teams", function()
     return Config.Aimbot.TeamCheck
 end, function(v)
     Config.Aimbot.TeamCheck = v
 end)
 
-addToggle(AimbotPage, 8, "Visible / Wall Check", "Raycasts to ignore targets behind solid cover", function()
+addToggle(AimbotPage, 9, "Visible / Wall Check", "Raycasts to ignore targets behind solid cover", function()
     return Config.Aimbot.VisibleCheck
 end, function(v)
     Config.Aimbot.VisibleCheck = v
 end)
 
-addToggle(AimbotPage, 9, "Sticky Target Lock", "Keeps lock on active target while valid", function()
+addToggle(AimbotPage, 10, "Sticky Target Lock", "Keeps lock on active target while valid", function()
     return Config.Aimbot.StickyTarget
 end, function(v)
     Config.Aimbot.StickyTarget = v
@@ -1960,61 +2242,101 @@ end)
 
 -- ESP TAB
 local EspPage = TabPages.ESP
-addToggle(EspPage, 1, "Master ESP", "Enables or disables all visual overlays", function()
+addToggle(EspPage, 1, "Master ESP", "Enables or disables all ESP layers", function()
     return Config.ESP.Enabled
 end, function(v)
     Config.ESP.Enabled = v
 end)
 
-addToggle(EspPage, 2, "2D Box ESP", "Dynamic 3D-projected bounding boxes", function()
+addToggle(EspPage, 2, "Box ESP", "2D projected bounding box around characters", function()
     return Config.ESP.BoxESP
 end, function(v)
     Config.ESP.BoxESP = v
 end)
 
-addToggle(EspPage, 3, "Line ESP (Tracers)", "Draws tracer lines from screen edge to targets", function()
+addSelector(EspPage, 3, "Box Style", {"Corner", "Full"}, function()
+    return Config.ESP.BoxStyle
+end, function(v)
+    Config.ESP.BoxStyle = v
+end)
+
+addSlider(EspPage, 4, "Box Thickness", 0.8, 5.0, 0.2, function(v)
+    return string.format("%.1f px", v)
+end, function()
+    return Config.ESP.BoxThickness
+end, function(v)
+    Config.ESP.BoxThickness = v
+end)
+
+addToggle(EspPage, 5, "Health Bar (0% - 100%)", "Vertical sidebar health indicator beside box", function()
+    return Config.ESP.HealthBar
+end, function(v)
+    Config.ESP.HealthBar = v
+end)
+
+addToggle(EspPage, 6, "Line ESP (Tracers)", "Draws tracer lines from screen edge to targets", function()
     return Config.ESP.TracerESP
 end, function(v)
     Config.ESP.TracerESP = v
 end)
 
-addSelector(EspPage, 4, "Tracer Origin", {"Bottom", "Center", "Top"}, function()
+addSelector(EspPage, 7, "Tracer Origin", {"Bottom", "Center", "Top"}, function()
     return Config.ESP.TracerOrigin
 end, function(v)
     Config.ESP.TracerOrigin = v
 end)
 
-addToggle(EspPage, 5, "360° Out-of-FOV Alert", "Directional ring arrows for off-screen enemies", function()
+addSlider(EspPage, 8, "Line Thickness", 0.8, 5.0, 0.2, function(v)
+    return string.format("%.1f px", v)
+end, function()
+    return Config.ESP.LineThickness
+end, function(v)
+    Config.ESP.LineThickness = v
+end)
+
+addToggle(EspPage, 9, "360° Out-of-FOV Alert", "Directional indicators for off-screen enemies", function()
     return Config.ESP.Alert360
 end, function(v)
     Config.ESP.Alert360 = v
 end)
 
-addToggle(EspPage, 6, "Highlight ESP", "Character silhouette highlight overlay", function()
+addToggle(EspPage, 10, "360° Alert Visible Check", "Hide 360° alerts when enemy is behind cover", function()
+    return Config.ESP.Alert360VisibleOnly
+end, function(v)
+    Config.ESP.Alert360VisibleOnly = v
+end)
+
+addToggle(EspPage, 11, "Highlight ESP", "AlwaysOnTop silhouette highlight overlay", function()
     return Config.ESP.HighlightESP
 end, function(v)
     Config.ESP.HighlightESP = v
 end)
 
-addToggle(EspPage, 7, "Name & Distance", "Displays target display name and meters", function()
+addToggle(EspPage, 12, "Highlight Visible Check", "Hide highlight when enemy is behind cover", function()
+    return Config.ESP.HighlightVisibleOnly
+end, function(v)
+    Config.ESP.HighlightVisibleOnly = v
+end)
+
+addToggle(EspPage, 13, "Name & Distance", "Displays target display name and distance", function()
     return Config.ESP.ShowNameDistance
 end, function(v)
     Config.ESP.ShowNameDistance = v
 end)
 
-addToggle(EspPage, 8, "ESP Team Check", "Hides ESP overlays for teammates", function()
+addToggle(EspPage, 14, "ESP Team Check", "Hides ESP overlays for teammates", function()
     return Config.ESP.TeamCheck
 end, function(v)
     Config.ESP.TeamCheck = v
 end)
 
-addToggle(EspPage, 9, "ESP Visible Only", "Hides ESP completely when obstructed by walls", function()
+addToggle(EspPage, 15, "Master Visible Check", "Hides all ESP completely when behind walls", function()
     return Config.ESP.VisibleCheck
 end, function(v)
     Config.ESP.VisibleCheck = v
 end)
 
-addToggle(EspPage, 10, "Color By Visibility", "Tints visible vs hidden targets dynamically", function()
+addToggle(EspPage, 16, "Color By Visibility", "Tints boxes and labels by line-of-sight", function()
     return Config.ESP.ColorByVisibility
 end, function(v)
     Config.ESP.ColorByVisibility = v
@@ -2022,9 +2344,19 @@ end)
 
 -- COLORS TAB
 local ColorsPage = TabPages.Colors
-local ColorKeys = {"Enemy", "Visible", "Hidden", "Tracer", "Alert360", "Highlight", "FOV"}
+local ColorChannelDefs = {
+    { Key = "Box", Label = "Box" },
+    { Key = "Visible", Label = "Visible" },
+    { Key = "Hidden", Label = "Hidden" },
+    { Key = "Line", Label = "Line" },
+    { Key = "HighlightVisible", Label = "HL Vis" },
+    { Key = "HighlightHidden", Label = "HL Hid" },
+    { Key = "AlertVisible", Label = "360 Vis" },
+    { Key = "AlertHidden", Label = "360 Hid" },
+    { Key = "FOV", Label = "FOV" },
+}
 
-local ChannelCard = createCardRow(ColorsPage, 84, 1)
+local ChannelCard = createCardRow(ColorsPage, 108, 1)
 local ChannelTitle = Instance.new("TextLabel")
 ChannelTitle.BackgroundTransparency = 1
 ChannelTitle.Position = UDim2.fromOffset(14, 8)
@@ -2034,7 +2366,7 @@ ChannelTitle.Text = "Color Channel"
 ChannelTitle.TextSize = 13
 ChannelTitle.TextColor3 = Palette.TextPrimary
 ChannelTitle.TextXAlignment = Enum.TextXAlignment.Left
-ChannelTitle.ZIndex = 4
+ChannelTitle.ZIndex = 5
 ChannelTitle.Parent = ChannelCard
 
 local LiveSwatch = Instance.new("Frame")
@@ -2042,7 +2374,7 @@ LiveSwatch.AnchorPoint = Vector2.new(1, 0)
 LiveSwatch.Position = UDim2.new(1, -14, 0, 8)
 LiveSwatch.Size = UDim2.fromOffset(42, 18)
 LiveSwatch.BorderSizePixel = 0
-LiveSwatch.ZIndex = 4
+LiveSwatch.ZIndex = 5
 LiveSwatch.Parent = ChannelCard
 
 local SwatchCorner = Instance.new("UICorner")
@@ -2058,13 +2390,13 @@ SwatchStroke.Parent = LiveSwatch
 local ChannelGridHolder = Instance.new("Frame")
 ChannelGridHolder.AnchorPoint = Vector2.new(0.5, 0)
 ChannelGridHolder.Position = UDim2.new(0.5, 0, 0, 32)
-ChannelGridHolder.Size = UDim2.new(1, -28, 0, 44)
+ChannelGridHolder.Size = UDim2.new(1, -28, 0, 68)
 ChannelGridHolder.BackgroundTransparency = 1
-ChannelGridHolder.ZIndex = 4
+ChannelGridHolder.ZIndex = 5
 ChannelGridHolder.Parent = ChannelCard
 
 local ChannelGrid = Instance.new("UIGridLayout")
-ChannelGrid.CellSize = UDim2.new(0.25, -4, 0, 20)
+ChannelGrid.CellSize = UDim2.new(0.333, -4, 0, 20)
 ChannelGrid.CellPadding = UDim2.fromOffset(4, 4)
 ChannelGrid.HorizontalAlignment = Enum.HorizontalAlignment.Center
 ChannelGrid.SortOrder = Enum.SortOrder.LayoutOrder
@@ -2091,15 +2423,15 @@ local function refreshColorControls()
     notifyColorUpdated()
 end
 
-for idx, key in ipairs(ColorKeys) do
+for idx, def in ipairs(ColorChannelDefs) do
     local b = Instance.new("TextButton")
     b.LayoutOrder = idx
-    b.Text = key
+    b.Text = def.Label
     b.Font = Enum.Font.GothamMedium
     b.TextSize = 10
     b.AutoButtonColor = false
     b.BorderSizePixel = 0
-    b.ZIndex = 5
+    b.ZIndex = 6
     b.Parent = ChannelGridHolder
 
     local bc = Instance.new("UICorner")
@@ -2107,11 +2439,11 @@ for idx, key in ipairs(ColorKeys) do
     bc.Parent = b
 
     b.Activated:Connect(function()
-        Config.UI.SelectedColorKey = key
+        Config.UI.SelectedColorKey = def.Key
         refreshColorControls()
     end)
 
-    channelBtns[key] = b
+    channelBtns[def.Key] = b
 end
 
 local function updateChannelRGB(r, g, b)
@@ -2159,7 +2491,7 @@ SwatchTitle.Text = "Quick Color Presets"
 SwatchTitle.TextSize = 13
 SwatchTitle.TextColor3 = Palette.TextPrimary
 SwatchTitle.TextXAlignment = Enum.TextXAlignment.Left
-SwatchTitle.ZIndex = 4
+SwatchTitle.ZIndex = 5
 SwatchTitle.Parent = SwatchesCard
 
 local SwatchRow = Instance.new("Frame")
@@ -2167,7 +2499,7 @@ SwatchRow.AnchorPoint = Vector2.new(0.5, 0)
 SwatchRow.Position = UDim2.new(0.5, 0, 0, 32)
 SwatchRow.Size = UDim2.new(1, -28, 0, 24)
 SwatchRow.BackgroundTransparency = 1
-SwatchRow.ZIndex = 4
+SwatchRow.ZIndex = 5
 SwatchRow.Parent = SwatchesCard
 
 local SwatchLayout = Instance.new("UIListLayout")
@@ -2195,7 +2527,7 @@ for _, swatchColor in ipairs(PresetPalette) do
     sb.BackgroundColor3 = swatchColor
     sb.AutoButtonColor = false
     sb.BorderSizePixel = 0
-    sb.ZIndex = 5
+    sb.ZIndex = 6
     sb.Parent = SwatchRow
 
     local sc = Instance.new("UICorner")
@@ -2218,7 +2550,13 @@ refreshColorControls()
 
 -- SYSTEM TAB
 local SystemPage = TabPages.System
-addSlider(SystemPage, 1, "Max Render Distance", 200, 3000, 50, function(v)
+addSelector(SystemPage, 1, "ESP Render Engine", {"ScreenGui", "Drawing"}, function()
+    return Config.ESP.RenderEngine
+end, function(v)
+    Config.ESP.RenderEngine = v
+end)
+
+addSlider(SystemPage, 2, "Max Render Distance", 200, 3500, 50, function(v)
     return string.format("%dm", math.round(v))
 end, function()
     return Config.ESP.MaxDistance
@@ -2227,7 +2565,7 @@ end, function(v)
     Config.Aimbot.MaxDistance = v
 end)
 
-addSlider(SystemPage, 2, "360° Alert Ring Radius", 80, 280, 5, function(v)
+addSlider(SystemPage, 3, "360° Alert Ring Radius", 80, 280, 5, function(v)
     return string.format("%d px", math.round(v))
 end, function()
     return Config.ESP.AlertRingRadius
@@ -2235,7 +2573,7 @@ end, function(v)
     Config.ESP.AlertRingRadius = v
 end)
 
-local ActionCard = createCardRow(SystemPage, 54, 3)
+local ActionCard = createCardRow(SystemPage, 54, 4)
 local ActionPad = Instance.new("UIPadding")
 ActionPad.PaddingLeft = UDim.new(0, 14)
 ActionPad.PaddingRight = UDim.new(0, 14)
@@ -2256,7 +2594,7 @@ ResetBtn.TextColor3 = Palette.TextPrimary
 ResetBtn.BackgroundColor3 = Palette.ElevatedSurface
 ResetBtn.AutoButtonColor = false
 ResetBtn.BorderSizePixel = 0
-ResetBtn.ZIndex = 5
+ResetBtn.ZIndex = 6
 ResetBtn.Parent = ActionCard
 
 local ResetCorner = Instance.new("UICorner")
@@ -2272,7 +2610,7 @@ UnloadBtn.BackgroundColor3 = Palette.Danger
 UnloadBtn.BackgroundTransparency = 0.2
 UnloadBtn.AutoButtonColor = false
 UnloadBtn.BorderSizePixel = 0
-UnloadBtn.ZIndex = 5
+UnloadBtn.ZIndex = 6
 UnloadBtn.Parent = ActionCard
 
 local UnloadCorner = Instance.new("UICorner")
@@ -2286,7 +2624,7 @@ local MobileToggle = Instance.new("TextButton")
 MobileToggle.Name = "TEAM_AKI_MobileToggle"
 MobileToggle.AnchorPoint = Vector2.new(0, 0.5)
 MobileToggle.Position = UDim2.new(0, 18, 0.25, 0)
-MobileToggle.Size = UDim2.fromOffset(106, 38)
+MobileToggle.Size = UDim2.fromOffset(108, 38)
 MobileToggle.BackgroundColor3 = Palette.ObsidianBase
 MobileToggle.BackgroundTransparency = 0.14
 MobileToggle.Font = Enum.Font.GothamBold
@@ -2312,18 +2650,22 @@ local function setPanelVisible(visible)
     Config.UI.Visible = visible
     if visible then
         MainCard.Visible = true
-        MainCard.Size = UDim2.fromOffset(440, 360)
+        CardShadow.Visible = true
+        MainCard.Size = UDim2.fromOffset(BASE_CARD_W - 26, BASE_CARD_H - 26)
         MainCard.BackgroundTransparency = 0.45
+        CardShadow.BackgroundTransparency = 0.85
         tween(MainCard, 0.2, {
-            Size = UDim2.fromOffset(470, 390),
+            Size = UDim2.fromOffset(BASE_CARD_W, BASE_CARD_H),
             BackgroundTransparency = 0.14,
         })
+        tween(CardShadow, 0.2, {BackgroundTransparency = 0.58})
         tween(ToggleStroke, 0.18, {Color = Palette.Accent})
     else
         local tw = tween(MainCard, 0.16, {
-            Size = UDim2.fromOffset(440, 360),
-            BackgroundTransparency = 0.6,
+            Size = UDim2.fromOffset(BASE_CARD_W - 26, BASE_CARD_H - 26),
+            BackgroundTransparency = 0.65,
         })
+        tween(CardShadow, 0.16, {BackgroundTransparency = 1})
         local completedConn
         completedConn = tw.Completed:Connect(function()
             if completedConn then
@@ -2331,13 +2673,13 @@ local function setPanelVisible(visible)
             end
             if not Config.UI.Visible then
                 MainCard.Visible = false
+                CardShadow.Visible = false
             end
         end)
         tween(ToggleStroke, 0.18, {Color = Palette.StrokeCool})
     end
 end
 
--- Distinguish tap vs drag cleanly on mobile & desktop (multi-touch isolated)
 do
     local activeInput = nil
     local movedDist = 0
