@@ -4054,18 +4054,23 @@ local function firePlayerMouseSignal(signalName)
     for _, conn in ipairs(conns) do
         local isOwn = conn and conn.Function and State.OwnInputFunctions[conn.Function]
         if (not isOwn) and (not isBlockedCoreInputConnection(conn)) then
-            eligibleCount = eligibleCount + 1
-            local okCall = pcall(function()
-                if type(conn.Fire) == "function" then
-                    task.spawn(function()
-                        pcall(conn.Fire, conn)
-                    end)
-                elseif type(conn.Function) == "function" then
-                    task.spawn(conn.Function)
+            local srcText = getConnectionSourceText(conn)
+            local isWeaponConn = TriggerGuard.isWeaponSourceText(srcText)
+            local isUiConn = (not isWeaponConn) and TriggerGuard.isNegativeUiSourceText(srcText)
+            if not isUiConn then
+                eligibleCount = eligibleCount + 1
+                local okCall = pcall(function()
+                    if type(conn.Fire) == "function" then
+                        task.spawn(function()
+                            pcall(conn.Fire, conn)
+                        end)
+                    elseif type(conn.Function) == "function" then
+                        task.spawn(conn.Function)
+                    end
+                end)
+                if okCall then
+                    firedAny = true
                 end
-            end)
-            if okCall then
-                firedAny = true
             end
         end
     end
@@ -4255,6 +4260,50 @@ function TriggerGuard.hasClickableGuiAtPoint(screenPos, ignoreOwnFloatingPills)
     return false
 end
 
+function TriggerGuard.pauseGameUiUnderPoints(camera, points)
+    if type(getconnections) ~= "function" or not points then
+        return
+    end
+    local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if not pg or type(pg.GetGuiObjectsAtPosition) ~= "function" then
+        return
+    end
+    local vp = camera and camera.ViewportSize or Vector2.new(1280, 720)
+    local pausedBtn = {}
+    for _, pt in ipairs(points) do
+        if pt then
+            local okList, objs = pcall(pg.GetGuiObjectsAtPosition, pg, pt.X, pt.Y)
+            if okList and type(objs) == "table" then
+                for _, obj in ipairs(objs) do
+                    if obj:IsA("GuiButton") and (not pausedBtn[obj]) and isGuiButtonTreeVisible(obj) then
+                        pausedBtn[obj] = true
+                        local isOwn = (State.MainGui and obj:IsDescendantOf(State.MainGui))
+                            or (State.OverlayGui and obj:IsDescendantOf(State.OverlayGui))
+                        local isTouchCtrl = obj:FindFirstAncestor("TouchGui") ~= nil
+                        local isShoot = (obj == State.CachedShootBtn)
+                        local isFullOverlay = (obj.AbsoluteSize.X >= vp.X * 0.55) or (obj.AbsoluteSize.Y >= vp.Y * 0.55)
+                        if (not isOwn) and (not isTouchCtrl) and (not isShoot) and (not isFullOverlay) then
+                            for _, sig in ipairs({obj.Activated, obj.MouseButton1Click, obj.MouseButton1Down, obj.InputBegan}) do
+                                local okSig, conns = pcall(getconnections, sig)
+                                if okSig and type(conns) == "table" then
+                                    for _, conn in ipairs(conns) do
+                                        if conn and conn.Enabled ~= false and type(conn.Disable) == "function" then
+                                            local okDis = pcall(conn.Disable, conn)
+                                            if okDis then
+                                                table.insert(State.PausedCoreInputConns, conn)
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
 function TriggerGuard.withTouchModePreserved(fn)
     if not UserInputService.TouchEnabled then
         local ok, res = pcall(fn)
@@ -4345,9 +4394,6 @@ function TriggerGuard.fireExecutorMousePulse(screenCenter, holdMode)
     if not Config.TriggerBot.HardwareMouse then
         return false
     end
-    if TriggerGuard.isPointOverMenu(screenCenter) then
-        return false
-    end
     local hasPress = (type(mouse1press) == "function")
     local hasClick = (type(mouse1click) == "function")
     if (not hasPress) and (not hasClick) then
@@ -4358,13 +4404,9 @@ function TriggerGuard.fireExecutorMousePulse(screenCenter, holdMode)
     State.IsSynthesizingMouse = true
 
     local didFire = TriggerGuard.withTouchModePreserved(function()
-        -- Move virtual cursor cleanly to center crosshair (never leave cursor parked on Aim/Trigger/HUD buttons!)
-        local movedToCenter = false
+        -- Move virtual cursor cleanly to center crosshair when supported
         if screenCenter and type(mousemoveabs) == "function" then
-            local okMove = pcall(mousemoveabs, math.round(screenCenter.X), math.round(screenCenter.Y))
-            if okMove then
-                movedToCenter = true
-            end
+            pcall(mousemoveabs, math.round(screenCenter.X), math.round(screenCenter.Y))
         end
 
         local okLoc, loc = pcall(function()
@@ -4372,13 +4414,8 @@ function TriggerGuard.fireExecutorMousePulse(screenCenter, holdMode)
         end)
         local actualLoc = (okLoc and typeof(loc) == "Vector2") and loc or screenCenter
 
-        -- Refuse hardware mouse click if a clickable GuiButton sits right under the click point (prevents self-toggles / clicking everywhere)
-        if TriggerGuard.hasClickableGuiAtPoint(screenCenter, false) then
-            return false
-        end
-        if TriggerGuard.hasClickableGuiAtPoint(actualLoc, movedToCenter) then
-            return false
-        end
+        -- Temporarily pause any non-shoot game HUD buttons under the cursor for this synchronous frame instead of dropping shots
+        TriggerGuard.pauseGameUiUnderPoints(State.Camera or Workspace.CurrentCamera, {screenCenter, actualLoc})
 
         if holdMode and hasPress then
             local ok = pcall(mouse1press)
@@ -4387,6 +4424,10 @@ function TriggerGuard.fireExecutorMousePulse(screenCenter, holdMode)
                 return true
             end
         elseif (not holdMode) and hasPress then
+            if State.TriggerMouseHeld and type(mouse1release) == "function" then
+                pcall(mouse1release)
+                State.TriggerMouseHeld = false
+            end
             local ok = pcall(mouse1press)
             if ok then
                 State.TriggerMouseHeld = true
@@ -4493,29 +4534,30 @@ local function triggerOnceOrPress(camera, screenCenter, now, holdMode, targetPar
         end
     end
 
-    -- 2) Mouse Fire Channel: PlayerMouse + weapon-filtered InputBegan + Touch-safe executor mouse1
-    if firePlayerMouseSignal("Button1Down") then
+    -- 2) Mouse Fire Channel: Touch-safe executor mouse1 primary; fallback to filtered client mouse signals only if hardware mouse unavailable
+    local hardwareFired = TriggerGuard.fireExecutorMousePulse(State.LastTriggerMousePos, holdMode)
+    if hardwareFired then
         strongClientFired = true
         firedAny = true
-    end
-
-    local inputAny, inputWeapon = dispatchClientMouseSignal(
-        UserInputService.InputBegan,
-        createFakeInputObject(Enum.UserInputType.MouseButton1, State.LastTriggerMousePos, true)
-    )
-    if inputAny then
-        firedAny = true
-        if holdMode then
-            State.TriggerFakeMouseHeld = true
+    else
+        if firePlayerMouseSignal("Button1Down") then
+            strongClientFired = true
+            firedAny = true
         end
-    end
-    if inputWeapon then
-        strongClientFired = true
-    end
 
-    if TriggerGuard.fireExecutorMousePulse(State.LastTriggerMousePos, holdMode) then
-        strongClientFired = true
-        firedAny = true
+        local inputAny, inputWeapon = dispatchClientMouseSignal(
+            UserInputService.InputBegan,
+            createFakeInputObject(Enum.UserInputType.MouseButton1, State.LastTriggerMousePos, true)
+        )
+        if inputAny then
+            firedAny = true
+            if holdMode then
+                State.TriggerFakeMouseHeld = true
+            end
+        end
+        if inputWeapon then
+            strongClientFired = true
+        end
     end
 
     -- 3) Mobile Shoot Button fallback (only if mouse did not confirm or Mouse + Remote mode requested)
@@ -4543,6 +4585,7 @@ local function triggerOnceOrPress(camera, screenCenter, now, holdMode, targetPar
             local endCenter = State.LastTriggerMousePos
             local btnToRelease = State.TriggerGuiBtn
             local toolToRelease = State.TriggerToolRef
+            local needFakeRelease = State.TriggerFakeMouseHeld or (not hardwareFired)
             task.delay(0.03, function()
                 if not State.TriggerHolding then
                     if btnToRelease and btnToRelease.Parent then
@@ -4551,8 +4594,11 @@ local function triggerOnceOrPress(camera, screenCenter, now, holdMode, targetPar
                     if State.TriggerGuiBtn == btnToRelease then
                         State.TriggerGuiBtn = nil
                     end
-                    firePlayerMouseSignal("Button1Up")
-                    dispatchClientMouseSignal(UserInputService.InputEnded, createFakeInputObject(Enum.UserInputType.MouseButton1, endCenter, false))
+                    if needFakeRelease then
+                        State.TriggerFakeMouseHeld = false
+                        firePlayerMouseSignal("Button1Up")
+                        dispatchClientMouseSignal(UserInputService.InputEnded, createFakeInputObject(Enum.UserInputType.MouseButton1, endCenter, false))
+                    end
                     if toolToRelease and toolToRelease.Parent then
                         pcall(function()
                             toolToRelease:Deactivate()
@@ -4596,6 +4642,38 @@ local function findEntryForHitPart(hitPart)
             return player, entry
         end
     end
+
+    -- On-demand resolution for newly spawned players/bots/custom Humanoid models (like mouse.Target.Parent/Parent.Parent)
+    local localChar = State.LocalCharacter or LocalPlayer.Character
+    local cur = hitPart.Parent
+    for _ = 1, 4 do
+        if not cur or cur == Workspace or cur == game then
+            break
+        end
+        if cur ~= localChar and cur:IsA("Model") then
+            local plr = Players:GetPlayerFromCharacter(cur)
+            if plr and plr ~= LocalPlayer then
+                if not Registry[plr] then
+                    registerPlayerEntry(plr)
+                end
+                if Registry[plr] then
+                    bindCharacterToEntry(Registry[plr], cur)
+                    return plr, Registry[plr]
+                end
+            end
+            local hum = cur:FindFirstChildOfClass("Humanoid")
+            if hum and hum.Health > 0 then
+                if not Registry[cur] and not Config.TriggerBot.IgnoreBots and isModelBotAlive(cur) then
+                    registerBotEntry(cur)
+                end
+                if Registry[cur] then
+                    return cur, Registry[cur]
+                end
+            end
+        end
+        cur = cur.Parent
+    end
+
     return nil, nil
 end
 
@@ -4669,6 +4747,39 @@ local function findTriggerTarget(camera, screenCenter, dt)
                 currentOrigin = result.Position + dirUnit * 0.05
             else
                 break
+            end
+        end
+    end
+
+    -- Pass 1.5: Direct mouse.Target check (matches classic cursor triggerbot behavior when aiming unlocked/PC or centered mouse)
+    local allowMouseTarget = (not UserInputService.TouchEnabled)
+    if not allowMouseTarget then
+        local okLoc, loc = pcall(function()
+            return UserInputService:GetMouseLocation()
+        end)
+        if okLoc and typeof(loc) == "Vector2" and (loc - screenCenter).Magnitude <= 40 then
+            allowMouseTarget = true
+        end
+    end
+    if allowMouseTarget then
+        local okTarget, mTarget = pcall(function()
+            local pm = LocalPlayer:GetMouse()
+            return pm and pm.Target or nil
+        end)
+        if okTarget and mTarget and mTarget:IsA("BasePart") then
+            local hitKey, hitEntry = findEntryForHitPart(mTarget)
+            if hitKey and hitEntry and partMatchesTriggerFilter(mTarget, hitEntry) then
+                local valid = IsValidTarget(hitKey, {
+                    checkTeam = Config.TriggerBot.TeamCheck,
+                    checkVisible = Config.TriggerBot.VisibleCheck,
+                    ignoreBots = Config.TriggerBot.IgnoreBots,
+                    maxDistance = maxDist,
+                    camera = camera,
+                    targetPart = mTarget,
+                })
+                if valid then
+                    return hitKey, hitEntry, mTarget, mTarget.Position
+                end
             end
         end
     end
