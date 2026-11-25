@@ -301,20 +301,31 @@ local State = {
     TriggerFakeMouseHeld = false,
     TriggerToolRef = nil,
     LastTriggerMousePos = Vector2.zero,
+    TriggerSessionToken = 0,
+    TriggerRespawnHoldUntil = 0,
+    TriggerLifecycleConns = {},
     TouchGuardToken = 0,
     TouchGuardLifecycleToken = 0,
     LastHardwareMouseTime = 0,
     LastTouchEnforceTime = 0,
     LastTouchBroadcastTime = 0,
+    LastCxxTouchResetTime = 0,
+    LastScreenGuiTouchSync = 0,
     HasUsedHardwareMouse = false,
     NeedsTouchBroadcast = false,
     IsSynthesizingMouse = false,
+    IsSynthesizingTouch = false,
+    CxxTouchResetUnsupported = false,
     OwnInputFunctions = {},
     PausedLastInputConns = {},
     PausedPreferredInputConns = {},
     PausedCoreInputConns = {},
+    PausedTouchInputConns = {},
     SavedMouseIconEnabled = nil,
     SavedMouseBehavior = nil,
+    InitialMouseBehavior = nil,
+    VirtualInputService = nil,
+    VirtualInputChecked = false,
     PlayerModuleCache = nil,
     PlayerModuleScript = nil,
     ColorListeners = {},
@@ -1824,11 +1835,6 @@ local function clearLocalCharacterState()
     State.CurrentAimTarget = nil
     State.CurrentAimPart = nil
     State.CurrentAimPredictedPos = nil
-    State.TriggerTarget = nil
-    State.TriggerAcquireTime = 0
-    releaseTriggerFire()
-    State.SavedMouseIconEnabled = nil
-    State.SavedMouseBehavior = nil
 
     for _, c in ipairs(State.LocalConns) do
         pcall(function()
@@ -1837,8 +1843,18 @@ local function clearLocalCharacterState()
     end
     clearTable(State.LocalConns)
 
-    if type(TriggerGuard.onCharacterLifecycle) == "function" then
-        pcall(TriggerGuard.onCharacterLifecycle, "Clear")
+    if type(TriggerGuard.resetTriggerStateAndHandlers) == "function" then
+        pcall(TriggerGuard.resetTriggerStateAndHandlers, "Clear")
+    else
+        State.TriggerTarget = nil
+        State.TriggerAcquireTime = 0
+        State.LastTriggerFire = 0
+        releaseTriggerFire()
+        State.SavedMouseIconEnabled = nil
+        State.SavedMouseBehavior = nil
+        if type(TriggerGuard.onCharacterLifecycle) == "function" then
+            pcall(TriggerGuard.onCharacterLifecycle, "Clear")
+        end
     end
 end
 
@@ -1865,9 +1881,13 @@ local function bindLocalCharacter(character)
         table.insert(State.LocalConns, hum.Died:Connect(function()
             State.LocalAlive = false
             State.CurrentAimTarget = nil
-            releaseTriggerFire()
-            if type(TriggerGuard.onCharacterLifecycle) == "function" then
-                pcall(TriggerGuard.onCharacterLifecycle, "Died")
+            if type(TriggerGuard.resetTriggerStateAndHandlers) == "function" then
+                pcall(TriggerGuard.resetTriggerStateAndHandlers, "Died")
+            else
+                releaseTriggerFire()
+                if type(TriggerGuard.onCharacterLifecycle) == "function" then
+                    pcall(TriggerGuard.onCharacterLifecycle, "Died")
+                end
             end
             ScheduleReload("LocalPlayerDied", false)
         end))
@@ -1896,7 +1916,9 @@ local function bindLocalCharacter(character)
         end
     end))
 
-    if type(TriggerGuard.onCharacterLifecycle) == "function" then
+    if type(TriggerGuard.resetTriggerStateAndHandlers) == "function" then
+        pcall(TriggerGuard.resetTriggerStateAndHandlers, "Respawn")
+    elseif type(TriggerGuard.onCharacterLifecycle) == "function" then
         pcall(TriggerGuard.onCharacterLifecycle, "Respawn")
     end
 end
@@ -3625,6 +3647,12 @@ function TriggerGuard.getPlayerModule()
     return State.PlayerModuleCache
 end
 
+if UserInputService.TouchEnabled then
+    pcall(function()
+        State.InitialMouseBehavior = UserInputService.MouseBehavior
+    end)
+end
+
 function TriggerGuard.keepTouchGuiActive()
     if not UserInputService.TouchEnabled then
         return
@@ -3637,6 +3665,12 @@ function TriggerGuard.keepTouchGuiActive()
             local tcf = touchGui:FindFirstChild("TouchControlFrame")
             if tcf and tcf:IsA("GuiObject") then
                 tcf.Visible = true
+                for _, childName in ipairs({"DynamicThumbstickFrame", "ThumbstickFrame", "JumpButton"}) do
+                    local ctrl = tcf:FindFirstChild(childName)
+                    if ctrl and ctrl:IsA("GuiObject") then
+                        ctrl.Visible = true
+                    end
+                end
             end
         end)
     end
@@ -3655,7 +3689,141 @@ function TriggerGuard.keepTouchGuiActive()
                 UserInputService.MouseBehavior = State.SavedMouseBehavior
             end
         end)
+    elseif State.HasUsedHardwareMouse or Config.TriggerBot.Enabled then
+        pcall(function()
+            local curBeh = UserInputService.MouseBehavior
+            local targetBeh = State.InitialMouseBehavior or Enum.MouseBehavior.Default
+            if targetBeh == Enum.MouseBehavior.Default
+                and (curBeh == Enum.MouseBehavior.LockCenter or curBeh == Enum.MouseBehavior.LockCurrentPosition)
+            then
+                UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+            end
+        end)
     end
+end
+
+function TriggerGuard.isTouchModeActiveInEngine()
+    local okLast, lastInput = pcall(function()
+        return UserInputService:GetLastInputType()
+    end)
+    if (not okLast) or lastInput ~= Enum.UserInputType.Touch then
+        return false
+    end
+    local okPref, prefInput = pcall(function()
+        return UserInputService.PreferredInput
+    end)
+    if okPref and prefInput ~= nil then
+        local okEnum, enumTouch = pcall(function()
+            return Enum.PreferredInput.Touch
+        end)
+        if okEnum and enumTouch ~= nil and prefInput ~= enumTouch then
+            return false
+        end
+    end
+    return true
+end
+
+function TriggerGuard.pulseCxxTouchReset(camera)
+    if (not UserInputService.TouchEnabled) or State.Unloaded or State.TriggerMouseHeld or State.CxxTouchResetUnsupported then
+        return false
+    end
+    if (not State.HasUsedHardwareMouse) and (not Config.TriggerBot.Enabled) then
+        return false
+    end
+    if TriggerGuard.isTouchModeActiveInEngine() then
+        return true
+    end
+
+    if not State.VirtualInputChecked then
+        State.VirtualInputChecked = true
+        State.VirtualInputService = tryGetService("VirtualInputManager")
+    end
+    local vim = State.VirtualInputService
+    if (not vim) or type(vim.SendTouchEvent) ~= "function" then
+        State.CxxTouchResetUnsupported = true
+        return false
+    end
+
+    local cam = camera or State.Camera or Workspace.CurrentCamera
+    local vp = cam and cam.ViewportSize or Vector2.new(1280, 720)
+    local candidates = {
+        Vector2.new(math.clamp(vp.X * 0.5, 140, math.max(vp.X - 140, 140)), 92),
+        Vector2.new(math.clamp(vp.X * 0.28, 120, math.max(vp.X - 120, 120)), 92),
+        Vector2.new(math.clamp(vp.X * 0.72, 120, math.max(vp.X - 120, 120)), 92),
+        Vector2.new(math.clamp(vp.X * 0.5, 140, math.max(vp.X - 140, 140)), 134),
+    }
+    local safePt = candidates[1]
+    for _, pt in ipairs(candidates) do
+        if not TriggerGuard.hasClickableGuiAtPoint(pt, false) then
+            safePt = pt
+            break
+        end
+    end
+
+    if type(getconnections) == "function" then
+        local touchSigNames = {
+            "InputBegan",
+            "InputChanged",
+            "InputEnded",
+            "TouchStarted",
+            "TouchMoved",
+            "TouchEnded",
+            "TouchTap",
+            "TouchTapInWorld",
+        }
+        for _, sigName in ipairs(touchSigNames) do
+            local okProp, sig = pcall(function()
+                return UserInputService[sigName]
+            end)
+            if okProp and sig then
+                local okSig, conns = pcall(getconnections, sig)
+                if okSig and type(conns) == "table" then
+                    for _, conn in ipairs(conns) do
+                        if conn and conn.Enabled ~= false and type(conn.Disable) == "function" then
+                            local isOwn = conn.Function and State.OwnInputFunctions[conn.Function]
+                            if not isOwn then
+                                local okDis = pcall(conn.Disable, conn)
+                                if okDis then
+                                    table.insert(State.PausedTouchInputConns, conn)
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    TriggerGuard.pauseGameUiUnderPoints(cam, {safePt})
+
+    State.IsSynthesizingTouch = true
+    local px = math.round(safePt.X)
+    local py = math.round(safePt.Y)
+    local okBegin = pcall(vim.SendTouchEvent, vim, 99871, 0, px, py)
+    if okBegin then
+        local okCancel = pcall(vim.SendTouchEvent, vim, 99871, 3, px, py)
+        if not okCancel then
+            pcall(vim.SendTouchEvent, vim, 99871, 2, px, py)
+        end
+    else
+        State.CxxTouchResetUnsupported = true
+    end
+
+    task.defer(function()
+        State.IsSynthesizingTouch = false
+        if #State.PausedTouchInputConns > 0 then
+            for _, conn in ipairs(State.PausedTouchInputConns) do
+                pcall(function()
+                    if conn and type(conn.Enable) == "function" then
+                        conn:Enable()
+                    end
+                end)
+            end
+            clearTable(State.PausedTouchInputConns)
+        end
+        TriggerGuard.restoreCoreInputConns()
+    end)
+
+    return okBegin
 end
 
 function TriggerGuard.broadcastTouchInputMode()
@@ -3668,7 +3836,9 @@ function TriggerGuard.broadcastTouchInputMode()
         for _, conn in ipairs(lastConns) do
             if conn and conn.Enabled ~= false then
                 local isOwn = conn.Function and State.OwnInputFunctions[conn.Function]
-                if (not isOwn) and (not isBlockedCoreInputConnection(conn)) then
+                local srcText = getConnectionSourceText(conn)
+                local isTeamAki = type(srcText) == "string" and string.find(srcText, "team_aki", 1, true) ~= nil
+                if (not isOwn) and (not isTeamAki) then
                     pcall(function()
                         if type(conn.Fire) == "function" then
                             task.spawn(function()
@@ -3692,7 +3862,9 @@ function TriggerGuard.broadcastTouchInputMode()
             for _, conn in ipairs(prefConns) do
                 if conn and conn.Enabled ~= false then
                     local isOwn = conn.Function and State.OwnInputFunctions[conn.Function]
-                    if (not isOwn) and (not isBlockedCoreInputConnection(conn)) then
+                    local srcText = getConnectionSourceText(conn)
+                    local isTeamAki = type(srcText) == "string" and string.find(srcText, "team_aki", 1, true) ~= nil
+                    if (not isOwn) and (not isTeamAki) then
                         pcall(function()
                             if type(conn.Fire) == "function" then
                                 task.spawn(function()
@@ -3723,7 +3895,21 @@ function TriggerGuard.enforceTouchControls(forceBroadcast)
                     if type(controls.OnLastInputTypeChanged) == "function" then
                         pcall(controls.OnLastInputTypeChanged, controls, Enum.UserInputType.Touch)
                     end
-                    if type(controls.Enable) == "function" then
+                    if type(controls.OnPreferredInputChanged) == "function" then
+                        pcall(controls.OnPreferredInputChanged, controls)
+                    end
+                    local switchedController = false
+                    if type(controls.SelectTouchModule) == "function" and type(controls.SwitchToController) == "function" then
+                        local okSel, touchMod, selSuccess = pcall(controls.SelectTouchModule, controls)
+                        if okSel and selSuccess ~= false and touchMod and controls.activeController ~= touchMod then
+                            pcall(controls.SwitchToController, controls, touchMod)
+                            switchedController = true
+                        end
+                    end
+                    if type(controls.UpdateTouchGuiVisibility) == "function" then
+                        pcall(controls.UpdateTouchGuiVisibility, controls)
+                    end
+                    if (forceBroadcast or switchedController) and type(controls.Enable) == "function" then
                         pcall(controls.Enable, controls, true)
                     end
                 end
@@ -3732,8 +3918,13 @@ function TriggerGuard.enforceTouchControls(forceBroadcast)
         pcall(function()
             if type(pm.GetCameras) == "function" then
                 local cameras = pm:GetCameras()
-                if type(cameras) == "table" and type(cameras.OnLastInputTypeChanged) == "function" then
-                    pcall(cameras.OnLastInputTypeChanged, cameras, Enum.UserInputType.Touch)
+                if type(cameras) == "table" then
+                    if type(cameras.OnLastInputTypeChanged) == "function" then
+                        pcall(cameras.OnLastInputTypeChanged, cameras, Enum.UserInputType.Touch)
+                    end
+                    if type(cameras.OnPreferredInputChanged) == "function" then
+                        pcall(cameras.OnPreferredInputChanged, cameras)
+                    end
                 end
             end
         end)
@@ -3759,10 +3950,12 @@ function TriggerGuard.onCharacterLifecycle(_)
     State.TouchGuardLifecycleToken = (State.TouchGuardLifecycleToken or 0) + 1
     local myToken = State.TouchGuardLifecycleToken
 
+    TriggerGuard.pulseCxxTouchReset(State.Camera)
     TriggerGuard.enforceTouchControls(true)
-    for _, waitSec in ipairs({0.05, 0.25, 0.70, 1.40}) do
+    for _, waitSec in ipairs({0.05, 0.20, 0.50, 1.00, 2.00}) do
         task.delay(waitSec, function()
             if (not State.Unloaded) and State.TouchGuardLifecycleToken == myToken and UserInputService.TouchEnabled then
+                TriggerGuard.pulseCxxTouchReset(State.Camera)
                 TriggerGuard.enforceTouchControls(true)
             end
         end)
@@ -3782,7 +3975,7 @@ function TriggerGuard.restoreCoreInputConns()
     end
 end
 
-function TriggerGuard.restoreLastInputConns()
+function TriggerGuard.restoreLastInputConns(skipBroadcast)
     if #State.PausedLastInputConns > 0 then
         for _, conn in ipairs(State.PausedLastInputConns) do
             pcall(function()
@@ -3803,15 +3996,29 @@ function TriggerGuard.restoreLastInputConns()
         end
         clearTable(State.PausedPreferredInputConns)
     end
-    TriggerGuard.enforceTouchControls(true)
+    if not skipBroadcast and not State.Unloaded then
+        TriggerGuard.pulseCxxTouchReset(State.Camera)
+        TriggerGuard.enforceTouchControls(true)
+    end
     State.SavedMouseIconEnabled = nil
     State.SavedMouseBehavior = nil
 end
 
-function TriggerGuard.restoreAll()
+function TriggerGuard.restoreAll(skipBroadcast)
     State.IsSynthesizingMouse = false
+    State.IsSynthesizingTouch = false
+    if #State.PausedTouchInputConns > 0 then
+        for _, conn in ipairs(State.PausedTouchInputConns) do
+            pcall(function()
+                if conn and type(conn.Enable) == "function" then
+                    conn:Enable()
+                end
+            end)
+        end
+        clearTable(State.PausedTouchInputConns)
+    end
     TriggerGuard.restoreCoreInputConns()
-    TriggerGuard.restoreLastInputConns()
+    TriggerGuard.restoreLastInputConns(skipBroadcast)
 end
 
 function TriggerGuard.isPointOverMenu(screenPos)
@@ -3928,13 +4135,22 @@ do
     local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
     if pg then
         addConnection(pg.ChildAdded:Connect(function(child)
-            if UserInputService.TouchEnabled and (not State.Unloaded) and child and child.Name == "TouchGui" then
+            if UserInputService.TouchEnabled and (not State.Unloaded) and child then
                 if State.HasUsedHardwareMouse or Config.TriggerBot.Enabled then
-                    task.defer(function()
-                        if not State.Unloaded then
-                            TriggerGuard.enforceTouchControls(true)
+                    local isTouchGui = (child.Name == "TouchGui")
+                    local isScreenGui = isTouchGui or child:IsA("ScreenGui")
+                    if isScreenGui then
+                        local nowGui = os.clock()
+                        if isTouchGui or (nowGui - (State.LastScreenGuiTouchSync or 0)) >= 0.18 then
+                            State.LastScreenGuiTouchSync = nowGui
+                            task.defer(function()
+                                if not State.Unloaded then
+                                    TriggerGuard.pulseCxxTouchReset(State.Camera)
+                                    TriggerGuard.enforceTouchControls(true)
+                                end
+                            end)
                         end
-                    end)
+                    end
                 end
             end
         end))
@@ -3949,6 +4165,7 @@ function TriggerGuard.withTouchModePreserved(fn)
 
     State.TouchGuardToken = State.TouchGuardToken + 1
     local myToken = State.TouchGuardToken
+    local mySession = State.TriggerSessionToken
 
     if State.SavedMouseIconEnabled == nil then
         pcall(function()
@@ -4014,12 +4231,14 @@ function TriggerGuard.withTouchModePreserved(fn)
     -- Restore touch movement & camera handlers on next frame so walking & look swipe never freeze even on 0.02s rapid-fire
     task.defer(function()
         TriggerGuard.restoreCoreInputConns()
-        TriggerGuard.enforceTouchControls()
+        if not State.Unloaded and State.TriggerSessionToken == mySession then
+            TriggerGuard.enforceTouchControls()
+        end
     end)
 
     -- Keep LastInputTypeChanged & PreferredInput paused across async C++ release + frame jitter before restoring
     task.delay(0.24, function()
-        if State.Unloaded or State.TouchGuardToken == myToken then
+        if State.Unloaded or (State.TouchGuardToken == myToken and State.TriggerSessionToken == mySession) then
             TriggerGuard.restoreLastInputConns()
         end
     end)
@@ -4037,6 +4256,7 @@ function TriggerGuard.fireExecutorMousePulse(screenCenter, holdMode)
         return false
     end
 
+    local mySession = State.TriggerSessionToken
     State.LastHardwareMouseTime = os.clock()
     State.HasUsedHardwareMouse = true
     State.NeedsTouchBroadcast = true
@@ -4087,7 +4307,7 @@ function TriggerGuard.fireExecutorMousePulse(screenCenter, holdMode)
 
     if didFire and (not holdMode) and State.TriggerMouseHeld then
         task.delay(0.028, function()
-            if not State.TriggerHolding and State.TriggerMouseHeld then
+            if (not State.Unloaded) and State.TriggerSessionToken == mySession and (not State.TriggerHolding) and State.TriggerMouseHeld then
                 State.TriggerMouseHeld = false
                 if type(mouse1release) == "function" then
                     State.LastHardwareMouseTime = os.clock()
@@ -4107,7 +4327,7 @@ function TriggerGuard.fireExecutorMousePulse(screenCenter, holdMode)
     return didFire
 end
 
-releaseTriggerFire = function()
+releaseTriggerFire = function(skipTouchGuardDelay)
     if State.TriggerFakeMouseHeld then
         State.TriggerFakeMouseHeld = false
         firePlayerMouseSignal("Button1Up")
@@ -4126,13 +4346,18 @@ releaseTriggerFire = function()
         if type(mouse1release) == "function" then
             State.LastHardwareMouseTime = os.clock()
             State.IsSynthesizingMouse = true
-            TriggerGuard.withTouchModePreserved(function()
+            if skipTouchGuardDelay then
                 pcall(mouse1release)
-                return true
-            end)
-            task.defer(function()
                 State.IsSynthesizingMouse = false
-            end)
+            else
+                TriggerGuard.withTouchModePreserved(function()
+                    pcall(mouse1release)
+                    return true
+                end)
+                task.defer(function()
+                    State.IsSynthesizingMouse = false
+                end)
+            end
         end
     end
 
@@ -4140,10 +4365,97 @@ releaseTriggerFire = function()
     State.TriggerHolding = false
 end
 
+function TriggerGuard.resetTriggerStateAndHandlers(reason)
+    -- Invalidate any pending delayed mouse1release / Button1Up / TouchGuard timers from prior life
+    State.TriggerSessionToken = (State.TriggerSessionToken or 0) + 1
+    State.TouchGuardToken = (State.TouchGuardToken or 0) + 1
+
+    -- Reset all internal Trigger Bot tracking state
+    State.TriggerTarget = nil
+    State.TriggerAcquireTime = 0
+    State.LastTriggerFire = 0
+    State.TriggerHolding = false
+    if TriggerDot then
+        TriggerDot.Visible = false
+    end
+
+    if reason == "CharacterAdded" or reason == "Respawn" then
+        State.TriggerRespawnHoldUntil = os.clock() + 0.30
+        State.PlayerModuleCache = nil
+        State.PlayerModuleScript = nil
+    end
+
+    -- Release any held virtual/hardware fire inputs immediately without scheduling delayed touch pauses
+    releaseTriggerFire(true)
+
+    -- Immediately re-enable all paused mouse/touch/LastInputTypeChanged handlers
+    TriggerGuard.restoreAll(true)
+
+    -- Enforce mobile Touch mode across PlayerModule, TouchGui, and C++ input state on death/respawn
+    if UserInputService.TouchEnabled and (not State.Unloaded) then
+        TriggerGuard.onCharacterLifecycle(reason or "TriggerReset")
+    end
+end
+
+function TriggerGuard.bindCharacterLifecycle(character)
+    for _, conn in ipairs(State.TriggerLifecycleConns) do
+        pcall(function()
+            conn:Disconnect()
+        end)
+    end
+    clearTable(State.TriggerLifecycleConns)
+
+    if not character or State.Unloaded then
+        return
+    end
+
+    local function hookHumanoidDied(hum)
+        if not hum or State.Unloaded then
+            return
+        end
+        table.insert(State.TriggerLifecycleConns, hum.Died:Connect(function()
+            if not State.Unloaded then
+                TriggerGuard.resetTriggerStateAndHandlers("Died")
+            end
+        end))
+    end
+
+    local existingHum = character:FindFirstChildOfClass("Humanoid")
+    if existingHum then
+        hookHumanoidDied(existingHum)
+    else
+        table.insert(State.TriggerLifecycleConns, character.ChildAdded:Connect(function(child)
+            if not State.Unloaded and child and child:IsA("Humanoid") then
+                hookHumanoidDied(child)
+            end
+        end))
+    end
+end
+
+addConnection(LocalPlayer.CharacterAdded:Connect(function(newCharacter)
+    if State.Unloaded then
+        return
+    end
+    TriggerGuard.resetTriggerStateAndHandlers("CharacterAdded")
+    TriggerGuard.bindCharacterLifecycle(newCharacter)
+end))
+
+addConnection(LocalPlayer.CharacterRemoving:Connect(function()
+    if State.Unloaded then
+        return
+    end
+    TriggerGuard.resetTriggerStateAndHandlers("CharacterRemoving")
+end))
+
+if LocalPlayer.Character then
+    TriggerGuard.bindCharacterLifecycle(LocalPlayer.Character)
+end
+
 local function triggerOnceOrPress(camera, screenCenter, now, holdMode)
     local localChar = State.LocalCharacter or LocalPlayer.Character
     local equippedTool = localChar and localChar:FindFirstChildOfClass("Tool") or nil
     local firedAny = false
+    local mySession = State.TriggerSessionToken
 
     State.LastTriggerMousePos = screenCenter or Vector2.new(640, 360)
 
@@ -4191,7 +4503,7 @@ local function triggerOnceOrPress(camera, screenCenter, now, holdMode)
             local toolToRelease = State.TriggerToolRef
             local needFakeRelease = State.TriggerFakeMouseHeld or (not hardwareFired)
             task.delay(0.03, function()
-                if not State.TriggerHolding then
+                if (not State.Unloaded) and State.TriggerSessionToken == mySession and (not State.TriggerHolding) then
                     if needFakeRelease then
                         State.TriggerFakeMouseHeld = false
                         firePlayerMouseSignal("Button1Up")
@@ -4500,7 +4812,7 @@ local function findTriggerTarget(camera, screenCenter, dt)
 end
 
 local function updateTriggerBot(camera, screenCenter, now, dt)
-    if not Config.TriggerBot.Enabled or not State.LocalAlive then
+    if (not Config.TriggerBot.Enabled) or (not State.LocalAlive) or now < (State.TriggerRespawnHoldUntil or 0) then
         State.TriggerTarget = nil
         State.TriggerAcquireTime = 0
         releaseTriggerFire()
@@ -4691,10 +5003,7 @@ local function onRenderStepFrame(dt)
 
     -- Enforce mobile Touch controls after hardware mouse pulses and across death/respawn so mobile never gets stuck in PC mode
     if UserInputService.TouchEnabled and (State.HasUsedHardwareMouse or Config.TriggerBot.Enabled) then
-        local okLast, lastInput = pcall(function()
-            return UserInputService:GetLastInputType()
-        end)
-        local isTouchLast = okLast and lastInput == Enum.UserInputType.Touch
+        local isTouchLast = TriggerGuard.isTouchModeActiveInEngine()
         local recentShot = (now - (State.LastHardwareMouseTime or 0)) < 1.25
         if isTouchLast and not recentShot then
             State.NeedsTouchBroadcast = false
@@ -4702,6 +5011,10 @@ local function onRenderStepFrame(dt)
             TriggerGuard.keepTouchGuiActive()
             if recentShot or (now - (State.LastTouchEnforceTime or 0)) >= 0.18 then
                 State.LastTouchEnforceTime = now
+                if (not isTouchLast) and (not State.TriggerMouseHeld) and (now - (State.LastCxxTouchResetTime or 0)) >= 0.35 then
+                    State.LastCxxTouchResetTime = now
+                    TriggerGuard.pulseCxxTouchReset(camera)
+                end
                 local shouldBroadcast = (not isTouchLast) and ((now - (State.LastTouchBroadcastTime or 0)) >= 0.45)
                 TriggerGuard.enforceTouchControls(shouldBroadcast)
             end
@@ -6974,8 +7287,12 @@ local function unloadScript()
     end
     State.Unloaded = true
     State.ReloadToken = State.ReloadToken + 1
-    releaseTriggerFire()
-    pcall(TriggerGuard.restoreAll)
+    if type(TriggerGuard.resetTriggerStateAndHandlers) == "function" then
+        pcall(TriggerGuard.resetTriggerStateAndHandlers, "Unload")
+    else
+        releaseTriggerFire(true)
+        pcall(TriggerGuard.restoreAll, true)
+    end
 
     pcall(applyPotatoGraphics, false)
 
@@ -6984,6 +7301,13 @@ local function unloadScript()
     end)
 
     clearLocalCharacterState()
+
+    for _, conn in ipairs(State.TriggerLifecycleConns) do
+        pcall(function()
+            conn:Disconnect()
+        end)
+    end
+    clearTable(State.TriggerLifecycleConns)
 
     for _, conn in ipairs(State.Connections) do
         pcall(function()
