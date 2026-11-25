@@ -198,8 +198,7 @@ local Config = {
     TriggerBot = {
         Enabled = false,
         FireMode = "Mouse",             -- Touch-safe Mouse input (no PC-mode lock, no UI self-clicks)
-        HardwareMouse = true,           -- Uses guarded mouse1press/click with anti-UI & anti-PC-mode protection
-        ServerRemoteFire = false,       -- Optional weapon FireServer/InvokeServer fallback (enable if needed)
+        HardwareMouse = true,           -- Uses guarded mouse1press/release/click with anti-UI & respawn Touch lock protection
         SyncWithAimbot = true,          -- Syncs lead prediction, Auto Predict, ProjectileSpeed & lock target with Aimbot
         TargetFilter = "Any Part",      -- "Any Part" | "Head & Chest" | "Head Only"
         HoldToFire = false,             -- true = hold trigger while locked; false = timed tap shots
@@ -300,16 +299,15 @@ local State = {
     TriggerHolding = false,
     TriggerMouseHeld = false,
     TriggerFakeMouseHeld = false,
-    TriggerVimHeld = false,
     TriggerToolRef = nil,
-    TriggerGuiBtn = nil,
-    CachedShootBtn = nil,
-    LastShootBtnScan = 0,
-    CachedFireRemotes = {},
-    LastRemoteScan = 0,
     LastTriggerMousePos = Vector2.zero,
     TouchGuardToken = 0,
+    TouchGuardLifecycleToken = 0,
     LastHardwareMouseTime = 0,
+    LastTouchEnforceTime = 0,
+    LastTouchBroadcastTime = 0,
+    HasUsedHardwareMouse = false,
+    NeedsTouchBroadcast = false,
     IsSynthesizingMouse = false,
     OwnInputFunctions = {},
     PausedLastInputConns = {},
@@ -317,9 +315,8 @@ local State = {
     PausedCoreInputConns = {},
     SavedMouseIconEnabled = nil,
     SavedMouseBehavior = nil,
-    ContextActionService = tryGetService("ContextActionService"),
     PlayerModuleCache = nil,
-    PlayerModuleChecked = false,
+    PlayerModuleScript = nil,
     ColorListeners = {},
     SavedGraphics = nil,
     PotatoDescConn = nil,
@@ -1825,9 +1822,13 @@ local function clearLocalCharacterState()
     State.LocalAlive = false
     State.LastLocalPos = nil
     State.CurrentAimTarget = nil
+    State.CurrentAimPart = nil
+    State.CurrentAimPredictedPos = nil
     State.TriggerTarget = nil
     State.TriggerAcquireTime = 0
     releaseTriggerFire()
+    State.SavedMouseIconEnabled = nil
+    State.SavedMouseBehavior = nil
 
     for _, c in ipairs(State.LocalConns) do
         pcall(function()
@@ -1835,6 +1836,10 @@ local function clearLocalCharacterState()
         end)
     end
     clearTable(State.LocalConns)
+
+    if type(TriggerGuard.onCharacterLifecycle) == "function" then
+        pcall(TriggerGuard.onCharacterLifecycle, "Clear")
+    end
 end
 
 local function bindLocalCharacter(character)
@@ -1860,6 +1865,10 @@ local function bindLocalCharacter(character)
         table.insert(State.LocalConns, hum.Died:Connect(function()
             State.LocalAlive = false
             State.CurrentAimTarget = nil
+            releaseTriggerFire()
+            if type(TriggerGuard.onCharacterLifecycle) == "function" then
+                pcall(TriggerGuard.onCharacterLifecycle, "Died")
+            end
             ScheduleReload("LocalPlayerDied", false)
         end))
     end
@@ -1886,6 +1895,10 @@ local function bindLocalCharacter(character)
             ScheduleReload("LocalCharacterRemoved", false)
         end
     end))
+
+    if type(TriggerGuard.onCharacterLifecycle) == "function" then
+        pcall(TriggerGuard.onCharacterLifecycle, "Respawn")
+    end
 end
 
 -- Full Reload & 1s Reconciliation: refreshes characters, parts, team detection, and healed visuals
@@ -3224,7 +3237,7 @@ local function updateAimbot(camera, screenCenter, dt)
     end
 end
 
--- Trigger Bot (Touch-Mode-Preserved Mouse Input + Tool/Client Signals + Mobile Shoot Button + Server Remote Fire)
+-- Trigger Bot (Touch-Mode-Preserved Mouse Input + Tool Activation + Aimbot Sync)
 local CORE_INPUT_BLOCK_PATTERNS = {
     "playermodule",
     "controlmodule",
@@ -3244,129 +3257,6 @@ local CORE_INPUT_BLOCK_PATTERNS = {
     "bubblechat",
     "playerlist",
     "team_aki",
-}
-
-local SHOOT_BTN_POSITIVE = {
-    "shoot",
-    "fire",
-    "attack",
-    "trigger",
-    "primaryfire",
-    "m1",
-    "blast",
-    "strike",
-    "swing",
-    "slash",
-    "gun",
-    "use",
-}
-
-local SHOOT_BTN_NEGATIVE = {
-    "aim",
-    "scope",
-    "ads",
-    "switch",
-    "reload",
-    "jump",
-    "crouch",
-    "sprint",
-    "dash",
-    "slide",
-    "edit",
-    "layout",
-    "setting",
-    "shop",
-    "menu",
-    "close",
-    "back",
-    "inventory",
-    "emote",
-    "team_aki",
-}
-
-local REMOTE_FIRE_POSITIVE = {
-    "fire",
-    "shoot",
-    "shot",
-    "firegun",
-    "shootgun",
-    "fireweapon",
-    "weaponfire",
-    "gunfire",
-    "firebullet",
-    "bullet",
-    "raycast",
-    "cast",
-    "replicatedshot",
-    "replicatehit",
-    "replicate",
-    "attack",
-    "hit",
-    "damage",
-    "trigger",
-    "primary",
-    "projectile",
-    "muzzle",
-}
-
-local REMOTE_FIRE_NEGATIVE = {
-    "ban",
-    "kick",
-    "report",
-    "anticheat",
-    "ac_",
-    "admin",
-    "mod",
-    "log",
-    "error",
-    "ping",
-    "move",
-    "walk",
-    "sprint",
-    "crouch",
-    "jump",
-    "chat",
-    "buy",
-    "shop",
-    "crate",
-    "case",
-    "skin",
-    "camo",
-    "equip",
-    "unequip",
-    "holster",
-    "switch",
-    "reload",
-    "aim",
-    "scope",
-    "ads",
-    "toggle",
-    "setting",
-    "menu",
-    "team",
-    "spawn",
-    "respawn",
-    "teleport",
-    "badge",
-    "quest",
-    "award",
-    "voice",
-    "sound",
-    "fx",
-    "effect",
-    "emote",
-    "inspect",
-    "anim",
-    "tilt",
-    "look",
-    "cframe",
-    "stance",
-    "lean",
-    "flashlight",
-    "laser",
-    "ragdoll",
-    "death",
-    "killfeed",
 }
 
 local function getConnectionSourceText(conn)
@@ -3536,367 +3426,6 @@ local function isGuiButtonTreeVisible(btn)
         cur = cur.Parent
     end
     return true
-end
-
-local function getGuiButtonSearchText(btn)
-    local parts = {string.lower(btn.Name)}
-    if btn.Parent and btn.Parent:IsA("GuiObject") then
-        table.insert(parts, string.lower(btn.Parent.Name))
-        local siblingBtns = 0
-        for _, child in ipairs(btn.Parent:GetChildren()) do
-            if child:IsA("GuiButton") then
-                siblingBtns = siblingBtns + 1
-            end
-        end
-        if siblingBtns == 1 then
-            for _, child in ipairs(btn.Parent:GetChildren()) do
-                if child:IsA("TextLabel") and type(child.Text) == "string" and child.Text ~= "" then
-                    table.insert(parts, string.lower(child.Text))
-                end
-            end
-        end
-    end
-    if btn:IsA("TextButton") and type(btn.Text) == "string" and btn.Text ~= "" then
-        table.insert(parts, string.lower(btn.Text))
-    end
-    for _, desc in ipairs(btn:GetDescendants()) do
-        if (desc:IsA("TextLabel") or desc:IsA("TextButton")) and type(desc.Text) == "string" and desc.Text ~= "" then
-            table.insert(parts, string.lower(desc.Text))
-        end
-    end
-    return table.concat(parts, " ")
-end
-
-local function findMobileShootButton(now)
-    local cached = State.CachedShootBtn
-    if cached and cached.Parent and isGuiButtonTreeVisible(cached) then
-        return cached
-    end
-    if (now - (State.LastShootBtnScan or 0)) < 0.75 then
-        return nil
-    end
-    State.LastShootBtnScan = now
-    State.CachedShootBtn = nil
-
-    local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-    if not pg then
-        return nil
-    end
-
-    local camera = State.Camera or Workspace.CurrentCamera
-    local vpWidth = camera and camera.ViewportSize.X or 1280
-
-    local bestBtn = nil
-    local bestScore = 0
-    local casFireNames = {}
-
-    if State.ContextActionService and type(State.ContextActionService.GetAllBoundActionInfo) == "function" then
-        local okCas, boundInfo = pcall(function()
-            return State.ContextActionService:GetAllBoundActionInfo()
-        end)
-        if okCas and type(boundInfo) == "table" then
-            for actionName in pairs(boundInfo) do
-                local lowerAction = string.lower(tostring(actionName))
-                local negHit = false
-                for _, neg in ipairs(SHOOT_BTN_NEGATIVE) do
-                    if string.find(lowerAction, neg, 1, true) then
-                        negHit = true
-                        break
-                    end
-                end
-                if not negHit then
-                    for _, posWord in ipairs(SHOOT_BTN_POSITIVE) do
-                        if string.find(lowerAction, posWord, 1, true) then
-                            casFireNames[lowerAction] = true
-                            break
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    for _, gui in ipairs(pg:GetChildren()) do
-        if gui:IsA("ScreenGui") and gui.Enabled ~= false then
-            local gName = string.lower(gui.Name)
-            local skipGui = (gui == State.MainGui or gui == State.OverlayGui)
-                or string.find(gName, "team_aki", 1, true)
-                or gName == "chat"
-                or gName == "bubblechat"
-                or gName == "topbar"
-                or gName == "playerlist"
-                or gName == "freecam"
-            if not skipGui then
-                for _, desc in ipairs(gui:GetDescendants()) do
-                    if (desc:IsA("TextButton") or desc:IsA("ImageButton")) and isGuiButtonTreeVisible(desc) then
-                        local dFull = string.lower(desc.Name)
-                        local isCoreTouchControl = (gName == "touchgui") and (
-                            string.find(dFull, "thumbstick", 1, true)
-                            or dFull == "jumpbutton"
-                            or (desc.Parent and string.find(string.lower(desc.Parent.Name), "thumbstick", 1, true) ~= nil)
-                        )
-                        local labelText = isCoreTouchControl and "" or getGuiButtonSearchText(desc)
-                        local rejected = isCoreTouchControl
-                        if not rejected then
-                            for _, neg in ipairs(SHOOT_BTN_NEGATIVE) do
-                                if string.find(labelText, neg, 1, true) then
-                                    rejected = true
-                                    break
-                                end
-                            end
-                        end
-
-                        if not rejected then
-                            local score = 0
-                            if casFireNames[dFull] then
-                                score = score + 115
-                            end
-                            for idx, posWord in ipairs(SHOOT_BTN_POSITIVE) do
-                                if string.find(labelText, posWord, 1, true) then
-                                    score = score + (100 - math.min(idx, 8) * 8)
-                                    break
-                                end
-                            end
-
-                            if score > 0 then
-                                local hasConns = hasSignalConnections(desc.InputBegan)
-                                    or hasSignalConnections(desc.MouseButton1Down)
-                                    or hasSignalConnections(desc.Activated)
-                                    or hasSignalConnections(desc.MouseButton1Click)
-                                    or hasSignalConnections(desc.TouchTap)
-                                if hasConns then
-                                    score = score + 50
-                                elseif type(getconnections) == "function" then
-                                    score = score - 40
-                                end
-                                if desc.AbsolutePosition.X >= vpWidth * 0.45 then
-                                    score = score + 15
-                                end
-                                if desc.AbsoluteSize.X >= 36 and desc.AbsoluteSize.Y >= 36 then
-                                    score = score + 10
-                                end
-                                if score > bestScore then
-                                    bestScore = score
-                                    bestBtn = desc
-                                end
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    if bestBtn then
-        State.CachedShootBtn = bestBtn
-    end
-    return bestBtn
-end
-
-local function fireMobileShootButton(btn, isBegin, isTap)
-    if not btn or not btn.Parent then
-        return false
-    end
-    local btnCenter = btn.AbsolutePosition + (btn.AbsoluteSize * 0.5)
-    local fakeTouch = createFakeInputObject(Enum.UserInputType.Touch, btnCenter, isBegin)
-
-    if isBegin then
-        local hasDown = hasSignalConnections(btn.InputBegan) or hasSignalConnections(btn.MouseButton1Down)
-        local fired = false
-        if invokeSignal(btn.InputBegan, fakeTouch, false) then
-            fired = true
-        end
-        if invokeSignal(btn.MouseButton1Down, btnCenter.X, btnCenter.Y) then
-            fired = true
-        end
-        if isTap or (not hasDown) then
-            if invokeSignal(btn.Activated, fakeTouch, 1) then
-                fired = true
-            end
-            if invokeSignal(btn.MouseButton1Click) then
-                fired = true
-            end
-            if invokeSignal(btn.TouchTap, {btnCenter}) then
-                fired = true
-            end
-        end
-        return fired
-    else
-        local fired = false
-        if invokeSignal(btn.MouseButton1Up, btnCenter.X, btnCenter.Y) then
-            fired = true
-        end
-        if invokeSignal(btn.InputEnded, fakeTouch, false) then
-            fired = true
-        end
-        return fired
-    end
-end
-
-local function isFireRemoteNameAllowed(lowerName, lowerFull)
-    for _, neg in ipairs(REMOTE_FIRE_NEGATIVE) do
-        if string.find(lowerName, neg, 1, true) then
-            return false, 0
-        end
-    end
-    local score = 0
-    for idx, pos in ipairs(REMOTE_FIRE_POSITIVE) do
-        if string.find(lowerName, pos, 1, true) then
-            score = score + (120 - math.min(idx, 12) * 5)
-            break
-        elseif string.find(lowerFull, pos, 1, true) then
-            score = score + 40
-            break
-        end
-    end
-    return score > 0, score
-end
-
-local function scanWeaponFireRemotes(now, equippedTool)
-    local remotes = {}
-    local seen = {}
-
-    -- Priority 1: Fire RemoteEvents / RemoteFunctions inside the currently equipped Tool
-    if equippedTool and equippedTool.Parent then
-        for _, desc in ipairs(equippedTool:GetDescendants()) do
-            if desc:IsA("RemoteEvent") or desc:IsA("RemoteFunction") then
-                local ln = string.lower(desc.Name)
-                local okRemote, nameScore = isFireRemoteNameAllowed(ln, ln)
-                if okRemote then
-                    seen[desc] = true
-                    table.insert(remotes, {remote = desc, score = 200 + nameScore, isFunc = desc:IsA("RemoteFunction")})
-                end
-            end
-        end
-        if #remotes > 0 then
-            table.sort(remotes, function(a, b)
-                return a.score > b.score
-            end)
-            return remotes
-        end
-    end
-
-    if (now - (State.LastRemoteScan or 0)) < 2.0 and #State.CachedFireRemotes > 0 then
-        local live = {}
-        for _, item in ipairs(State.CachedFireRemotes) do
-            if item.remote and item.remote.Parent then
-                table.insert(live, item)
-            end
-        end
-        if #live > 0 then
-            return live
-        end
-    end
-
-    State.LastRemoteScan = now
-    clearTable(State.CachedFireRemotes)
-
-    local containers = {ReplicatedStorage}
-    local localChar = State.LocalCharacter or LocalPlayer.Character
-    if localChar then
-        table.insert(containers, localChar)
-    end
-    local ps = LocalPlayer:FindFirstChildOfClass("PlayerScripts")
-    if ps then
-        table.insert(containers, ps)
-    end
-
-    for _, container in ipairs(containers) do
-        if container then
-            for _, desc in ipairs(container:GetDescendants()) do
-                if (desc:IsA("RemoteEvent") or desc:IsA("RemoteFunction")) and not seen[desc] then
-                    local ln = string.lower(desc.Name)
-                    local okPath, fullPath = pcall(function()
-                        return string.lower(desc:GetFullName())
-                    end)
-                    local lf = (okPath and fullPath) or ln
-                    local okRemote, score = isFireRemoteNameAllowed(ln, lf)
-                    if okRemote then
-                        seen[desc] = true
-                        table.insert(State.CachedFireRemotes, {remote = desc, score = score, isFunc = desc:IsA("RemoteFunction")})
-                    end
-                end
-            end
-        end
-    end
-
-    -- Last resort: neutral non-blocked RemoteEvent inside equipped Tool if ReplicatedStorage had no fire remote
-    if #State.CachedFireRemotes == 0 and equippedTool and equippedTool.Parent then
-        for _, desc in ipairs(equippedTool:GetDescendants()) do
-            if desc:IsA("RemoteEvent") then
-                local ln = string.lower(desc.Name)
-                local blocked = false
-                for _, neg in ipairs(REMOTE_FIRE_NEGATIVE) do
-                    if string.find(ln, neg, 1, true) then
-                        blocked = true
-                        break
-                    end
-                end
-                if not blocked then
-                    table.insert(State.CachedFireRemotes, {remote = desc, score = 45, isFunc = false})
-                end
-            end
-        end
-    end
-
-    table.sort(State.CachedFireRemotes, function(a, b)
-        return a.score > b.score
-    end)
-
-    return State.CachedFireRemotes
-end
-
-local function fireWeaponServerRemote(camera, now, equippedTool, targetPart, hitWorldPos)
-    if not Config.TriggerBot.ServerRemoteFire or not camera or not targetPart then
-        return false
-    end
-
-    local remotes = scanWeaponFireRemotes(now, equippedTool)
-    if #remotes == 0 then
-        return false
-    end
-
-    local origin = camera.CFrame.Position
-    local hitPos = hitWorldPos or targetPart.Position
-    local delta = hitPos - origin
-    local dir = (delta.Magnitude > 0.001) and delta.Unit or camera.CFrame.LookVector
-
-    local sentAny = false
-    local limit = math.min(#remotes, 3)
-    for i = 1, limit do
-        local item = remotes[i]
-        local remote = item and item.remote
-        if remote and remote.Parent then
-            if item.isFunc then
-                local okSpawn = pcall(function()
-                    task.spawn(function()
-                        pcall(function()
-                            if equippedTool then
-                                remote:InvokeServer(hitPos, targetPart, origin, dir, equippedTool)
-                            else
-                                remote:InvokeServer(hitPos, targetPart, origin, dir)
-                            end
-                        end)
-                    end)
-                end)
-                if okSpawn then
-                    sentAny = true
-                end
-            else
-                local okSent = pcall(function()
-                    if equippedTool then
-                        remote:FireServer(hitPos, targetPart, origin, dir, equippedTool)
-                    else
-                        remote:FireServer(hitPos, targetPart, origin, dir)
-                    end
-                end)
-                if okSent then
-                    sentAny = true
-                end
-            end
-        end
-    end
-    return sentAny
 end
 
 TriggerGuard.WEAPON_PATTERNS = {
@@ -4080,24 +3609,16 @@ local function firePlayerMouseSignal(signalName)
     return firedAny
 end
 
-local function toolHasActivatedConnections(tool)
-    if not tool or type(getconnections) ~= "function" then
-        return false
-    end
-    local ok, conns = pcall(getconnections, tool.Activated)
-    return ok and type(conns) == "table" and #conns > 0
-end
-
 function TriggerGuard.getPlayerModule()
-    if State.PlayerModuleChecked then
+    if State.PlayerModuleCache and State.PlayerModuleScript and State.PlayerModuleScript.Parent then
         return State.PlayerModuleCache
     end
-    State.PlayerModuleChecked = true
     local ps = LocalPlayer:FindFirstChildOfClass("PlayerScripts")
     local pmScript = ps and ps:FindFirstChild("PlayerModule")
     if pmScript and type(require) == "function" then
         local okReq, mod = pcall(require, pmScript)
         if okReq and type(mod) == "table" then
+            State.PlayerModuleScript = pmScript
             State.PlayerModuleCache = mod
         end
     end
@@ -4119,9 +3640,9 @@ function TriggerGuard.keepTouchGuiActive()
             end
         end)
     end
-    if State.SavedMouseIconEnabled ~= nil then
+    if State.SavedMouseIconEnabled == true then
         pcall(function()
-            UserInputService.MouseIconEnabled = State.SavedMouseIconEnabled
+            UserInputService.MouseIconEnabled = true
         end)
     else
         pcall(function()
@@ -4137,7 +3658,58 @@ function TriggerGuard.keepTouchGuiActive()
     end
 end
 
-function TriggerGuard.enforceTouchControls()
+function TriggerGuard.broadcastTouchInputMode()
+    if not UserInputService.TouchEnabled or type(getconnections) ~= "function" then
+        return
+    end
+    State.LastTouchBroadcastTime = os.clock()
+    local okLast, lastConns = pcall(getconnections, UserInputService.LastInputTypeChanged)
+    if okLast and type(lastConns) == "table" then
+        for _, conn in ipairs(lastConns) do
+            if conn and conn.Enabled ~= false then
+                local isOwn = conn.Function and State.OwnInputFunctions[conn.Function]
+                if (not isOwn) and (not isBlockedCoreInputConnection(conn)) then
+                    pcall(function()
+                        if type(conn.Fire) == "function" then
+                            task.spawn(function()
+                                pcall(conn.Fire, conn, Enum.UserInputType.Touch)
+                            end)
+                        elseif type(conn.Function) == "function" then
+                            task.spawn(conn.Function, Enum.UserInputType.Touch)
+                        end
+                    end)
+                end
+            end
+        end
+    end
+
+    local okPrefSig, prefSig = pcall(function()
+        return UserInputService:GetPropertyChangedSignal("PreferredInput")
+    end)
+    if okPrefSig and prefSig then
+        local okPref, prefConns = pcall(getconnections, prefSig)
+        if okPref and type(prefConns) == "table" then
+            for _, conn in ipairs(prefConns) do
+                if conn and conn.Enabled ~= false then
+                    local isOwn = conn.Function and State.OwnInputFunctions[conn.Function]
+                    if (not isOwn) and (not isBlockedCoreInputConnection(conn)) then
+                        pcall(function()
+                            if type(conn.Fire) == "function" then
+                                task.spawn(function()
+                                    pcall(conn.Fire, conn)
+                                end)
+                            elseif type(conn.Function) == "function" then
+                                task.spawn(conn.Function)
+                            end
+                        end)
+                    end
+                end
+            end
+        end
+    end
+end
+
+function TriggerGuard.enforceTouchControls(forceBroadcast)
     if not UserInputService.TouchEnabled then
         return
     end
@@ -4163,6 +3735,35 @@ function TriggerGuard.enforceTouchControls()
                 if type(cameras) == "table" and type(cameras.OnLastInputTypeChanged) == "function" then
                     pcall(cameras.OnLastInputTypeChanged, cameras, Enum.UserInputType.Touch)
                 end
+            end
+        end)
+    end
+    if forceBroadcast then
+        TriggerGuard.broadcastTouchInputMode()
+    end
+end
+
+function TriggerGuard.onCharacterLifecycle(_)
+    if not UserInputService.TouchEnabled or State.Unloaded then
+        return
+    end
+    State.SavedMouseIconEnabled = nil
+    State.SavedMouseBehavior = nil
+    if State.HasUsedHardwareMouse or Config.TriggerBot.Enabled then
+        State.NeedsTouchBroadcast = true
+    end
+    if (not State.HasUsedHardwareMouse) and (not Config.TriggerBot.Enabled) then
+        return
+    end
+
+    State.TouchGuardLifecycleToken = (State.TouchGuardLifecycleToken or 0) + 1
+    local myToken = State.TouchGuardLifecycleToken
+
+    TriggerGuard.enforceTouchControls(true)
+    for _, waitSec in ipairs({0.05, 0.25, 0.70, 1.40}) do
+        task.delay(waitSec, function()
+            if (not State.Unloaded) and State.TouchGuardLifecycleToken == myToken and UserInputService.TouchEnabled then
+                TriggerGuard.enforceTouchControls(true)
             end
         end)
     end
@@ -4202,7 +3803,7 @@ function TriggerGuard.restoreLastInputConns()
         end
         clearTable(State.PausedPreferredInputConns)
     end
-    TriggerGuard.enforceTouchControls()
+    TriggerGuard.enforceTouchControls(true)
     State.SavedMouseIconEnabled = nil
     State.SavedMouseBehavior = nil
 end
@@ -4280,7 +3881,10 @@ function TriggerGuard.pauseGameUiUnderPoints(camera, points)
                         local isOwn = (State.MainGui and obj:IsDescendantOf(State.MainGui))
                             or (State.OverlayGui and obj:IsDescendantOf(State.OverlayGui))
                         local isTouchCtrl = obj:FindFirstAncestor("TouchGui") ~= nil
-                        local isShoot = (obj == State.CachedShootBtn)
+                        local lowerBtn = string.lower(obj.Name)
+                        local isShoot = string.find(lowerBtn, "shoot", 1, true) ~= nil
+                            or string.find(lowerBtn, "fire", 1, true) ~= nil
+                            or string.find(lowerBtn, "attack", 1, true) ~= nil
                         local isFullOverlay = (obj.AbsoluteSize.X >= vp.X * 0.55) or (obj.AbsoluteSize.Y >= vp.Y * 0.55)
                         if (not isOwn) and (not isTouchCtrl) and (not isShoot) and (not isFullOverlay) then
                             for _, sig in ipairs({obj.Activated, obj.MouseButton1Click, obj.MouseButton1Down, obj.InputBegan}) do
@@ -4301,6 +3905,39 @@ function TriggerGuard.pauseGameUiUnderPoints(camera, points)
                 end
             end
         end
+    end
+end
+
+addOwnUserInputConn(UserInputService.LastInputTypeChanged, function(lastType)
+    if (not UserInputService.TouchEnabled) or State.Unloaded then
+        return
+    end
+    if lastType == Enum.UserInputType.Touch then
+        State.NeedsTouchBroadcast = false
+    elseif State.HasUsedHardwareMouse or Config.TriggerBot.Enabled then
+        State.NeedsTouchBroadcast = true
+        task.defer(function()
+            if not State.Unloaded and UserInputService.TouchEnabled then
+                TriggerGuard.enforceTouchControls(true)
+            end
+        end)
+    end
+end)
+
+do
+    local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if pg then
+        addConnection(pg.ChildAdded:Connect(function(child)
+            if UserInputService.TouchEnabled and (not State.Unloaded) and child and child.Name == "TouchGui" then
+                if State.HasUsedHardwareMouse or Config.TriggerBot.Enabled then
+                    task.defer(function()
+                        if not State.Unloaded then
+                            TriggerGuard.enforceTouchControls(true)
+                        end
+                    end)
+                end
+            end
+        end))
     end
 end
 
@@ -4401,6 +4038,8 @@ function TriggerGuard.fireExecutorMousePulse(screenCenter, holdMode)
     end
 
     State.LastHardwareMouseTime = os.clock()
+    State.HasUsedHardwareMouse = true
+    State.NeedsTouchBroadcast = true
     State.IsSynthesizingMouse = true
 
     local didFire = TriggerGuard.withTouchModePreserved(function()
@@ -4469,11 +4108,6 @@ function TriggerGuard.fireExecutorMousePulse(screenCenter, holdMode)
 end
 
 releaseTriggerFire = function()
-    if State.TriggerGuiBtn and State.TriggerGuiBtn.Parent then
-        fireMobileShootButton(State.TriggerGuiBtn, false, false)
-    end
-    State.TriggerGuiBtn = nil
-
     if State.TriggerFakeMouseHeld then
         State.TriggerFakeMouseHeld = false
         firePlayerMouseSignal("Button1Up")
@@ -4503,22 +4137,18 @@ releaseTriggerFire = function()
     end
 
     TriggerGuard.restoreCoreInputConns()
-    State.TriggerVimHeld = false
     State.TriggerHolding = false
 end
 
-local function triggerOnceOrPress(camera, screenCenter, now, holdMode, targetPart, hitWorldPos)
+local function triggerOnceOrPress(camera, screenCenter, now, holdMode)
     local localChar = State.LocalCharacter or LocalPlayer.Character
     local equippedTool = localChar and localChar:FindFirstChildOfClass("Tool") or nil
-    local mode = Config.TriggerBot.FireMode or "Mouse"
     local firedAny = false
-    local strongClientFired = false
 
     State.LastTriggerMousePos = screenCenter or Vector2.new(640, 360)
 
     -- 1) Equipped Tool activation (classic tools + local tool scripts)
     if equippedTool then
-        local hasActivatedConns = toolHasActivatedConnections(equippedTool)
         local okTool = pcall(function()
             equippedTool:Activate()
         end)
@@ -4526,9 +4156,6 @@ local function triggerOnceOrPress(camera, screenCenter, now, holdMode, targetPar
         if okTool then
             State.TriggerToolRef = equippedTool
             firedAny = true
-            if invokedAct and hasActivatedConns then
-                strongClientFired = true
-            end
         elseif invokedAct then
             firedAny = true
         end
@@ -4537,15 +4164,13 @@ local function triggerOnceOrPress(camera, screenCenter, now, holdMode, targetPar
     -- 2) Mouse Fire Channel: Touch-safe executor mouse1 primary; fallback to filtered client mouse signals only if hardware mouse unavailable
     local hardwareFired = TriggerGuard.fireExecutorMousePulse(State.LastTriggerMousePos, holdMode)
     if hardwareFired then
-        strongClientFired = true
         firedAny = true
     else
         if firePlayerMouseSignal("Button1Down") then
-            strongClientFired = true
             firedAny = true
         end
 
-        local inputAny, inputWeapon = dispatchClientMouseSignal(
+        local inputAny = dispatchClientMouseSignal(
             UserInputService.InputBegan,
             createFakeInputObject(Enum.UserInputType.MouseButton1, State.LastTriggerMousePos, true)
         )
@@ -4555,26 +4180,6 @@ local function triggerOnceOrPress(camera, screenCenter, now, holdMode, targetPar
                 State.TriggerFakeMouseHeld = true
             end
         end
-        if inputWeapon then
-            strongClientFired = true
-        end
-    end
-
-    -- 3) Mobile Shoot Button fallback (only if mouse did not confirm or Mouse + Remote mode requested)
-    if (not strongClientFired) and mode ~= "Mouse" then
-        local shootBtn = findMobileShootButton(now)
-        if shootBtn and fireMobileShootButton(shootBtn, true, not holdMode) then
-            State.TriggerGuiBtn = shootBtn
-            strongClientFired = true
-            firedAny = true
-        end
-    end
-
-    -- 4) Optional Server Remote Fire Request (Mouse + Remote mode or explicit ServerRemoteFire toggle)
-    if Config.TriggerBot.ServerRemoteFire and (mode == "Mouse + Remote" or not strongClientFired) then
-        if fireWeaponServerRemote(camera, now, equippedTool, targetPart, hitWorldPos) then
-            firedAny = true
-        end
     end
 
     if holdMode and firedAny then
@@ -4583,17 +4188,10 @@ local function triggerOnceOrPress(camera, screenCenter, now, holdMode, targetPar
         State.TriggerHolding = false
         if firedAny then
             local endCenter = State.LastTriggerMousePos
-            local btnToRelease = State.TriggerGuiBtn
             local toolToRelease = State.TriggerToolRef
             local needFakeRelease = State.TriggerFakeMouseHeld or (not hardwareFired)
             task.delay(0.03, function()
                 if not State.TriggerHolding then
-                    if btnToRelease and btnToRelease.Parent then
-                        fireMobileShootButton(btnToRelease, false, true)
-                    end
-                    if State.TriggerGuiBtn == btnToRelease then
-                        State.TriggerGuiBtn = nil
-                    end
                     if needFakeRelease then
                         State.TriggerFakeMouseHeld = false
                         firePlayerMouseSignal("Button1Up")
@@ -4940,12 +4538,12 @@ local function updateTriggerBot(camera, screenCenter, now, dt)
 
     if Config.TriggerBot.HoldToFire then
         if not State.TriggerHolding then
-            triggerOnceOrPress(camera, screenCenter, now, true, targetPart, hitWorldPos)
+            triggerOnceOrPress(camera, screenCenter, now, true)
         end
     else
         if (now - State.LastTriggerFire) >= Config.TriggerBot.ShotCooldown then
             State.LastTriggerFire = now
-            triggerOnceOrPress(camera, screenCenter, now, false, targetPart, hitWorldPos)
+            triggerOnceOrPress(camera, screenCenter, now, false)
         end
     end
 end
@@ -5091,9 +4689,23 @@ local function onRenderStepFrame(dt)
         bindLocalCharacter(liveLocalChar)
     end
 
-    -- Enforce mobile Touch controls after any hardware mouse pulse so mobile never gets stuck in PC mode
-    if UserInputService.TouchEnabled and (now - (State.LastHardwareMouseTime or 0)) < 0.75 then
-        TriggerGuard.enforceTouchControls()
+    -- Enforce mobile Touch controls after hardware mouse pulses and across death/respawn so mobile never gets stuck in PC mode
+    if UserInputService.TouchEnabled and (State.HasUsedHardwareMouse or Config.TriggerBot.Enabled) then
+        local okLast, lastInput = pcall(function()
+            return UserInputService:GetLastInputType()
+        end)
+        local isTouchLast = okLast and lastInput == Enum.UserInputType.Touch
+        local recentShot = (now - (State.LastHardwareMouseTime or 0)) < 1.25
+        if isTouchLast and not recentShot then
+            State.NeedsTouchBroadcast = false
+        elseif recentShot or (not isTouchLast) or State.NeedsTouchBroadcast then
+            TriggerGuard.keepTouchGuiActive()
+            if recentShot or (now - (State.LastTouchEnforceTime or 0)) >= 0.18 then
+                State.LastTouchEnforceTime = now
+                local shouldBroadcast = (not isTouchLast) and ((now - (State.LastTouchBroadcastTime or 0)) >= 0.45)
+                TriggerGuard.enforceTouchControls(shouldBroadcast)
+            end
+        end
     end
 
     updateAimbot(camera, screenCenter, dt)
@@ -6492,28 +6104,13 @@ do
         Config.TriggerBot.SyncWithAimbot = v
     end)
 
-    addSelector(TriggerPage, 4, "Fire Method", {"Mouse", "Mouse + Remote"}, function()
-        return Config.TriggerBot.FireMode
-    end, function(v)
-        Config.TriggerBot.FireMode = v
-        if v == "Mouse + Remote" then
-            Config.TriggerBot.ServerRemoteFire = true
-        end
-    end, false)
-
-    addToggle(TriggerPage, 5, "Hardware Mouse Click (mouse1)", "Center-aimed Touch-guarded mouse1 (blocks clicks on Aim/Trigger/HUD UI)", function()
+    addToggle(TriggerPage, 4, "Hardware Mouse Click (mouse1)", "Uses Touch-guarded mouse1press/release while keeping Touch mode across respawns", function()
         return Config.TriggerBot.HardwareMouse
     end, function(v)
         Config.TriggerBot.HardwareMouse = v
     end)
 
-    addToggle(TriggerPage, 6, "Server Remote Fire", "Optional FireServer / InvokeServer backup when Mouse + Remote is used", function()
-        return Config.TriggerBot.ServerRemoteFire
-    end, function(v)
-        Config.TriggerBot.ServerRemoteFire = v
-    end)
-
-    addToggle(TriggerPage, 7, "Hold Fire While Locked", "Hold trigger continuously vs timed tap shots", function()
+    addToggle(TriggerPage, 5, "Hold Fire While Locked", "Hold trigger continuously vs timed tap shots", function()
         return Config.TriggerBot.HoldToFire
     end, function(v)
         Config.TriggerBot.HoldToFire = v
