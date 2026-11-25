@@ -202,6 +202,12 @@ local State = {
     TriggerVimHeld = false,
     TriggerToolRef = nil,
     LastTriggerMousePos = Vector2.zero,
+    NamecallHooked = false,
+    OrigNamecall = nil,
+    PcGuardUntil = 0,
+    SuppressedInputConns = {},
+    SavedTouchGuiVisible = nil,
+    SavedMouseIcon = nil,
     ColorListeners = {},
     FrameIndex = 0,
     LastRenderTick = 0,
@@ -1409,7 +1415,9 @@ local function bindLocalCharacter(character)
     State.LocalCharacter = character
     State.Camera = Workspace.CurrentCamera
     State.LocalHumanoid = character:FindFirstChildOfClass("Humanoid")
-    State.LocalRootPart = character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart
+    State.LocalRootPart = character:FindFirstChild("HumanoidRootPart")
+        or character.PrimaryPart
+        or (character:IsA("BasePart") and character or character:FindFirstChildWhichIsA("BasePart", true))
     State.LocalAlive = true
     if State.LocalRootPart and State.LocalRootPart.Parent then
         State.LastLocalPos = State.LocalRootPart.Position
@@ -1417,7 +1425,7 @@ local function bindLocalCharacter(character)
 
     local function attachHumanoidDeath(hum)
         State.LocalHumanoid = hum
-        State.LocalAlive = (hum.Health > 0)
+        State.LocalAlive = (hum.MaxHealth <= 0) or (hum.Health > 0)
         table.insert(State.LocalConns, hum.Died:Connect(function()
             State.LocalAlive = false
             State.CurrentAimTarget = nil
@@ -1434,6 +1442,8 @@ local function bindLocalCharacter(character)
                 attachHumanoidDeath(child)
                 ScheduleReload("LocalHumanoidReady", false)
             elseif child.Name == "HumanoidRootPart" and child:IsA("BasePart") then
+                State.LocalRootPart = child
+            elseif (not State.LocalRootPart or not State.LocalRootPart.Parent) and child:IsA("BasePart") then
                 State.LocalRootPart = child
             end
         end))
@@ -1496,9 +1506,14 @@ ReloadAllSystems = function(reason, hardReset)
             bindLocalCharacter(liveLocalChar)
         else
             State.LocalHumanoid = liveLocalChar:FindFirstChildOfClass("Humanoid") or State.LocalHumanoid
-            State.LocalRootPart = liveLocalChar:FindFirstChild("HumanoidRootPart") or liveLocalChar.PrimaryPart or State.LocalRootPart
+            State.LocalRootPart = liveLocalChar:FindFirstChild("HumanoidRootPart")
+                or liveLocalChar.PrimaryPart
+                or State.LocalRootPart
+                or (liveLocalChar:IsA("BasePart") and liveLocalChar or liveLocalChar:FindFirstChildWhichIsA("BasePart", true))
             if State.LocalHumanoid then
-                State.LocalAlive = (State.LocalHumanoid.Health > 0)
+                State.LocalAlive = (State.LocalHumanoid.MaxHealth <= 0) or (State.LocalHumanoid.Health > 0)
+            else
+                State.LocalAlive = (State.LocalRootPart ~= nil and State.LocalRootPart.Parent ~= nil)
             end
         end
     end
@@ -2582,7 +2597,7 @@ local function updateAimbot(camera, screenCenter, dt)
     end
 end
 
--- Mouse-Only Client Trigger Bot (Sends client MouseButton1 / Mouse.Button1Down requests without switching mobile to PC mode)
+-- Mouse Trigger Bot + Mobile Touch-Mode Lock Shield (fires real Mouse clicks while keeping mobile out of PC mode)
 local CORE_INPUT_BLOCK_PATTERNS = {
     "playermodule",
     "controlmodule",
@@ -2598,19 +2613,25 @@ local CORE_INPUT_BLOCK_PATTERNS = {
     "team_aki",
 }
 
-local function isBlockedCoreInputConnection(conn)
+local PC_MODE_SWITCH_PATTERNS = {
+    "playermodule",
+    "controlmodule",
+    "cameramodule",
+    "inputcategorizer",
+    "touchgui",
+    "corepackages",
+    "robloxgui",
+    "topbar",
+    "playerlist",
+}
+
+local function getConnectionSourceText(conn)
     if not conn then
-        return true
-    end
-    if conn.Enabled == false then
-        return true
+        return ""
     end
     local fn = conn.Function
     if type(fn) ~= "function" then
-        return true
-    end
-    if type(iscclosure) == "function" and iscclosure(fn) then
-        return true
+        return ""
     end
 
     local srcInfo = ""
@@ -2634,13 +2655,178 @@ local function isBlockedCoreInputConnection(conn)
         end
     end
 
-    local combined = srcInfo .. "|" .. scriptPath
-    for _, pattern in ipairs(CORE_INPUT_BLOCK_PATTERNS) do
+    return srcInfo .. "|" .. scriptPath
+end
+
+local function isBlockedCoreInputConnection(conn)
+    if not conn then
+        return true
+    end
+    if conn.Enabled == false then
+        return true
+    end
+    if type(conn.Function) ~= "function" then
+        return true
+    end
+
+    local combined = getConnectionSourceText(conn)
+    if combined ~= "|" and combined ~= "" then
+        for _, pattern in ipairs(CORE_INPUT_BLOCK_PATTERNS) do
+            if string.find(combined, pattern, 1, true) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function isPcModeSwitchConnection(conn)
+    local combined = getConnectionSourceText(conn)
+    if string.find(combined, "team_aki", 1, true) then
+        return false
+    end
+    for _, pattern in ipairs(PC_MODE_SWITCH_PATTERNS) do
         if string.find(combined, pattern, 1, true) then
             return true
         end
     end
     return false
+end
+
+local function ensureTouchModeHook()
+    if State.NamecallHooked or State.Unloaded then
+        return
+    end
+    if not UserInputService.TouchEnabled then
+        return
+    end
+    if type(hookmetamethod) ~= "function"
+        or type(getnamecallmethod) ~= "function"
+        or type(newcclosure) ~= "function"
+        or type(checkcaller) ~= "function"
+    then
+        return
+    end
+
+    local okHook, oldFn = pcall(function()
+        local orig
+        orig = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+            local method = getnamecallmethod()
+            if (not State.Unloaded)
+                and Config.TriggerBot.Enabled
+                and UserInputService.TouchEnabled
+                and self == UserInputService
+                and (not checkcaller())
+            then
+                if method == "GetLastInputType" then
+                    return Enum.UserInputType.Touch
+                end
+            end
+            return orig(self, ...)
+        end))
+        return orig
+    end)
+
+    if okHook and type(oldFn) == "function" then
+        State.OrigNamecall = oldFn
+        State.NamecallHooked = true
+    end
+end
+
+local function suppressSignalConnections(signalObj, suppressAll)
+    if not signalObj or type(getconnections) ~= "function" then
+        return
+    end
+    local ok, conns = pcall(getconnections, signalObj)
+    if not ok or type(conns) ~= "table" then
+        return
+    end
+    for _, conn in ipairs(conns) do
+        if conn and conn.Enabled ~= false then
+            local src = getConnectionSourceText(conn)
+            if not string.find(src, "team_aki", 1, true) then
+                if suppressAll or isPcModeSwitchConnection(conn) then
+                    local okDis = pcall(function()
+                        conn:Disable()
+                    end)
+                    if okDis then
+                        table.insert(State.SuppressedInputConns, conn)
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function suppressPcModeConnections()
+    if not UserInputService.TouchEnabled then
+        return
+    end
+    if State.SavedTouchGuiVisible == nil then
+        local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        local touchGui = pg and pg:FindFirstChild("TouchGui")
+        State.SavedTouchGuiVisible = (touchGui ~= nil and touchGui:IsA("ScreenGui") and touchGui.Enabled) and true or false
+        State.SavedMouseIcon = UserInputService.MouseIconEnabled
+    end
+    State.PcGuardUntil = os.clock() + 0.25
+
+    suppressSignalConnections(UserInputService.LastInputTypeChanged, true)
+    suppressSignalConnections(UserInputService.InputBegan, false)
+    suppressSignalConnections(UserInputService.InputChanged, false)
+    suppressSignalConnections(UserInputService.InputEnded, false)
+end
+
+local function restoreSuppressedInputConns()
+    if #State.SuppressedInputConns > 0 then
+        for _, conn in ipairs(State.SuppressedInputConns) do
+            pcall(function()
+                conn:Enable()
+            end)
+        end
+        clearTable(State.SuppressedInputConns)
+    end
+
+    if UserInputService.TouchEnabled and State.SavedTouchGuiVisible ~= nil then
+        pcall(function()
+            if type(firesignal) == "function" then
+                firesignal(UserInputService.LastInputTypeChanged, Enum.UserInputType.Touch)
+            end
+        end)
+        pcall(function()
+            UserInputService.MouseIconEnabled = State.SavedMouseIcon
+        end)
+        State.SavedTouchGuiVisible = nil
+        State.SavedMouseIcon = nil
+    end
+end
+
+local function maintainTouchModeState(now)
+    if not UserInputService.TouchEnabled then
+        return
+    end
+    local guardActive = (now < (State.PcGuardUntil or 0)) or State.TriggerMouseHeld
+    if guardActive then
+        if State.SavedTouchGuiVisible then
+            local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+            local touchGui = pg and pg:FindFirstChild("TouchGui")
+            if touchGui and touchGui:IsA("ScreenGui") then
+                if not touchGui.Enabled then
+                    touchGui.Enabled = true
+                end
+                local tcf = touchGui:FindFirstChild("TouchControlFrame")
+                if tcf and tcf:IsA("GuiObject") and not tcf.Visible then
+                    tcf.Visible = true
+                end
+            end
+        end
+        pcall(function()
+            if UserInputService.MouseIconEnabled then
+                UserInputService.MouseIconEnabled = false
+            end
+        end)
+    elseif #State.SuppressedInputConns > 0 or State.SavedTouchGuiVisible ~= nil then
+        restoreSuppressedInputConns()
+    end
 end
 
 local function createFakeMouseInput(screenCenter, isBegin)
@@ -2672,7 +2858,9 @@ local function dispatchClientMouseSignal(signalObj, fakeInput)
     local firedAny = false
     for _, conn in ipairs(conns) do
         if not isBlockedCoreInputConnection(conn) then
-            local invoked = pcall(conn.Function, fakeInput, false)
+            local invoked = pcall(function()
+                conn.Function(fakeInput, false)
+            end)
             if invoked then
                 firedAny = true
             end
@@ -2695,34 +2883,36 @@ local function firePlayerMouseSignal(signalName)
         return false
     end
 
-    if type(firesignal) == "function" then
-        local okFire = pcall(firesignal, sig)
-        if okFire then
-            return true
-        end
+    if type(getconnections) ~= "function" then
+        return false
     end
-    if type(getconnections) == "function" then
-        local okConns, conns = pcall(getconnections, sig)
-        if okConns and type(conns) == "table" and #conns > 0 then
-            local firedAny = false
-            for _, conn in ipairs(conns) do
-                if not isBlockedCoreInputConnection(conn) then
-                    local okCall = pcall(function()
-                        if type(conn.Fire) == "function" then
-                            conn:Fire()
-                        elseif type(conn.Function) == "function" then
-                            conn.Function()
-                        end
-                    end)
-                    if okCall then
-                        firedAny = true
-                    end
+
+    local okConns, conns = pcall(getconnections, sig)
+    if not okConns or type(conns) ~= "table" or #conns == 0 then
+        return false
+    end
+
+    local eligibleCount = 0
+    local firedAny = false
+    for _, conn in ipairs(conns) do
+        if not isBlockedCoreInputConnection(conn) then
+            eligibleCount = eligibleCount + 1
+            local okCall = pcall(function()
+                if type(conn.Fire) == "function" then
+                    conn:Fire()
+                elseif type(conn.Function) == "function" then
+                    conn.Function()
                 end
+            end)
+            if okCall then
+                firedAny = true
             end
-            return firedAny
         end
     end
-    return false
+    if eligibleCount == 0 then
+        return false
+    end
+    return firedAny
 end
 
 local function toolHasActivatedConnections(tool)
@@ -2756,76 +2946,116 @@ releaseTriggerFire = function()
 
     State.TriggerVimHeld = false
     State.TriggerHolding = false
+    if UserInputService.TouchEnabled then
+        State.PcGuardUntil = math.max(State.PcGuardUntil or 0, os.clock() + 0.08)
+    end
 end
 
 local function triggerOnceOrPress(screenCenter, holdMode)
     local isTouchDevice = UserInputService.TouchEnabled
     local localChar = State.LocalCharacter or LocalPlayer.Character
     local equippedTool = localChar and localChar:FindFirstChildOfClass("Tool") or nil
-    local fired = false
+    local hardwareFired = false
+    local fallbackFired = false
 
     State.LastTriggerMousePos = screenCenter or Vector2.new(640, 360)
 
-    -- 1) Send pure-Luau PlayerMouse Button1Down (never changes UserInputService input type on mobile)
-    if firePlayerMouseSignal("Button1Down") then
-        fired = true
+    if isTouchDevice then
+        ensureTouchModeHook()
+        suppressPcModeConnections()
     end
 
-    -- 2) Send filtered UserInputService.InputBegan MouseButton1 strictly to game weapon scripts (never PlayerModule/InputCategorizer)
-    if dispatchClientMouseSignal(UserInputService.InputBegan, createFakeMouseInput(State.LastTriggerMousePos, true)) then
-        fired = true
+    -- 1) Real Mouse request (mouse1press / mouse1click) with Touch-Mode Lock Shield on mobile
+    if holdMode and type(mouse1press) == "function" then
+        local okPress = pcall(mouse1press)
+        if okPress then
+            State.TriggerMouseHeld = true
+            hardwareFired = true
+        end
+    elseif (not holdMode) and type(mouse1press) == "function" and type(mouse1release) == "function" then
+        local okPress = pcall(mouse1press)
+        if okPress then
+            State.TriggerMouseHeld = true
+            hardwareFired = true
+            task.delay(0.028, function()
+                if not State.TriggerHolding then
+                    State.TriggerMouseHeld = false
+                    if isTouchDevice then
+                        State.PcGuardUntil = math.max(State.PcGuardUntil or 0, os.clock() + 0.14)
+                    end
+                    pcall(mouse1release)
+                end
+            end)
+        end
+    elseif (not holdMode) and type(mouse1click) == "function" then
+        local okClick = pcall(mouse1click)
+        if okClick then
+            hardwareFired = true
+        end
+    elseif type(mouse1press) == "function" then
+        local okPress = pcall(mouse1press)
+        if okPress then
+            State.TriggerMouseHeld = true
+            hardwareFired = true
+            if not holdMode then
+                task.delay(0.028, function()
+                    if not State.TriggerHolding then
+                        State.TriggerMouseHeld = false
+                        if type(mouse1release) == "function" then
+                            pcall(mouse1release)
+                        end
+                    end
+                end)
+            end
+        end
     end
 
-    -- 3) Activate equipped Tool if it has Tool.Activated handlers or if no Luau mouse listeners existed
-    if equippedTool and (toolHasActivatedConnections(equippedTool) or not fired) then
+    -- 2) Activate equipped Tool when it uses Tool.Activated or when hardware mouse functions are unavailable
+    if equippedTool and (toolHasActivatedConnections(equippedTool) or not hardwareFired) then
         local okTool = pcall(function()
             equippedTool:Activate()
         end)
         if okTool then
             State.TriggerToolRef = equippedTool
-            fired = true
+            fallbackFired = true
         end
     end
 
-    -- 4) Only use hardware mouse1press/mouse1click on true non-touch PCs; NEVER on touchscreen phones (prevents PC-mode lock)
-    if (not isTouchDevice) and (not fired) then
-        if holdMode and type(mouse1press) == "function" then
-            pcall(mouse1press)
-            State.TriggerMouseHeld = true
-            fired = true
-        elseif (not holdMode) and type(mouse1click) == "function" then
-            pcall(mouse1click)
-            fired = true
-        elseif type(mouse1press) == "function" then
-            pcall(mouse1press)
-            State.TriggerMouseHeld = true
-            task.delay(0.025, function()
-                State.TriggerMouseHeld = false
-                if type(mouse1release) == "function" then
-                    pcall(mouse1release)
-                end
-            end)
-            fired = true
+    -- 3) Fallback pure-Luau Mouse signals only when hardware mouse1press/mouse1click was unavailable or failed
+    if not hardwareFired then
+        if firePlayerMouseSignal("Button1Down") then
+            fallbackFired = true
+        end
+        if dispatchClientMouseSignal(UserInputService.InputBegan, createFakeMouseInput(State.LastTriggerMousePos, true)) then
+            fallbackFired = true
+        end
+        if fallbackFired then
+            if holdMode then
+                State.TriggerFakeMouseHeld = true
+            else
+                local endCenter = State.LastTriggerMousePos
+                task.delay(0.028, function()
+                    if not State.TriggerHolding then
+                        firePlayerMouseSignal("Button1Up")
+                        dispatchClientMouseSignal(UserInputService.InputEnded, createFakeMouseInput(endCenter, false))
+                    end
+                end)
+            end
         end
     end
 
-    if holdMode and fired then
-        State.TriggerFakeMouseHeld = true
+    local anyFired = hardwareFired or fallbackFired
+    if holdMode and anyFired then
         State.TriggerHolding = true
     else
         State.TriggerHolding = false
-        if fired then
-            local endCenter = State.LastTriggerMousePos
+        if fallbackFired and equippedTool then
             local toolToRelease = equippedTool
             task.delay(0.028, function()
-                if not State.TriggerHolding then
-                    firePlayerMouseSignal("Button1Up")
-                    dispatchClientMouseSignal(UserInputService.InputEnded, createFakeMouseInput(endCenter, false))
-                    if toolToRelease and toolToRelease.Parent then
-                        pcall(function()
-                            toolToRelease:Deactivate()
-                        end)
-                    end
+                if not State.TriggerHolding and toolToRelease and toolToRelease.Parent then
+                    pcall(function()
+                        toolToRelease:Deactivate()
+                    end)
                 end
             end)
         end
@@ -2937,7 +3167,7 @@ local function findTriggerTarget(camera, screenCenter)
             elseif Config.TriggerBot.TargetFilter == "Head & Chest" then
                 checkParts = {entry.Head, entry.Torso, entry.RootPart}
             else
-                checkParts = {entry.Head, entry.Torso, entry.RootPart}
+                checkParts = (#entry.RigParts > 0) and entry.RigParts or {entry.Head, entry.Torso, entry.RootPart}
             end
 
             for _, part in ipairs(checkParts) do
@@ -3152,6 +3382,7 @@ local function onRenderStepFrame(dt)
         FOVStroke.Transparency = Config.Aimbot.Enabled and 0.15 or 0.45
     end
 
+    maintainTouchModeState(now)
     updateAimbot(camera, screenCenter, dt)
     updateTriggerBot(camera, screenCenter, now)
     updateAllESP(camera, viewportSize, screenCenter)
@@ -4988,6 +5219,13 @@ local function unloadScript()
     State.Unloaded = true
     State.ReloadToken = State.ReloadToken + 1
     releaseTriggerFire()
+    restoreSuppressedInputConns()
+
+    if State.NamecallHooked and State.OrigNamecall and type(hookmetamethod) == "function" then
+        pcall(hookmetamethod, game, "__namecall", State.OrigNamecall)
+        State.NamecallHooked = false
+        State.OrigNamecall = nil
+    end
 
     pcall(function()
         RunService:UnbindFromRenderStep(RENDER_STEP_NAME)
