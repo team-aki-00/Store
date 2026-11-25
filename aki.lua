@@ -197,9 +197,10 @@ local Config = {
     },
     TriggerBot = {
         Enabled = false,
-        FireMode = "Mouse",             -- Touch-safe Mouse + Client Signals + Mobile Shoot Button + Server Remote
-        HardwareMouse = true,           -- Sends guarded mouse1 input (never calls mousemoveabs on Touch; toggle off for pure Client+Server)
-        ServerRemoteFire = true,        -- Sends weapon RemoteEvent/RemoteFunction fire request to server
+        FireMode = "Mouse",             -- Touch-safe Mouse input (no PC-mode lock, no UI self-clicks)
+        HardwareMouse = true,           -- Uses guarded mouse1press/click with anti-UI & anti-PC-mode protection
+        ServerRemoteFire = false,       -- Optional weapon FireServer/InvokeServer fallback (enable if needed)
+        SyncWithAimbot = true,          -- Syncs lead prediction, Auto Predict, ProjectileSpeed & lock target with Aimbot
         TargetFilter = "Any Part",      -- "Any Part" | "Head & Chest" | "Head Only"
         HoldToFire = false,             -- true = hold trigger while locked; false = timed tap shots
         ReactionDelay = 0.03,           -- 0.00 .. 0.30 seconds
@@ -289,6 +290,9 @@ local State = {
     LastLocalPos = nil,
     Camera = Workspace.CurrentCamera,
     CurrentAimTarget = nil,
+    CurrentAimPart = nil,
+    CurrentAimPredictedPos = nil,
+    CurrentAimFrame = 0,
     IsHoldingAim = false,
     TriggerTarget = nil,
     TriggerAcquireTime = 0,
@@ -306,6 +310,8 @@ local State = {
     LastTriggerMousePos = Vector2.zero,
     TouchGuardToken = 0,
     LastHardwareMouseTime = 0,
+    IsSynthesizingMouse = false,
+    OwnInputFunctions = {},
     PausedLastInputConns = {},
     PausedPreferredInputConns = {},
     PausedCoreInputConns = {},
@@ -333,6 +339,13 @@ local function addConnection(conn)
     table.insert(State.Connections, conn)
     return conn
 end
+
+local function addOwnUserInputConn(signalObj, fn)
+    State.OwnInputFunctions[fn] = true
+    return addConnection(signalObj:Connect(fn))
+end
+
+local TriggerGuard = {}
 
 local function notifyColorUpdated()
     for _, callback in ipairs(State.ColorListeners) do
@@ -2857,20 +2870,20 @@ end
 -- ============================================================================
 -- [SECTION 7] AIMBOT WITH KINEMATIC PREDICTION (WIRED TO ISVALIDTARGET)
 -- ============================================================================
-addConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
-    if gameProcessed then
+addOwnUserInputConn(UserInputService.InputBegan, function(input, gameProcessed)
+    if gameProcessed or TriggerGuard.shouldBlockUiMouseClick(input) then
         return
     end
     if input.UserInputType == Enum.UserInputType.MouseButton2 or input.KeyCode == Enum.KeyCode.E then
         State.IsHoldingAim = true
     end
-end))
+end)
 
-addConnection(UserInputService.InputEnded:Connect(function(input)
+addOwnUserInputConn(UserInputService.InputEnded, function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton2 or input.KeyCode == Enum.KeyCode.E then
         State.IsHoldingAim = false
     end
-end))
+end)
 
 local function isAimbotInputActive()
     if Config.Aimbot.ActivationMode == "Hold" then
@@ -3018,6 +3031,11 @@ local function getLocalPingSeconds()
 end
 
 local function resolveTargetVelocity(entry, part, targetPos, dt)
+    if entry.LastVelFrame == State.FrameIndex and entry.LastTrackedPart == part and isFiniteVector3(entry.EstimatedVel) then
+        return entry.EstimatedVel
+    end
+    entry.LastVelFrame = State.FrameIndex
+
     local pos = isFiniteVector3(targetPos) and targetPos or part.Position
     if not isFiniteVector3(pos) then
         return Vector3.zero
@@ -3096,9 +3114,39 @@ local function evaluateAimCandidate(targetKey, camera, screenCenter)
     return true, entry, aimPart, screenDist, worldDist
 end
 
+local function computePredictedTargetPoint(entry, part, basePos, worldDist, dt)
+    local velocity = resolveTargetVelocity(entry, part, basePos, dt)
+    local projLead = (Config.Aimbot.ProjectileSpeed > 0) and (worldDist / Config.Aimbot.ProjectileSpeed) or 0
+    local leadTime
+    if Config.Aimbot.AutoPredict then
+        local pingSec = getRawPingSeconds()
+        local distFactor = math.clamp(worldDist / 1400, 0, 0.085)
+        local horizSpeed = Vector3.new(velocity.X, 0, velocity.Z).Magnitude
+        local speedScale = math.clamp(horizSpeed / 95, 0.75, 1.35)
+        leadTime = math.clamp((pingSec + distFactor) * speedScale + projLead, 0.015, 0.34)
+    else
+        leadTime = math.clamp(Config.Aimbot.Prediction + projLead + getLocalPingSeconds(), 0, 0.36)
+    end
+
+    local predOffset = velocity * leadTime
+    if not isFiniteVector3(predOffset) then
+        predOffset = Vector3.zero
+    elseif predOffset.Magnitude > 16 then
+        predOffset = predOffset.Unit * 16
+    end
+
+    local predictedPos = basePos + predOffset
+    if not isFiniteVector3(predictedPos) then
+        return basePos, leadTime
+    end
+    return predictedPos, leadTime
+end
+
 local function updateAimbot(camera, screenCenter, dt)
     if not Config.Aimbot.Enabled or not isAimbotInputActive() then
         State.CurrentAimTarget = nil
+        State.CurrentAimPart = nil
+        State.CurrentAimPredictedPos = nil
         return
     end
 
@@ -3142,36 +3190,24 @@ local function updateAimbot(camera, screenCenter, dt)
     end
 
     if not chosenPart or not chosenEntry then
+        State.CurrentAimPart = nil
+        State.CurrentAimPredictedPos = nil
         return
     end
 
     local camPos = camera.CFrame.Position
     local aimBasePos = getAimWorldPosition(chosenEntry, chosenPart, camera, screenCenter)
     if not isFiniteVector3(camPos) or not aimBasePos then
+        State.CurrentAimPart = nil
+        State.CurrentAimPredictedPos = nil
         return
     end
 
-    local velocity = resolveTargetVelocity(chosenEntry, chosenPart, aimBasePos, dt)
-    local projLead = (Config.Aimbot.ProjectileSpeed > 0) and (chosenDist / Config.Aimbot.ProjectileSpeed) or 0
-    local leadTime
-    if Config.Aimbot.AutoPredict then
-        local pingSec = getRawPingSeconds()
-        local distFactor = math.clamp(chosenDist / 1400, 0, 0.085)
-        local horizSpeed = Vector3.new(velocity.X, 0, velocity.Z).Magnitude
-        local speedScale = math.clamp(horizSpeed / 95, 0.75, 1.35)
-        leadTime = math.clamp((pingSec + distFactor) * speedScale + projLead, 0.015, 0.34)
-    else
-        leadTime = math.clamp(Config.Aimbot.Prediction + projLead + getLocalPingSeconds(), 0, 0.36)
-    end
+    local predictedPos = computePredictedTargetPoint(chosenEntry, chosenPart, aimBasePos, chosenDist, dt)
+    State.CurrentAimPart = chosenPart
+    State.CurrentAimPredictedPos = predictedPos
+    State.CurrentAimFrame = State.FrameIndex
 
-    local predOffset = velocity * leadTime
-    if not isFiniteVector3(predOffset) then
-        predOffset = Vector3.zero
-    elseif predOffset.Magnitude > 16 then
-        predOffset = predOffset.Unit * 16
-    end
-
-    local predictedPos = aimBasePos + predOffset
     local aimDelta = predictedPos - camPos
     if (not isFiniteVector3(predictedPos)) or aimDelta.Magnitude < 0.4 then
         return
@@ -3863,29 +3899,49 @@ local function fireWeaponServerRemote(camera, now, equippedTool, targetPart, hit
     return sentAny
 end
 
-local TriggerGuard = {
-    WEAPON_PATTERNS = {
-        "gun",
-        "weapon",
-        "fire",
-        "shoot",
-        "tool",
-        "combat",
-        "attack",
-        "rifle",
-        "pistol",
-        "sniper",
-        "shotgun",
-        "fps",
-        "viewmodel",
-        "equipped",
-        "acs",
-        "blaster",
-        "bow",
-        "bullet",
-        "swep",
-        "backpack",
-    },
+TriggerGuard.WEAPON_PATTERNS = {
+    "gun",
+    "weapon",
+    "fire",
+    "shoot",
+    "tool",
+    "combat",
+    "attack",
+    "rifle",
+    "pistol",
+    "sniper",
+    "shotgun",
+    "fps",
+    "viewmodel",
+    "equipped",
+    "acs",
+    "blaster",
+    "bow",
+    "bullet",
+    "swep",
+    "backpack",
+}
+
+TriggerGuard.UI_NEGATIVE_PATTERNS = {
+    "shop",
+    "store",
+    "menu",
+    "inventory",
+    "emote",
+    "chat",
+    "setting",
+    "trade",
+    "pet",
+    "crate",
+    "case",
+    "hud",
+    "topbar",
+    "slot",
+    "hotbar",
+    "wardrobe",
+    "customize",
+    "leaderboard",
+    "spectate",
 }
 
 function TriggerGuard.isWeaponSourceText(srcText)
@@ -3896,6 +3952,36 @@ function TriggerGuard.isWeaponSourceText(srcText)
         if string.find(srcText, pat, 1, true) then
             return true
         end
+    end
+    return false
+end
+
+function TriggerGuard.isNegativeUiSourceText(srcText)
+    if type(srcText) ~= "string" or srcText == "" or srcText == "|" then
+        return false
+    end
+    for _, pat in ipairs(TriggerGuard.UI_NEGATIVE_PATTERNS) do
+        if string.find(srcText, pat, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+function TriggerGuard.shouldBlockUiMouseClick(input)
+    if input and input.UserInputType == Enum.UserInputType.Touch then
+        return false
+    end
+    local isMouseOrUnknown = (input == nil) or (input.UserInputType == Enum.UserInputType.MouseButton1)
+    if State.IsSynthesizingMouse and isMouseOrUnknown then
+        return true
+    end
+    local sinceHw = os.clock() - (State.LastHardwareMouseTime or 0)
+    if sinceHw < 0.35 and isMouseOrUnknown then
+        if input == nil then
+            return UserInputService.TouchEnabled == true or sinceHw < 0.14
+        end
+        return UserInputService.TouchEnabled == true or sinceHw < 0.14
     end
     return false
 end
@@ -3912,22 +3998,27 @@ local function dispatchClientMouseSignal(signalObj, fakeInput)
     local firedAny = false
     local weaponMatched = false
     for _, conn in ipairs(conns) do
-        if not isBlockedCoreInputConnection(conn) then
+        local isOwn = conn and conn.Function and State.OwnInputFunctions[conn.Function]
+        if (not isOwn) and (not isBlockedCoreInputConnection(conn)) then
             local srcText = getConnectionSourceText(conn)
             local isWeaponConn = TriggerGuard.isWeaponSourceText(srcText)
-            local invoked = pcall(function()
-                if type(conn.Fire) == "function" then
-                    task.spawn(function()
-                        pcall(conn.Fire, conn, fakeInput, false)
-                    end)
-                elseif type(conn.Function) == "function" then
-                    task.spawn(conn.Function, fakeInput, false)
-                end
-            end)
-            if invoked then
-                firedAny = true
-                if isWeaponConn then
-                    weaponMatched = true
+            local isUiConn = (not isWeaponConn) and TriggerGuard.isNegativeUiSourceText(srcText)
+            -- Only invoke scripts that are verified weapon handlers or non-UI client handlers (never blind UI clicks)
+            if (not isUiConn) and (isWeaponConn or srcText == "|" or srcText == "") then
+                local invoked = pcall(function()
+                    if type(conn.Fire) == "function" then
+                        task.spawn(function()
+                            pcall(conn.Fire, conn, fakeInput, false)
+                        end)
+                    elseif type(conn.Function) == "function" then
+                        task.spawn(conn.Function, fakeInput, false)
+                    end
+                end)
+                if invoked then
+                    firedAny = true
+                    if isWeaponConn then
+                        weaponMatched = true
+                    end
                 end
             end
         end
@@ -3961,7 +4052,8 @@ local function firePlayerMouseSignal(signalName)
     local eligibleCount = 0
     local firedAny = false
     for _, conn in ipairs(conns) do
-        if not isBlockedCoreInputConnection(conn) then
+        local isOwn = conn and conn.Function and State.OwnInputFunctions[conn.Function]
+        if (not isOwn) and (not isBlockedCoreInputConnection(conn)) then
             eligibleCount = eligibleCount + 1
             local okCall = pcall(function()
                 if type(conn.Fire) == "function" then
@@ -4033,7 +4125,7 @@ function TriggerGuard.keepTouchGuiActive()
     end
     if State.SavedMouseBehavior ~= nil then
         pcall(function()
-            if UserInputService.MouseBehavior == Enum.MouseBehavior.Default and State.SavedMouseBehavior ~= Enum.MouseBehavior.Default then
+            if UserInputService.MouseBehavior ~= State.SavedMouseBehavior then
                 UserInputService.MouseBehavior = State.SavedMouseBehavior
             end
         end)
@@ -4111,6 +4203,7 @@ function TriggerGuard.restoreLastInputConns()
 end
 
 function TriggerGuard.restoreAll()
+    State.IsSynthesizingMouse = false
     TriggerGuard.restoreCoreInputConns()
     TriggerGuard.restoreLastInputConns()
 end
@@ -4127,6 +4220,39 @@ function TriggerGuard.isPointOverMenu(screenPos)
             and screenPos.Y >= ap.Y and screenPos.Y <= (ap.Y + as.Y)
     end)
     return ok and over == true
+end
+
+function TriggerGuard.hasClickableGuiAtPoint(screenPos, ignoreOwnFloatingPills)
+    if not screenPos then
+        return false
+    end
+    if TriggerGuard.isPointOverMenu(screenPos) then
+        return true
+    end
+    local containers = {}
+    local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if pg then
+        table.insert(containers, pg)
+    end
+    if State.MainGui and State.MainGui.Parent and State.MainGui.Parent ~= pg then
+        table.insert(containers, State.MainGui.Parent)
+    end
+    for _, container in ipairs(containers) do
+        if type(container.GetGuiObjectsAtPosition) == "function" then
+            local okList, objs = pcall(container.GetGuiObjectsAtPosition, container, screenPos.X, screenPos.Y)
+            if okList and type(objs) == "table" then
+                for _, obj in ipairs(objs) do
+                    if obj:IsA("GuiButton") and isGuiButtonTreeVisible(obj) and obj.Active ~= false then
+                        local skipPill = ignoreOwnFloatingPills and State.MainGui and obj:IsDescendantOf(State.MainGui) and ((not State.MainCard) or (not obj:IsDescendantOf(State.MainCard)))
+                        if not skipPill then
+                            return true
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return false
 end
 
 function TriggerGuard.withTouchModePreserved(fn)
@@ -4206,7 +4332,7 @@ function TriggerGuard.withTouchModePreserved(fn)
     end)
 
     -- Keep LastInputTypeChanged & PreferredInput paused across async C++ release + frame jitter before restoring
-    task.delay(0.22, function()
+    task.delay(0.24, function()
         if State.Unloaded or State.TouchGuardToken == myToken then
             TriggerGuard.restoreLastInputConns()
         end
@@ -4228,19 +4354,32 @@ function TriggerGuard.fireExecutorMousePulse(screenCenter, holdMode)
         return false
     end
 
-    local isTouchDevice = UserInputService.TouchEnabled == true
     State.LastHardwareMouseTime = os.clock()
+    State.IsSynthesizingMouse = true
 
     local didFire = TriggerGuard.withTouchModePreserved(function()
-        -- NEVER call mousemoveabs on Touch devices: cursor movement immediately switches mobile clients to PC mode
-        if (not isTouchDevice) and screenCenter and type(mousemoveabs) == "function" then
-            local okBeh, beh = pcall(function()
-                return UserInputService.MouseBehavior
-            end)
-            if (not okBeh) or beh == Enum.MouseBehavior.Default then
-                pcall(mousemoveabs, math.round(screenCenter.X), math.round(screenCenter.Y))
+        -- Move virtual cursor cleanly to center crosshair (never leave cursor parked on Aim/Trigger/HUD buttons!)
+        local movedToCenter = false
+        if screenCenter and type(mousemoveabs) == "function" then
+            local okMove = pcall(mousemoveabs, math.round(screenCenter.X), math.round(screenCenter.Y))
+            if okMove then
+                movedToCenter = true
             end
         end
+
+        local okLoc, loc = pcall(function()
+            return UserInputService:GetMouseLocation()
+        end)
+        local actualLoc = (okLoc and typeof(loc) == "Vector2") and loc or screenCenter
+
+        -- Refuse hardware mouse click if a clickable GuiButton sits right under the click point (prevents self-toggles / clicking everywhere)
+        if TriggerGuard.hasClickableGuiAtPoint(screenCenter, false) then
+            return false
+        end
+        if TriggerGuard.hasClickableGuiAtPoint(actualLoc, movedToCenter) then
+            return false
+        end
+
         if holdMode and hasPress then
             local ok = pcall(mouse1press)
             if ok then
@@ -4262,14 +4401,23 @@ function TriggerGuard.fireExecutorMousePulse(screenCenter, holdMode)
         return false
     end)
 
+    task.defer(function()
+        State.IsSynthesizingMouse = false
+    end)
+
     if didFire and (not holdMode) and State.TriggerMouseHeld then
         task.delay(0.028, function()
             if not State.TriggerHolding and State.TriggerMouseHeld then
                 State.TriggerMouseHeld = false
                 if type(mouse1release) == "function" then
+                    State.LastHardwareMouseTime = os.clock()
+                    State.IsSynthesizingMouse = true
                     TriggerGuard.withTouchModePreserved(function()
                         pcall(mouse1release)
                         return true
+                    end)
+                    task.defer(function()
+                        State.IsSynthesizingMouse = false
                     end)
                 end
             end
@@ -4301,9 +4449,14 @@ releaseTriggerFire = function()
     if State.TriggerMouseHeld then
         State.TriggerMouseHeld = false
         if type(mouse1release) == "function" then
+            State.LastHardwareMouseTime = os.clock()
+            State.IsSynthesizingMouse = true
             TriggerGuard.withTouchModePreserved(function()
                 pcall(mouse1release)
                 return true
+            end)
+            task.defer(function()
+                State.IsSynthesizingMouse = false
             end)
         end
     end
@@ -4317,23 +4470,12 @@ local function triggerOnceOrPress(camera, screenCenter, now, holdMode, targetPar
     local localChar = State.LocalCharacter or LocalPlayer.Character
     local equippedTool = localChar and localChar:FindFirstChildOfClass("Tool") or nil
     local mode = Config.TriggerBot.FireMode or "Mouse"
-    local isTouchDevice = UserInputService.TouchEnabled == true
     local firedAny = false
     local strongClientFired = false
 
     State.LastTriggerMousePos = screenCenter or Vector2.new(640, 360)
 
-    -- 1) Smart mode prioritizes native Mobile Shoot button first if detected
-    if mode == "Smart" then
-        local shootBtn = findMobileShootButton(now)
-        if shootBtn and fireMobileShootButton(shootBtn, true, not holdMode) then
-            State.TriggerGuiBtn = shootBtn
-            strongClientFired = true
-            firedAny = true
-        end
-    end
-
-    -- 2) Equipped Tool activation (classic tools + local tool scripts)
+    -- 1) Equipped Tool activation (classic tools + local tool scripts)
     if equippedTool then
         local hasActivatedConns = toolHasActivatedConnections(equippedTool)
         local okTool = pcall(function()
@@ -4343,7 +4485,7 @@ local function triggerOnceOrPress(camera, screenCenter, now, holdMode, targetPar
         if okTool then
             State.TriggerToolRef = equippedTool
             firedAny = true
-            if invokedAct and hasActivatedConns and (not isTouchDevice) then
+            if invokedAct and hasActivatedConns then
                 strongClientFired = true
             end
         elseif invokedAct then
@@ -4351,38 +4493,33 @@ local function triggerOnceOrPress(camera, screenCenter, now, holdMode, targetPar
         end
     end
 
-    -- 3) Client-level Mouse Signals + Touch-Preserved Executor Mouse Input
-    if mode == "Mouse" or (mode == "Smart" and not strongClientFired) then
-        local pmFired = firePlayerMouseSignal("Button1Down")
-        if pmFired then
-            strongClientFired = true
-            firedAny = true
-        end
-
-        local inputAny, inputWeapon = dispatchClientMouseSignal(
-            UserInputService.InputBegan,
-            createFakeInputObject(Enum.UserInputType.MouseButton1, State.LastTriggerMousePos, true)
-        )
-        if inputAny then
-            firedAny = true
-            if holdMode then
-                State.TriggerFakeMouseHeld = true
-            end
-        end
-        if inputWeapon and (not isTouchDevice) then
-            strongClientFired = true
-        end
-
-        if TriggerGuard.fireExecutorMousePulse(State.LastTriggerMousePos, holdMode) then
-            firedAny = true
-            if not isTouchDevice then
-                strongClientFired = true
-            end
-        end
+    -- 2) Mouse Fire Channel: PlayerMouse + weapon-filtered InputBegan + Touch-safe executor mouse1
+    if firePlayerMouseSignal("Button1Down") then
+        strongClientFired = true
+        firedAny = true
     end
 
-    -- 4) Mobile Shoot Button dispatch (runs in Mouse mode when no dedicated mobile mouse handler consumed it)
-    if (not strongClientFired) and (mode == "Mouse" or mode == "Smart") then
+    local inputAny, inputWeapon = dispatchClientMouseSignal(
+        UserInputService.InputBegan,
+        createFakeInputObject(Enum.UserInputType.MouseButton1, State.LastTriggerMousePos, true)
+    )
+    if inputAny then
+        firedAny = true
+        if holdMode then
+            State.TriggerFakeMouseHeld = true
+        end
+    end
+    if inputWeapon then
+        strongClientFired = true
+    end
+
+    if TriggerGuard.fireExecutorMousePulse(State.LastTriggerMousePos, holdMode) then
+        strongClientFired = true
+        firedAny = true
+    end
+
+    -- 3) Mobile Shoot Button fallback (only if mouse did not confirm or Mouse + Remote mode requested)
+    if (not strongClientFired) and mode ~= "Mouse" then
         local shootBtn = findMobileShootButton(now)
         if shootBtn and fireMobileShootButton(shootBtn, true, not holdMode) then
             State.TriggerGuiBtn = shootBtn
@@ -4391,8 +4528,8 @@ local function triggerOnceOrPress(camera, screenCenter, now, holdMode, targetPar
         end
     end
 
-    -- 5) Server Remote Fire Request (explicit Remote mode, or on Mobile/desktop when no dedicated client handler confirmed)
-    if Config.TriggerBot.ServerRemoteFire and (mode == "Remote" or not strongClientFired) then
+    -- 4) Optional Server Remote Fire Request (Mouse + Remote mode or explicit ServerRemoteFire toggle)
+    if Config.TriggerBot.ServerRemoteFire and (mode == "Mouse + Remote" or not strongClientFired) then
         if fireWeaponServerRemote(camera, now, equippedTool, targetPart, hitWorldPos) then
             firedAny = true
         end
@@ -4462,7 +4599,7 @@ local function findEntryForHitPart(hitPart)
     return nil, nil
 end
 
-local function findTriggerTarget(camera, screenCenter)
+local function findTriggerTarget(camera, screenCenter, dt)
     local maxDist = Config.TriggerBot.MaxDistance
     local origin = camera.CFrame.Position
     local dirUnit = camera.CFrame.LookVector
@@ -4536,14 +4673,52 @@ local function findTriggerTarget(camera, screenCenter)
         end
     end
 
-    -- Pass 2: Crosshair Tolerance Sweep (catches fast-moving targets within N px of center reticle)
+    -- Pass 2: Aimbot Lock & Prediction Synchronization (fires when crosshair aligns with Aimbot's predicted lead point)
+    local syncTol = math.max(Config.TriggerBot.CrosshairTolerance, 6)
+    if Config.TriggerBot.SyncWithAimbot and Config.Aimbot.Enabled and State.CurrentAimTarget and State.CurrentAimFrame == State.FrameIndex then
+        local aimKey = State.CurrentAimTarget
+        local aimEntry = Registry[aimKey]
+        local aimPart = State.CurrentAimPart
+        local predPos = State.CurrentAimPredictedPos
+        if aimEntry and aimPart and aimPart.Parent and predPos then
+            local filterOk = (Config.TriggerBot.TargetFilter == "Any Part") or partMatchesTriggerFilter(aimPart, aimEntry)
+            if filterOk then
+                local vpPred, onPred = camera:WorldToViewportPoint(predPos)
+                local predDist = (vpPred.Z > 0 and onPred) and (Vector2.new(vpPred.X, vpPred.Y) - screenCenter).Magnitude or math.huge
+                local vpReal, onReal = camera:WorldToViewportPoint(aimPart.Position)
+                local realDist = (vpReal.Z > 0 and onReal) and (Vector2.new(vpReal.X, vpReal.Y) - screenCenter).Magnitude or math.huge
+                if predDist <= math.max(syncTol, 8) or realDist <= syncTol then
+                    local valid = IsValidTarget(aimKey, {
+                        checkTeam = Config.TriggerBot.TeamCheck,
+                        checkVisible = Config.TriggerBot.VisibleCheck,
+                        ignoreBots = Config.TriggerBot.IgnoreBots,
+                        maxDistance = maxDist,
+                        camera = camera,
+                        targetPart = aimPart,
+                    })
+                    if valid then
+                        return aimKey, aimEntry, aimPart, predPos
+                    end
+                end
+            end
+        end
+    end
+
+    -- Pass 3: Crosshair Tolerance + Predicted Lead Sweep (catches fast-moving targets & predicted Aimbot leads within N px)
     local tol = Config.TriggerBot.CrosshairTolerance
-    if tol > 0 then
+    local usePredSweep = Config.TriggerBot.SyncWithAimbot and (
+        Config.Aimbot.AutoPredict
+        or Config.Aimbot.Prediction > 0
+        or Config.Aimbot.ProjectileSpeed > 0
+        or Config.Aimbot.PingCompensation
+    )
+    if tol > 0 or usePredSweep then
+        local sweepTol = math.max(tol, usePredSweep and 6 or 0)
         local bestKey = nil
         local bestEntry = nil
         local bestPart = nil
         local bestPos = nil
-        local bestScreenDist = tol + 0.001
+        local bestScreenDist = sweepTol + 0.001
 
         for targetKey, entry in pairs(Registry) do
             local checkParts
@@ -4565,25 +4740,42 @@ local function findTriggerTarget(camera, screenCenter)
                             checkPos = bonePos
                         end
                     end
+
+                    local sDist = math.huge
+                    local matchedPos = checkPos
                     local vp, onScreen = camera:WorldToViewportPoint(checkPos)
                     if vp.Z > 0 and onScreen then
-                        local sDist = (Vector2.new(vp.X, vp.Y) - screenCenter).Magnitude
-                        if sDist <= bestScreenDist then
-                            local valid = IsValidTarget(targetKey, {
-                                checkTeam = Config.TriggerBot.TeamCheck,
-                                checkVisible = Config.TriggerBot.VisibleCheck,
-                                ignoreBots = Config.TriggerBot.IgnoreBots,
-                                maxDistance = maxDist,
-                                camera = camera,
-                                targetPart = part,
-                            })
-                            if valid then
-                                bestScreenDist = sDist
-                                bestKey = targetKey
-                                bestEntry = entry
-                                bestPart = part
-                                bestPos = checkPos
+                        sDist = (Vector2.new(vp.X, vp.Y) - screenCenter).Magnitude
+                    end
+
+                    if usePredSweep then
+                        local worldDist = (checkPos - origin).Magnitude
+                        local predPos = computePredictedTargetPoint(entry, part, checkPos, worldDist, dt or (1 / 60))
+                        local vpP, onP = camera:WorldToViewportPoint(predPos)
+                        if vpP.Z > 0 and onP then
+                            local pDist = (Vector2.new(vpP.X, vpP.Y) - screenCenter).Magnitude
+                            if pDist < sDist then
+                                sDist = pDist
+                                matchedPos = predPos
                             end
+                        end
+                    end
+
+                    if sDist <= bestScreenDist then
+                        local valid = IsValidTarget(targetKey, {
+                            checkTeam = Config.TriggerBot.TeamCheck,
+                            checkVisible = Config.TriggerBot.VisibleCheck,
+                            ignoreBots = Config.TriggerBot.IgnoreBots,
+                            maxDistance = maxDist,
+                            camera = camera,
+                            targetPart = part,
+                        })
+                        if valid then
+                            bestScreenDist = sDist
+                            bestKey = targetKey
+                            bestEntry = entry
+                            bestPart = part
+                            bestPos = matchedPos
                         end
                     end
                 end
@@ -4598,7 +4790,7 @@ local function findTriggerTarget(camera, screenCenter)
     return nil, nil, nil, nil
 end
 
-local function updateTriggerBot(camera, screenCenter, now)
+local function updateTriggerBot(camera, screenCenter, now, dt)
     if not Config.TriggerBot.Enabled or not State.LocalAlive then
         State.TriggerTarget = nil
         State.TriggerAcquireTime = 0
@@ -4607,7 +4799,7 @@ local function updateTriggerBot(camera, screenCenter, now)
         return
     end
 
-    local targetPlayer, _, targetPart, hitWorldPos = findTriggerTarget(camera, screenCenter)
+    local targetPlayer, _, targetPart, hitWorldPos = findTriggerTarget(camera, screenCenter, dt)
     local locked = (targetPlayer ~= nil)
 
     if Config.TriggerBot.ShowIndicator then
@@ -4794,7 +4986,7 @@ local function onRenderStepFrame(dt)
     end
 
     updateAimbot(camera, screenCenter, dt)
-    updateTriggerBot(camera, screenCenter, now)
+    updateTriggerBot(camera, screenCenter, now, dt)
     updateAllESP(camera, viewportSize, screenCenter)
 end
 
@@ -5327,6 +5519,9 @@ do
     local startPos = nil
 
     headerBar.InputBegan:Connect(function(input)
+        if TriggerGuard.shouldBlockUiMouseClick(input) then
+            return
+        end
         if not activeInput and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
             activeInput = input
             dragStart = input.Position
@@ -5334,7 +5529,7 @@ do
         end
     end)
 
-    addConnection(UserInputService.InputChanged:Connect(function(input)
+    addOwnUserInputConn(UserInputService.InputChanged, function(input)
         if activeInput and dragStart and startPos then
             if input == activeInput or (activeInput.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseMovement) then
                 local scale = math.max(RootScale.Scale, 0.5)
@@ -5354,13 +5549,13 @@ do
                 )
             end
         end
-    end))
+    end)
 
-    addConnection(UserInputService.InputEnded:Connect(function(input)
+    addOwnUserInputConn(UserInputService.InputEnded, function(input)
         if input == activeInput then
             activeInput = nil
         end
-    end))
+    end)
 end
 
 local TabPages = {}
@@ -5482,7 +5677,22 @@ do
         corner.CornerRadius = UDim.new(0, 8)
         corner.Parent = btn
 
-        btn.Activated:Connect(function()
+        local hadTabPress = false
+        btn.InputBegan:Connect(function(input)
+            if TriggerGuard.shouldBlockUiMouseClick(input) then
+                return
+            end
+            if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+                hadTabPress = true
+            end
+        end)
+
+        btn.Activated:Connect(function(inputObj)
+            if (not hadTabPress) or TriggerGuard.shouldBlockUiMouseClick(inputObj) then
+                hadTabPress = false
+                return
+            end
+            hadTabPress = false
             switchTab(tabName)
         end)
 
@@ -5500,6 +5710,9 @@ local syncMobileTriggerVisibility = function() end
 local function SyncDependentSettings(needsFullReload, reason)
     if not Config.Aimbot.Enabled then
         State.CurrentAimTarget = nil
+        State.CurrentAimPart = nil
+        State.CurrentAimPredictedPos = nil
+        State.CurrentAimFrame = 0
     end
     if not Config.TriggerBot.Enabled then
         State.TriggerTarget = nil
@@ -5525,16 +5738,21 @@ local function SyncDependentSettings(needsFullReload, reason)
     end
 end
 
--- Scroll-guarded tap handler so vertical scrolling on mobile never triggers accidental mis-touches
+-- Scroll-guarded tap handler so vertical scrolling on mobile never triggers accidental mis-touches or TriggerBot mouse clicks
 local function bindSafeTap(btn, scrollParent, callback)
     local isScrollingFrame = scrollParent and scrollParent:IsA("ScrollingFrame")
     local trackedInput = nil
     local startPos = nil
     local startCanvasY = 0
     local maxMove = 0
+    local hadValidPress = false
 
     btn.InputBegan:Connect(function(input)
+        if TriggerGuard.shouldBlockUiMouseClick(input) then
+            return
+        end
         if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            hadValidPress = true
             trackedInput = input
             startPos = input.Position
             startCanvasY = isScrollingFrame and scrollParent.CanvasPosition.Y or 0
@@ -5542,7 +5760,7 @@ local function bindSafeTap(btn, scrollParent, callback)
         end
     end)
 
-    addConnection(UserInputService.InputChanged:Connect(function(input)
+    addOwnUserInputConn(UserInputService.InputChanged, function(input)
         if not trackedInput or not startPos then
             return
         end
@@ -5552,9 +5770,9 @@ local function bindSafeTap(btn, scrollParent, callback)
                 maxMove = dist
             end
         end
-    end))
+    end)
 
-    addConnection(UserInputService.InputEnded:Connect(function(input)
+    addOwnUserInputConn(UserInputService.InputEnded, function(input)
         if input == trackedInput then
             local dist = startPos and (Vector2.new(input.Position.X, input.Position.Y) - Vector2.new(startPos.X, startPos.Y)).Magnitude or 0
             if dist > maxMove then
@@ -5562,11 +5780,13 @@ local function bindSafeTap(btn, scrollParent, callback)
             end
             trackedInput = nil
         end
-    end))
+    end)
 
-    btn.Activated:Connect(function()
+    btn.Activated:Connect(function(inputObj)
+        local blocked = TriggerGuard.shouldBlockUiMouseClick(inputObj) or (not hadValidPress)
         local canvasDelta = isScrollingFrame and math.abs(scrollParent.CanvasPosition.Y - startCanvasY) or 0
-        local wasCleanTap = (maxMove <= 8) and (canvasDelta <= 4)
+        local wasCleanTap = (not blocked) and (maxMove <= 8) and (canvasDelta <= 4)
+        hadValidPress = false
         trackedInput = nil
         startPos = nil
         maxMove = 0
@@ -5835,6 +6055,9 @@ local function addSlider(parent, order, title, minVal, maxVal, step, formatFn, g
     end
 
     trackHitbox.InputBegan:Connect(function(input)
+        if TriggerGuard.shouldBlockUiMouseClick(input) then
+            return
+        end
         if not pendingInput and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
             pendingInput = input
             dragStartPos = input.Position
@@ -5851,7 +6074,7 @@ local function addSlider(parent, order, title, minVal, maxVal, step, formatFn, g
         end
     end)
 
-    addConnection(UserInputService.InputChanged:Connect(function(input)
+    addOwnUserInputConn(UserInputService.InputChanged, function(input)
         if not pendingInput or not dragStartPos then
             return
         end
@@ -5881,9 +6104,9 @@ local function addSlider(parent, order, title, minVal, maxVal, step, formatFn, g
                 updateFromInput(input.Position.X)
             end
         end
-    end))
+    end)
 
-    addConnection(UserInputService.InputEnded:Connect(function(input)
+    addOwnUserInputConn(UserInputService.InputEnded, function(input)
         if input == pendingInput then
             local dx = dragStartPos and math.abs(input.Position.X - dragStartPos.X) or 0
             local dy = dragStartPos and math.abs(input.Position.Y - dragStartPos.Y) or 0
@@ -5898,7 +6121,7 @@ local function addSlider(parent, order, title, minVal, maxVal, step, formatFn, g
                 parent.ScrollingEnabled = true
             end
         end
-    end))
+    end)
 
     return sync
 end
@@ -6145,45 +6368,54 @@ end
 do
     local TriggerPage = TabPages["Trigger"]
     addSectionHeader(TriggerPage, 1, "Trigger Bot Engine")
-    addToggle(TriggerPage, 2, "Enable Trigger Bot", "Fires mouse input safely on mobile without PC-mode lock", function()
+    addToggle(TriggerPage, 2, "Enable Trigger Bot", "Mouse input stays ON after shots without PC-mode lock or self-clicks", function()
         return Config.TriggerBot.Enabled
     end, function(v)
         Config.TriggerBot.Enabled = v
         Config.UI.MobileTriggerLocked = v
     end)
 
-    addSelector(TriggerPage, 3, "Fire Method", {"Mouse", "Smart", "Remote"}, function()
+    addToggle(TriggerPage, 3, "Sync With Aimbot & Prediction", "Syncs lead prediction, Auto Predict, ProjectileSpeed & Aimbot target lock", function()
+        return Config.TriggerBot.SyncWithAimbot
+    end, function(v)
+        Config.TriggerBot.SyncWithAimbot = v
+    end)
+
+    addSelector(TriggerPage, 4, "Fire Method", {"Mouse", "Mouse + Remote"}, function()
         return Config.TriggerBot.FireMode
     end, function(v)
         Config.TriggerBot.FireMode = v
+        if v == "Mouse + Remote" then
+            Config.TriggerBot.ServerRemoteFire = true
+        end
     end, false)
 
-    addToggle(TriggerPage, 4, "Hardware Mouse Click (mouse1)", "Touch-guarded mouse1 (turn OFF for 100% pure Client + Server)", function()
+    addToggle(TriggerPage, 5, "Hardware Mouse Click (mouse1)", "Center-aimed Touch-guarded mouse1 (blocks clicks on Aim/Trigger/HUD UI)", function()
         return Config.TriggerBot.HardwareMouse
     end, function(v)
         Config.TriggerBot.HardwareMouse = v
     end)
 
-    addToggle(TriggerPage, 5, "Server Remote Fire", "Sends weapon FireServer / InvokeServer request directly to server", function()
+    addToggle(TriggerPage, 6, "Server Remote Fire", "Optional FireServer / InvokeServer backup when Mouse + Remote is used", function()
         return Config.TriggerBot.ServerRemoteFire
     end, function(v)
         Config.TriggerBot.ServerRemoteFire = v
     end)
 
-    addToggle(TriggerPage, 6, "Hold Fire While Locked", "Hold trigger continuously vs timed tap shots", function()
+    addToggle(TriggerPage, 7, "Hold Fire While Locked", "Hold trigger continuously vs timed tap shots", function()
         return Config.TriggerBot.HoldToFire
     end, function(v)
         Config.TriggerBot.HoldToFire = v
     end)
 
-    addSectionHeader(TriggerPage, 7, "Hitbox & Timing")
-    addSelector(TriggerPage, 8, "Target Part Filter", {"Any Part", "Head & Chest", "Head Only"}, function()
+    addSectionHeader(TriggerPage, 8, "Hitbox & Timing")
+    addSelector(TriggerPage, 9, "Target Part Filter", {"Any Part", "Head & Chest", "Head Only"}, function()
         return Config.TriggerBot.TargetFilter
     end, function(v)
         Config.TriggerBot.TargetFilter = v
     end, false)
 
-    addSlider(TriggerPage, 9, "Crosshair Tolerance", 0, 28, 1, function(v)
+    addSlider(TriggerPage, 10, "Crosshair Tolerance", 0, 28, 1, function(v)
         local n = math.round(v)
         return (n == 0) and "0 px (Exact)" or string.format("%d px", n)
     end, function()
@@ -6192,7 +6424,7 @@ do
         Config.TriggerBot.CrosshairTolerance = math.round(v)
     end)
 
-    addSlider(TriggerPage, 10, "Reaction Delay", 0.00, 0.30, 0.01, function(v)
+    addSlider(TriggerPage, 11, "Reaction Delay", 0.00, 0.30, 0.01, function(v)
         return string.format("%.2fs", v)
     end, function()
         return Config.TriggerBot.ReactionDelay
@@ -6200,7 +6432,7 @@ do
         Config.TriggerBot.ReactionDelay = v
     end)
 
-    addSlider(TriggerPage, 11, "Shot Cooldown", 0.02, 0.60, 0.01, function(v)
+    addSlider(TriggerPage, 12, "Shot Cooldown", 0.02, 0.60, 0.01, function(v)
         return string.format("%.2fs", v)
     end, function()
         return Config.TriggerBot.ShotCooldown
@@ -6208,27 +6440,27 @@ do
         Config.TriggerBot.ShotCooldown = v
     end)
 
-    addSectionHeader(TriggerPage, 12, "Checks & Reticle HUD")
-    addToggle(TriggerPage, 13, "Ignore Bots (Trigger)", "Skips NPCs/bots when Trigger Bot is active", function()
+    addSectionHeader(TriggerPage, 13, "Checks & Reticle HUD")
+    addToggle(TriggerPage, 14, "Ignore Bots (Trigger)", "Skips NPCs/bots when Trigger Bot is active", function()
         return Config.TriggerBot.IgnoreBots
     end, function(v)
         Config.TriggerBot.IgnoreBots = v
         syncWorkspaceBots()
     end)
 
-    addToggle(TriggerPage, 14, "Trigger Team Check", "Never shoots teammates (FFA-safe Auto mode)", function()
+    addToggle(TriggerPage, 15, "Trigger Team Check", "Never shoots teammates (FFA-safe Auto mode)", function()
         return Config.TriggerBot.TeamCheck
     end, function(v)
         Config.TriggerBot.TeamCheck = v
     end)
 
-    addToggle(TriggerPage, 15, "Trigger Visible Check", "Blocks shots when enemy is behind walls", function()
+    addToggle(TriggerPage, 16, "Trigger Visible Check", "Blocks shots when enemy is behind walls", function()
         return Config.TriggerBot.VisibleCheck
     end, function(v)
         Config.TriggerBot.VisibleCheck = v
     end)
 
-    addToggle(TriggerPage, 16, "Show Crosshair Indicator", "Center reticle dot pulses mint when target locked", function()
+    addToggle(TriggerPage, 17, "Show Crosshair Indicator", "Center reticle dot pulses mint when target locked", function()
         return Config.TriggerBot.ShowIndicator
     end, function(v)
         Config.TriggerBot.ShowIndicator = v
@@ -6855,6 +7087,9 @@ local function makeDraggableButton(btn, onTap)
     local startPos = nil
 
     btn.InputBegan:Connect(function(input)
+        if TriggerGuard.shouldBlockUiMouseClick(input) then
+            return
+        end
         if not activeInput and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
             activeInput = input
             movedDist = 0
@@ -6863,7 +7098,7 @@ local function makeDraggableButton(btn, onTap)
         end
     end)
 
-    addConnection(UserInputService.InputChanged:Connect(function(input)
+    addOwnUserInputConn(UserInputService.InputChanged, function(input)
         if activeInput and dragStart and startPos then
             if input == activeInput or (activeInput.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseMovement) then
                 local scale = math.max(RootScale.Scale, 0.5)
@@ -6887,16 +7122,19 @@ local function makeDraggableButton(btn, onTap)
                 end
             end
         end
-    end))
+    end)
 
-    addConnection(UserInputService.InputEnded:Connect(function(input)
+    addOwnUserInputConn(UserInputService.InputEnded, function(input)
         if input == activeInput then
             activeInput = nil
+            if TriggerGuard.shouldBlockUiMouseClick(input) then
+                return
+            end
             if movedDist <= 6 then
                 onTap()
             end
         end
-    end))
+    end)
 end
 
 local function setPanelVisible(visible)
@@ -6961,16 +7199,16 @@ makeDraggableButton(MobileTriggerBtn, function()
 end)
 
 if UI.MinimizeBtn then
-    UI.MinimizeBtn.Activated:Connect(function()
+    bindSafeTap(UI.MinimizeBtn, nil, function()
         setPanelVisible(false)
     end)
 end
 
-addConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
+addOwnUserInputConn(UserInputService.InputBegan, function(input, gameProcessed)
     if not gameProcessed and input.KeyCode == Enum.KeyCode.RightShift then
         setPanelVisible(not Config.UI.Visible)
     end
-end))
+end)
 
 bindSafeTap(ForceReloadBtn, SettingsPage, function()
     ReloadAllSystems("ManualButton", true)
@@ -7076,6 +7314,6 @@ end
 globalEnv.TEAM_AKI_UNLOAD = unloadScript
 
 if UI.UnloadHeaderBtn then
-    UI.UnloadHeaderBtn.Activated:Connect(unloadScript)
+    bindSafeTap(UI.UnloadHeaderBtn, nil, unloadScript)
 end
 bindSafeTap(UnloadBtn, SettingsPage, unloadScript)
