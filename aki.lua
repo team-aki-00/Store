@@ -28,7 +28,14 @@ local clonerefFn = (type(cloneref) == "function" and cloneref) or function(obj)
 end
 
 local function getService(name)
-    return clonerefFn(game:GetService(name))
+    local svc = game:GetService(name)
+    if type(cloneref) == "function" then
+        local ok, cloned = pcall(cloneref, svc)
+        if ok and cloned ~= nil then
+            return cloned
+        end
+    end
+    return svc
 end
 
 local function tryGetService(name)
@@ -97,6 +104,32 @@ local function getSafeGuiParent()
         end
     end
     return LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 5) or CoreGui
+end
+
+local function mountGuiSafely(gui)
+    local candidates = {}
+    if type(gethui) == "function" then
+        local ok, hui = pcall(gethui)
+        if ok and typeof(hui) == "Instance" then
+            table.insert(candidates, hui)
+        end
+    end
+    if CoreGui then
+        table.insert(candidates, CoreGui)
+    end
+    local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 5)
+    if pg then
+        table.insert(candidates, pg)
+    end
+    for _, parent in ipairs(candidates) do
+        local ok = pcall(function()
+            gui.Parent = parent
+        end)
+        if ok and gui.Parent ~= nil then
+            return true
+        end
+    end
+    return false
 end
 
 local function cleanupOrphanGuis()
@@ -243,6 +276,8 @@ local Registry = {}
 
 local State = {
     Unloaded = false,
+    MainGui = nil,
+    OverlayGui = nil,
     Connections = {},
     LocalConns = {},
     LocalCharacter = nil,
@@ -303,7 +338,8 @@ OverlayGui.ResetOnSpawn = false
 OverlayGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 OverlayGui.DisplayOrder = 999
 protectGui(OverlayGui)
-OverlayGui.Parent = getSafeGuiParent()
+mountGuiSafely(OverlayGui)
+State.OverlayGui = OverlayGui
 
 local EspContainer = Instance.new("Folder")
 EspContainer.Name = "ESP_Elements"
@@ -325,11 +361,13 @@ end
 
 local HighlightContainer = Instance.new("Folder")
 HighlightContainer.Name = "TEAM_AKI_Highlights"
-local okHighlightParent = pcall(function()
-    HighlightContainer.Parent = getHighlightParent()
-end)
-if not okHighlightParent or not HighlightContainer.Parent then
-    HighlightContainer.Parent = OverlayGui
+do
+    local okHighlightParent = pcall(function()
+        HighlightContainer.Parent = getHighlightParent()
+    end)
+    if not okHighlightParent or not HighlightContainer.Parent then
+        HighlightContainer.Parent = OverlayGui
+    end
 end
 
 local DrawingSupported = false
@@ -410,10 +448,6 @@ FOVRingFrame.BackgroundTransparency = 1
 FOVRingFrame.Visible = false
 FOVRingFrame.Parent = OverlayGui
 
-local FOVCorner = Instance.new("UICorner")
-FOVCorner.CornerRadius = UDim.new(1, 0)
-FOVCorner.Parent = FOVRingFrame
-
 local FOVStroke = Instance.new("UIStroke")
 FOVStroke.Thickness = Config.Aimbot.FOVThickness
 FOVStroke.Transparency = 0.2
@@ -432,15 +466,21 @@ TriggerDot.Visible = false
 TriggerDot.ZIndex = 6
 TriggerDot.Parent = OverlayGui
 
-local TriggerDotCorner = Instance.new("UICorner")
-TriggerDotCorner.CornerRadius = UDim.new(1, 0)
-TriggerDotCorner.Parent = TriggerDot
+do
+    local fovCorner = Instance.new("UICorner")
+    fovCorner.CornerRadius = UDim.new(1, 0)
+    fovCorner.Parent = FOVRingFrame
 
-local TriggerDotStroke = Instance.new("UIStroke")
-TriggerDotStroke.Thickness = 1.2
-TriggerDotStroke.Color = Color3.fromRGB(11, 13, 20)
-TriggerDotStroke.Transparency = 0.2
-TriggerDotStroke.Parent = TriggerDot
+    local dotCorner = Instance.new("UICorner")
+    dotCorner.CornerRadius = UDim.new(1, 0)
+    dotCorner.Parent = TriggerDot
+
+    local dotStroke = Instance.new("UIStroke")
+    dotStroke.Thickness = 1.2
+    dotStroke.Color = Color3.fromRGB(11, 13, 20)
+    dotStroke.Transparency = 0.2
+    dotStroke.Parent = TriggerDot
+end
 
 local function createRegistryVisualBundle()
     local guiRoot = Instance.new("Folder")
@@ -3469,7 +3509,7 @@ local function findMobileShootButton(now)
     for _, gui in ipairs(pg:GetChildren()) do
         if gui:IsA("ScreenGui") and gui.Enabled ~= false then
             local gName = string.lower(gui.Name)
-            local skipGui = (gui == MainGui or gui == OverlayGui)
+            local skipGui = (gui == State.MainGui or gui == State.OverlayGui)
                 or string.find(gName, "team_aki", 1, true)
                 or gName == "touchgui"
                 or gName == "chat"
@@ -4536,7 +4576,10 @@ MainGui.ResetOnSpawn = false
 MainGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 MainGui.DisplayOrder = 1000
 protectGui(MainGui)
-MainGui.Parent = getSafeGuiParent()
+mountGuiSafely(MainGui)
+State.MainGui = MainGui
+
+local UI = {}
 
 local Palette = {
     GlassBase = Color3.fromRGB(11, 13, 20),
@@ -4594,10 +4637,6 @@ CardShadow.BorderSizePixel = 0
 CardShadow.ZIndex = 1
 CardShadow.Parent = MainGui
 
-local ShadowCorner = Instance.new("UICorner")
-ShadowCorner.CornerRadius = UDim.new(0, 26)
-ShadowCorner.Parent = CardShadow
-
 local MainCard = Instance.new("Frame")
 MainCard.Name = "MainCard"
 MainCard.AnchorPoint = Vector2.new(0.5, 0.5)
@@ -4610,177 +4649,185 @@ MainCard.ClipsDescendants = true
 MainCard.ZIndex = 2
 MainCard.Parent = MainGui
 
-local MainCorner = Instance.new("UICorner")
-MainCorner.CornerRadius = UDim.new(0, 18)
-MainCorner.Parent = MainCard
+do
+    local shadowCorner = Instance.new("UICorner")
+    shadowCorner.CornerRadius = UDim.new(0, 26)
+    shadowCorner.Parent = CardShadow
 
-applyGlassStroke(MainCard, 1.35, 0.72)
+    local mainCorner = Instance.new("UICorner")
+    mainCorner.CornerRadius = UDim.new(0, 18)
+    mainCorner.Parent = MainCard
 
-local GlassGradient = Instance.new("UIGradient")
-GlassGradient.Color = ColorSequence.new({
-    ColorSequenceKeypoint.new(0, Color3.fromRGB(22, 28, 44)),
-    ColorSequenceKeypoint.new(0.55, Color3.fromRGB(11, 13, 20)),
-    ColorSequenceKeypoint.new(1, Color3.fromRGB(17, 22, 34)),
-})
-GlassGradient.Rotation = 135
-GlassGradient.Parent = MainCard
+    applyGlassStroke(MainCard, 1.35, 0.72)
 
-local FrostedOverlay = Instance.new("Frame")
-FrostedOverlay.Name = "FrostedOverlay"
-FrostedOverlay.AnchorPoint = Vector2.new(0.5, 0)
-FrostedOverlay.Position = UDim2.new(0.5, 0, 0, -56)
-FrostedOverlay.Size = UDim2.new(0.84, 0, 0, 108)
-FrostedOverlay.BackgroundColor3 = Palette.PrimaryAccent
-FrostedOverlay.BackgroundTransparency = 0.90
-FrostedOverlay.BorderSizePixel = 0
-FrostedOverlay.ZIndex = 2
-FrostedOverlay.Parent = MainCard
+    local glassGradient = Instance.new("UIGradient")
+    glassGradient.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(22, 28, 44)),
+        ColorSequenceKeypoint.new(0.55, Color3.fromRGB(11, 13, 20)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(17, 22, 34)),
+    })
+    glassGradient.Rotation = 135
+    glassGradient.Parent = MainCard
 
-local FrostCorner = Instance.new("UICorner")
-FrostCorner.CornerRadius = UDim.new(1, 0)
-FrostCorner.Parent = FrostedOverlay
+    local frostedOverlay = Instance.new("Frame")
+    frostedOverlay.Name = "FrostedOverlay"
+    frostedOverlay.AnchorPoint = Vector2.new(0.5, 0)
+    frostedOverlay.Position = UDim2.new(0.5, 0, 0, -56)
+    frostedOverlay.Size = UDim2.new(0.84, 0, 0, 108)
+    frostedOverlay.BackgroundColor3 = Palette.PrimaryAccent
+    frostedOverlay.BackgroundTransparency = 0.90
+    frostedOverlay.BorderSizePixel = 0
+    frostedOverlay.ZIndex = 2
+    frostedOverlay.Parent = MainCard
 
-local function updateResponsiveLayout()
-    local cam = Workspace.CurrentCamera
-    if not cam then
-        return
-    end
-    local vp = cam.ViewportSize
-    local maxScaleX = (vp.X * 0.92) / BASE_CARD_W
-    local maxScaleY = (vp.Y * 0.86) / BASE_CARD_H
-    local scale = math.clamp(math.min(maxScaleX, maxScaleY), 0.58, 1.12)
-    RootScale.Scale = scale
+    local frostCorner = Instance.new("UICorner")
+    frostCorner.CornerRadius = UDim.new(1, 0)
+    frostCorner.Parent = frostedOverlay
 end
-
-local viewportConn = nil
-local function bindCameraViewport()
-    if viewportConn then
-        pcall(function()
-            viewportConn:Disconnect()
-        end)
-        viewportConn = nil
-    end
-    local cam = Workspace.CurrentCamera
-    State.Camera = cam
-    if cam then
-        viewportConn = addConnection(cam:GetPropertyChangedSignal("ViewportSize"):Connect(updateResponsiveLayout))
-    end
-    updateResponsiveLayout()
-end
-
-bindCameraViewport()
-addConnection(Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(bindCameraViewport))
-
-local HeaderBar = Instance.new("Frame")
-HeaderBar.Name = "HeaderBar"
-HeaderBar.Size = UDim2.new(1, 0, 0, 56)
-HeaderBar.BackgroundColor3 = Palette.CardElevated
-HeaderBar.BackgroundTransparency = 0.18
-HeaderBar.BorderSizePixel = 0
-HeaderBar.ZIndex = 3
-HeaderBar.Parent = MainCard
-
-local HeaderDivider = Instance.new("Frame")
-HeaderDivider.Size = UDim2.new(1, 0, 0, 1)
-HeaderDivider.Position = UDim2.new(0, 0, 1, -1)
-HeaderDivider.BackgroundColor3 = Palette.GlassEdge
-HeaderDivider.BackgroundTransparency = 0.78
-HeaderDivider.BorderSizePixel = 0
-HeaderDivider.Parent = HeaderBar
-
-local BrandBadge = Instance.new("Frame")
-BrandBadge.AnchorPoint = Vector2.new(0, 0.5)
-BrandBadge.Position = UDim2.new(0, 16, 0.5, 0)
-BrandBadge.Size = UDim2.fromOffset(92, 28)
-BrandBadge.BackgroundColor3 = Palette.PrimaryAccent
-BrandBadge.BackgroundTransparency = 0.84
-BrandBadge.BorderSizePixel = 0
-BrandBadge.ZIndex = 4
-BrandBadge.Parent = HeaderBar
-
-local BrandCorner = Instance.new("UICorner")
-BrandCorner.CornerRadius = UDim.new(0, 8)
-BrandCorner.Parent = BrandBadge
-
-local BrandStroke = Instance.new("UIStroke")
-BrandStroke.Thickness = 1
-BrandStroke.Transparency = 0.42
-BrandStroke.Color = Palette.ActiveGlow
-BrandStroke.Parent = BrandBadge
-
-local TitleLabel = Instance.new("TextLabel")
-TitleLabel.Name = "BrandTitle"
-TitleLabel.BackgroundTransparency = 1
-TitleLabel.AnchorPoint = Vector2.new(0.5, 0.5)
-TitleLabel.Position = UDim2.fromScale(0.5, 0.5)
-TitleLabel.Size = UDim2.fromScale(1, 1)
-TitleLabel.Font = Enum.Font.GothamBold
-TitleLabel.Text = "TEAM AKI"
-TitleLabel.TextSize = 14
-TitleLabel.TextColor3 = Palette.TextHeader
-TitleLabel.ZIndex = 5
-TitleLabel.Parent = BrandBadge
-
-local SubtitleLabel = Instance.new("TextLabel")
-SubtitleLabel.Name = "BrandSubtitle"
-SubtitleLabel.BackgroundTransparency = 1
-SubtitleLabel.AnchorPoint = Vector2.new(0, 0.5)
-SubtitleLabel.Position = UDim2.new(0, 118, 0.5, 0)
-SubtitleLabel.Size = UDim2.new(1, -210, 0, 18)
-SubtitleLabel.Font = Enum.Font.GothamMedium
-SubtitleLabel.Text = "Universal Combat & ESP Hub"
-SubtitleLabel.TextSize = 11.5
-SubtitleLabel.TextColor3 = Palette.TextSilver
-SubtitleLabel.TextXAlignment = Enum.TextXAlignment.Left
-SubtitleLabel.TextTruncate = Enum.TextTruncate.AtEnd
-SubtitleLabel.ZIndex = 4
-SubtitleLabel.Parent = HeaderBar
-
-local HeaderActions = Instance.new("Frame")
-HeaderActions.BackgroundTransparency = 1
-HeaderActions.AnchorPoint = Vector2.new(1, 0.5)
-HeaderActions.Position = UDim2.new(1, -14, 0.5, 0)
-HeaderActions.Size = UDim2.fromOffset(72, 30)
-HeaderActions.ZIndex = 4
-HeaderActions.Parent = HeaderBar
-
-local HeaderActionsLayout = Instance.new("UIListLayout")
-HeaderActionsLayout.FillDirection = Enum.FillDirection.Horizontal
-HeaderActionsLayout.HorizontalAlignment = Enum.HorizontalAlignment.Right
-HeaderActionsLayout.VerticalAlignment = Enum.VerticalAlignment.Center
-HeaderActionsLayout.Padding = UDim.new(0, 8)
-HeaderActionsLayout.Parent = HeaderActions
-
-local function createHeaderButton(symbol, bg)
-    local btn = Instance.new("TextButton")
-    btn.Size = UDim2.fromOffset(30, 30)
-    btn.BackgroundColor3 = bg
-    btn.BackgroundTransparency = 0.25
-    btn.Font = Enum.Font.GothamBold
-    btn.Text = symbol
-    btn.TextSize = 15
-    btn.TextColor3 = Palette.TextHeader
-    btn.AutoButtonColor = false
-    btn.ZIndex = 5
-    btn.Parent = HeaderActions
-
-    local c = Instance.new("UICorner")
-    c.CornerRadius = UDim.new(0, 8)
-    c.Parent = btn
-
-    applyGlassStroke(btn, 1, 0.72)
-    return btn
-end
-
-local MinimizeBtn = createHeaderButton("-", Palette.SurfaceSoft)
-local UnloadHeaderBtn = createHeaderButton("×", Palette.Danger)
 
 do
+    local function updateResponsiveLayout()
+        local cam = Workspace.CurrentCamera
+        if not cam then
+            return
+        end
+        local vp = cam.ViewportSize
+        local maxScaleX = (vp.X * 0.92) / BASE_CARD_W
+        local maxScaleY = (vp.Y * 0.86) / BASE_CARD_H
+        local scale = math.clamp(math.min(maxScaleX, maxScaleY), 0.58, 1.12)
+        RootScale.Scale = scale
+    end
+
+    local viewportConn = nil
+    local function bindCameraViewport()
+        if viewportConn then
+            pcall(function()
+                viewportConn:Disconnect()
+            end)
+            viewportConn = nil
+        end
+        local cam = Workspace.CurrentCamera
+        State.Camera = cam
+        if cam then
+            viewportConn = addConnection(cam:GetPropertyChangedSignal("ViewportSize"):Connect(updateResponsiveLayout))
+        end
+        updateResponsiveLayout()
+    end
+
+    bindCameraViewport()
+    addConnection(Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(bindCameraViewport))
+end
+
+do
+    local headerBar = Instance.new("Frame")
+    headerBar.Name = "HeaderBar"
+    headerBar.Size = UDim2.new(1, 0, 0, 56)
+    headerBar.BackgroundColor3 = Palette.CardElevated
+    headerBar.BackgroundTransparency = 0.18
+    headerBar.BorderSizePixel = 0
+    headerBar.ZIndex = 3
+    headerBar.Parent = MainCard
+
+    local headerDivider = Instance.new("Frame")
+    headerDivider.Size = UDim2.new(1, 0, 0, 1)
+    headerDivider.Position = UDim2.new(0, 0, 1, -1)
+    headerDivider.BackgroundColor3 = Palette.GlassEdge
+    headerDivider.BackgroundTransparency = 0.78
+    headerDivider.BorderSizePixel = 0
+    headerDivider.Parent = headerBar
+
+    local brandBadge = Instance.new("Frame")
+    brandBadge.AnchorPoint = Vector2.new(0, 0.5)
+    brandBadge.Position = UDim2.new(0, 16, 0.5, 0)
+    brandBadge.Size = UDim2.fromOffset(92, 28)
+    brandBadge.BackgroundColor3 = Palette.PrimaryAccent
+    brandBadge.BackgroundTransparency = 0.84
+    brandBadge.BorderSizePixel = 0
+    brandBadge.ZIndex = 4
+    brandBadge.Parent = headerBar
+
+    local brandCorner = Instance.new("UICorner")
+    brandCorner.CornerRadius = UDim.new(0, 8)
+    brandCorner.Parent = brandBadge
+
+    local brandStroke = Instance.new("UIStroke")
+    brandStroke.Thickness = 1
+    brandStroke.Transparency = 0.42
+    brandStroke.Color = Palette.ActiveGlow
+    brandStroke.Parent = brandBadge
+
+    local titleLabel = Instance.new("TextLabel")
+    titleLabel.Name = "BrandTitle"
+    titleLabel.BackgroundTransparency = 1
+    titleLabel.AnchorPoint = Vector2.new(0.5, 0.5)
+    titleLabel.Position = UDim2.fromScale(0.5, 0.5)
+    titleLabel.Size = UDim2.fromScale(1, 1)
+    titleLabel.Font = Enum.Font.GothamBold
+    titleLabel.Text = "TEAM AKI"
+    titleLabel.TextSize = 14
+    titleLabel.TextColor3 = Palette.TextHeader
+    titleLabel.ZIndex = 5
+    titleLabel.Parent = brandBadge
+
+    local subtitleLabel = Instance.new("TextLabel")
+    subtitleLabel.Name = "BrandSubtitle"
+    subtitleLabel.BackgroundTransparency = 1
+    subtitleLabel.AnchorPoint = Vector2.new(0, 0.5)
+    subtitleLabel.Position = UDim2.new(0, 118, 0.5, 0)
+    subtitleLabel.Size = UDim2.new(1, -210, 0, 18)
+    subtitleLabel.Font = Enum.Font.GothamMedium
+    subtitleLabel.Text = "Universal Combat & ESP Hub"
+    subtitleLabel.TextSize = 11.5
+    subtitleLabel.TextColor3 = Palette.TextSilver
+    subtitleLabel.TextXAlignment = Enum.TextXAlignment.Left
+    subtitleLabel.TextTruncate = Enum.TextTruncate.AtEnd
+    subtitleLabel.ZIndex = 4
+    subtitleLabel.Parent = headerBar
+
+    local headerActions = Instance.new("Frame")
+    headerActions.BackgroundTransparency = 1
+    headerActions.AnchorPoint = Vector2.new(1, 0.5)
+    headerActions.Position = UDim2.new(1, -14, 0.5, 0)
+    headerActions.Size = UDim2.fromOffset(72, 30)
+    headerActions.ZIndex = 4
+    headerActions.Parent = headerBar
+
+    local headerActionsLayout = Instance.new("UIListLayout")
+    headerActionsLayout.FillDirection = Enum.FillDirection.Horizontal
+    headerActionsLayout.HorizontalAlignment = Enum.HorizontalAlignment.Right
+    headerActionsLayout.VerticalAlignment = Enum.VerticalAlignment.Center
+    headerActionsLayout.Padding = UDim.new(0, 8)
+    headerActionsLayout.Parent = headerActions
+
+    local function createHeaderButton(symbol, bg)
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.fromOffset(30, 30)
+        btn.BackgroundColor3 = bg
+        btn.BackgroundTransparency = 0.25
+        btn.Font = Enum.Font.GothamBold
+        btn.Text = symbol
+        btn.TextSize = 15
+        btn.TextColor3 = Palette.TextHeader
+        btn.AutoButtonColor = false
+        btn.ZIndex = 5
+        btn.Parent = headerActions
+
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, 8)
+        c.Parent = btn
+
+        applyGlassStroke(btn, 1, 0.72)
+        return btn
+    end
+
+    UI.MinimizeBtn = createHeaderButton("-", Palette.SurfaceSoft)
+    UI.UnloadHeaderBtn = createHeaderButton("×", Palette.Danger)
+
     local activeInput = nil
     local dragStart = nil
     local startPos = nil
 
-    HeaderBar.InputBegan:Connect(function(input)
+    headerBar.InputBegan:Connect(function(input)
         if not activeInput and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
             activeInput = input
             dragStart = input.Position
@@ -4817,129 +4864,131 @@ do
     end))
 end
 
-local TabBar = Instance.new("Frame")
-TabBar.Name = "TabBar"
-TabBar.AnchorPoint = Vector2.new(0.5, 0)
-TabBar.Position = UDim2.new(0.5, 0, 0, 66)
-TabBar.Size = UDim2.new(1, -28, 0, 38)
-TabBar.BackgroundColor3 = Palette.CardElevated
-TabBar.BackgroundTransparency = 0.18
-TabBar.BorderSizePixel = 0
-TabBar.ZIndex = 3
-TabBar.Parent = MainCard
-
-local TabBarCorner = Instance.new("UICorner")
-TabBarCorner.CornerRadius = UDim.new(0, 11)
-TabBarCorner.Parent = TabBar
-
-applyGlassStroke(TabBar, 1, 0.72)
-
-local TabPadding = Instance.new("UIPadding")
-TabPadding.PaddingLeft = UDim.new(0, 4)
-TabPadding.PaddingRight = UDim.new(0, 4)
-TabPadding.PaddingTop = UDim.new(0, 4)
-TabPadding.PaddingBottom = UDim.new(0, 4)
-TabPadding.Parent = TabBar
-
-local TabOrder = {"Aimbot", "Trigger", "ESP", "Colors", "Settings"}
-
-local TabGrid = Instance.new("UIGridLayout")
-TabGrid.CellSize = UDim2.new(1 / #TabOrder, -4, 1, 0)
-TabGrid.CellPadding = UDim2.fromOffset(4, 0)
-TabGrid.HorizontalAlignment = Enum.HorizontalAlignment.Center
-TabGrid.VerticalAlignment = Enum.VerticalAlignment.Center
-TabGrid.SortOrder = Enum.SortOrder.LayoutOrder
-TabGrid.Parent = TabBar
-
-local ContentHolder = Instance.new("Frame")
-ContentHolder.Name = "ContentHolder"
-ContentHolder.AnchorPoint = Vector2.new(0.5, 0)
-ContentHolder.Position = UDim2.new(0.5, 0, 0, 114)
-ContentHolder.Size = UDim2.new(1, -28, 1, -126)
-ContentHolder.BackgroundTransparency = 1
-ContentHolder.ZIndex = 3
-ContentHolder.Parent = MainCard
-
 local TabPages = {}
 local TabButtons = {}
 
-local function createTabPage(name)
-    local page = Instance.new("ScrollingFrame")
-    page.Name = name .. "Page"
-    page.AnchorPoint = Vector2.new(0.5, 0.5)
-    page.Position = UDim2.fromScale(0.5, 0.5)
-    page.Size = UDim2.fromScale(1, 1)
-    page.BackgroundTransparency = 1
-    page.BorderSizePixel = 0
-    page.ScrollBarThickness = 5
-    page.ScrollBarImageColor3 = Palette.PrimaryAccent
-    page.ScrollBarImageTransparency = 0.35
-    page.ElasticBehavior = Enum.ElasticBehavior.WhenScrollable
-    page.CanvasSize = UDim2.fromOffset(0, 0)
-    page.AutomaticCanvasSize = Enum.AutomaticSize.Y
-    page.Visible = (name == Config.UI.ActiveTab)
-    page.ZIndex = 3
-    page.Parent = ContentHolder
+do
+    local tabBar = Instance.new("Frame")
+    tabBar.Name = "TabBar"
+    tabBar.AnchorPoint = Vector2.new(0.5, 0)
+    tabBar.Position = UDim2.new(0.5, 0, 0, 66)
+    tabBar.Size = UDim2.new(1, -28, 0, 38)
+    tabBar.BackgroundColor3 = Palette.CardElevated
+    tabBar.BackgroundTransparency = 0.18
+    tabBar.BorderSizePixel = 0
+    tabBar.ZIndex = 3
+    tabBar.Parent = MainCard
 
-    local list = Instance.new("UIListLayout")
-    list.SortOrder = Enum.SortOrder.LayoutOrder
-    list.HorizontalAlignment = Enum.HorizontalAlignment.Center
-    list.Padding = UDim.new(0, 8)
-    list.Parent = page
+    local tabBarCorner = Instance.new("UICorner")
+    tabBarCorner.CornerRadius = UDim.new(0, 11)
+    tabBarCorner.Parent = tabBar
 
-    local pad = Instance.new("UIPadding")
-    pad.PaddingTop = UDim.new(0, 2)
-    pad.PaddingBottom = UDim.new(0, 10)
-    pad.PaddingLeft = UDim.new(0, 2)
-    pad.PaddingRight = UDim.new(0, 8)
-    pad.Parent = page
+    applyGlassStroke(tabBar, 1, 0.72)
 
-    TabPages[name] = page
-    return page
-end
+    local tabPadding = Instance.new("UIPadding")
+    tabPadding.PaddingLeft = UDim.new(0, 4)
+    tabPadding.PaddingRight = UDim.new(0, 4)
+    tabPadding.PaddingTop = UDim.new(0, 4)
+    tabPadding.PaddingBottom = UDim.new(0, 4)
+    tabPadding.Parent = tabBar
 
-local function switchTab(tabName)
-    Config.UI.ActiveTab = tabName
-    for name, page in pairs(TabPages) do
-        page.Visible = (name == tabName)
+    local tabOrder = {"Aimbot", "Trigger", "ESP", "Colors", "Settings"}
+
+    local tabGrid = Instance.new("UIGridLayout")
+    tabGrid.CellSize = UDim2.new(1 / #tabOrder, -4, 1, 0)
+    tabGrid.CellPadding = UDim2.fromOffset(4, 0)
+    tabGrid.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    tabGrid.VerticalAlignment = Enum.VerticalAlignment.Center
+    tabGrid.SortOrder = Enum.SortOrder.LayoutOrder
+    tabGrid.Parent = tabBar
+
+    local contentHolder = Instance.new("Frame")
+    contentHolder.Name = "ContentHolder"
+    contentHolder.AnchorPoint = Vector2.new(0.5, 0)
+    contentHolder.Position = UDim2.new(0.5, 0, 0, 114)
+    contentHolder.Size = UDim2.new(1, -28, 1, -126)
+    contentHolder.BackgroundTransparency = 1
+    contentHolder.ZIndex = 3
+    contentHolder.Parent = MainCard
+
+    local function createTabPage(name)
+        local page = Instance.new("ScrollingFrame")
+        page.Name = name .. "Page"
+        page.AnchorPoint = Vector2.new(0.5, 0.5)
+        page.Position = UDim2.fromScale(0.5, 0.5)
+        page.Size = UDim2.fromScale(1, 1)
+        page.BackgroundTransparency = 1
+        page.BorderSizePixel = 0
+        page.ScrollBarThickness = 5
+        page.ScrollBarImageColor3 = Palette.PrimaryAccent
+        page.ScrollBarImageTransparency = 0.35
+        page.ElasticBehavior = Enum.ElasticBehavior.WhenScrollable
+        page.CanvasSize = UDim2.fromOffset(0, 0)
+        page.AutomaticCanvasSize = Enum.AutomaticSize.Y
+        page.Visible = (name == Config.UI.ActiveTab)
+        page.ZIndex = 3
+        page.Parent = contentHolder
+
+        local list = Instance.new("UIListLayout")
+        list.SortOrder = Enum.SortOrder.LayoutOrder
+        list.HorizontalAlignment = Enum.HorizontalAlignment.Center
+        list.Padding = UDim.new(0, 8)
+        list.Parent = page
+
+        local pad = Instance.new("UIPadding")
+        pad.PaddingTop = UDim.new(0, 2)
+        pad.PaddingBottom = UDim.new(0, 10)
+        pad.PaddingLeft = UDim.new(0, 2)
+        pad.PaddingRight = UDim.new(0, 8)
+        pad.Parent = page
+
+        TabPages[name] = page
+        return page
     end
-    for name, btn in pairs(TabButtons) do
-        local isActive = (name == tabName)
-        tween(btn, 0.18, {
-            BackgroundColor3 = isActive and Palette.PrimaryAccent or Palette.CardElevated,
-            BackgroundTransparency = isActive and 0.18 or 1,
-            TextColor3 = isActive and Palette.TextHeader or Palette.TextSilver,
-        })
+
+    local function switchTab(tabName)
+        Config.UI.ActiveTab = tabName
+        for name, page in pairs(TabPages) do
+            page.Visible = (name == tabName)
+        end
+        for name, btn in pairs(TabButtons) do
+            local isActive = (name == tabName)
+            tween(btn, 0.18, {
+                BackgroundColor3 = isActive and Palette.PrimaryAccent or Palette.CardElevated,
+                BackgroundTransparency = isActive and 0.18 or 1,
+                TextColor3 = isActive and Palette.TextHeader or Palette.TextSilver,
+            })
+        end
     end
-end
 
-for idx, tabName in ipairs(TabOrder) do
-    createTabPage(tabName)
+    for idx, tabName in ipairs(tabOrder) do
+        createTabPage(tabName)
 
-    local btn = Instance.new("TextButton")
-    btn.Name = tabName .. "Tab"
-    btn.LayoutOrder = idx
-    btn.Font = Enum.Font.GothamMedium
-    btn.Text = tabName
-    btn.TextSize = 10.5
-    btn.TextTruncate = Enum.TextTruncate.AtEnd
-    btn.AutoButtonColor = false
-    btn.BorderSizePixel = 0
-    btn.BackgroundColor3 = (tabName == Config.UI.ActiveTab) and Palette.PrimaryAccent or Palette.CardElevated
-    btn.BackgroundTransparency = (tabName == Config.UI.ActiveTab) and 0.18 or 1
-    btn.TextColor3 = (tabName == Config.UI.ActiveTab) and Palette.TextHeader or Palette.TextSilver
-    btn.ZIndex = 4
-    btn.Parent = TabBar
+        local btn = Instance.new("TextButton")
+        btn.Name = tabName .. "Tab"
+        btn.LayoutOrder = idx
+        btn.Font = Enum.Font.GothamMedium
+        btn.Text = tabName
+        btn.TextSize = 10.5
+        btn.TextTruncate = Enum.TextTruncate.AtEnd
+        btn.AutoButtonColor = false
+        btn.BorderSizePixel = 0
+        btn.BackgroundColor3 = (tabName == Config.UI.ActiveTab) and Palette.PrimaryAccent or Palette.CardElevated
+        btn.BackgroundTransparency = (tabName == Config.UI.ActiveTab) and 0.18 or 1
+        btn.TextColor3 = (tabName == Config.UI.ActiveTab) and Palette.TextHeader or Palette.TextSilver
+        btn.ZIndex = 4
+        btn.Parent = tabBar
 
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 8)
-    corner.Parent = btn
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 8)
+        corner.Parent = btn
 
-    btn.Activated:Connect(function()
-        switchTab(tabName)
-    end)
+        btn.Activated:Connect(function()
+            switchTab(tabName)
+        end)
 
-    TabButtons[tabName] = btn
+        TabButtons[tabName] = btn
+    end
 end
 
 -- ============================================================================
@@ -5484,688 +5533,702 @@ end
 -- ============================================================================
 -- [SECTION 11] POPULATE TABS (AIMBOT, TRIGGER, ESP, COLORS & THICKNESS, SETTINGS)
 -- ============================================================================
+local ForceReloadBtn = nil
+local ResetBtn = nil
+local UnloadBtn = nil
+local SettingsPage = TabPages["Settings"]
 
+local function populateAllTabs()
 -- 1. AIMBOT TAB
-local AimbotPage = TabPages["Aimbot"]
-addSectionHeader(AimbotPage, 1, "Core Aim Lock")
-addToggle(AimbotPage, 2, "Enable Aimbot", "Master toggle synced with Aim Lock GUI button", function()
-    return Config.Aimbot.Enabled
-end, function(v)
-    Config.Aimbot.Enabled = v
-    Config.UI.MobileAimLocked = v
-end)
+do
+    local AimbotPage = TabPages["Aimbot"]
+    addSectionHeader(AimbotPage, 1, "Core Aim Lock")
+    addToggle(AimbotPage, 2, "Enable Aimbot", "Master toggle synced with Aim Lock GUI button", function()
+        return Config.Aimbot.Enabled
+    end, function(v)
+        Config.Aimbot.Enabled = v
+        Config.UI.MobileAimLocked = v
+    end)
 
-addSelector(AimbotPage, 3, "Activation Mode", {"GUI Toggle", "Hold"}, function()
-    return Config.Aimbot.ActivationMode
-end, function(v)
-    Config.Aimbot.ActivationMode = v
-end, false)
+    addSelector(AimbotPage, 3, "Activation Mode", {"GUI Toggle", "Hold"}, function()
+        return Config.Aimbot.ActivationMode
+    end, function(v)
+        Config.Aimbot.ActivationMode = v
+    end, false)
 
-addSelector(AimbotPage, 4, "Target Part (R6 / R15 / Custom Rigs)", {"Head", "Chest", "HumanoidRootPart", "Closest"}, function()
-    return Config.Aimbot.TargetPart
-end, function(v)
-    Config.Aimbot.TargetPart = v
-end, false)
+    addSelector(AimbotPage, 4, "Target Part (R6 / R15 / Custom Rigs)", {"Head", "Chest", "HumanoidRootPart", "Closest"}, function()
+        return Config.Aimbot.TargetPart
+    end, function(v)
+        Config.Aimbot.TargetPart = v
+    end, false)
 
-addSlider(AimbotPage, 5, "Smoothness", 1, 20, 1, function(v)
-    local n = math.round(v)
-    return (n <= 1) and "1 (Instant)" or string.format("%d", n)
-end, function()
-    return Config.Aimbot.Smoothness
-end, function(v)
-    Config.Aimbot.Smoothness = math.round(v)
-end)
+    addSlider(AimbotPage, 5, "Smoothness", 1, 20, 1, function(v)
+        local n = math.round(v)
+        return (n <= 1) and "1 (Instant)" or string.format("%d", n)
+    end, function()
+        return Config.Aimbot.Smoothness
+    end, function(v)
+        Config.Aimbot.Smoothness = math.round(v)
+    end)
 
-addSectionHeader(AimbotPage, 6, "Prediction & Auto Predict")
-addToggle(AimbotPage, 7, "Auto Predict", "Automatically adjusts lead by live ping, distance & target speed", function()
-    return Config.Aimbot.AutoPredict
-end, function(v)
-    Config.Aimbot.AutoPredict = v
-end)
+    addSectionHeader(AimbotPage, 6, "Prediction & Auto Predict")
+    addToggle(AimbotPage, 7, "Auto Predict", "Automatically adjusts lead by live ping, distance & target speed", function()
+        return Config.Aimbot.AutoPredict
+    end, function(v)
+        Config.Aimbot.AutoPredict = v
+    end)
 
-addSlider(AimbotPage, 8, "Manual Prediction Lead Time", 0.00, 0.30, 0.01, function(v)
-    return string.format("%.2fs", v)
-end, function()
-    return Config.Aimbot.Prediction
-end, function(v)
-    Config.Aimbot.Prediction = v
-end)
+    addSlider(AimbotPage, 8, "Manual Prediction Lead Time", 0.00, 0.30, 0.01, function(v)
+        return string.format("%.2fs", v)
+    end, function()
+        return Config.Aimbot.Prediction
+    end, function(v)
+        Config.Aimbot.Prediction = v
+    end)
 
-addSlider(AimbotPage, 9, "Projectile Speed (0 = Lead Only)", 0, 2000, 50, function(v)
-    local n = math.round(v)
-    return (n == 0) and "Off" or string.format("%d st/s", n)
-end, function()
-    return Config.Aimbot.ProjectileSpeed
-end, function(v)
-    Config.Aimbot.ProjectileSpeed = math.round(v)
-end)
+    addSlider(AimbotPage, 9, "Projectile Speed (0 = Lead Only)", 0, 2000, 50, function(v)
+        local n = math.round(v)
+        return (n == 0) and "Off" or string.format("%d st/s", n)
+    end, function()
+        return Config.Aimbot.ProjectileSpeed
+    end, function(v)
+        Config.Aimbot.ProjectileSpeed = math.round(v)
+    end)
 
-addToggle(AimbotPage, 10, "Ping Auto-Compensation", "Adds half-RTT ping when Auto Predict is off", function()
-    return Config.Aimbot.PingCompensation
-end, function(v)
-    Config.Aimbot.PingCompensation = v
-end)
+    addToggle(AimbotPage, 10, "Ping Auto-Compensation", "Adds half-RTT ping when Auto Predict is off", function()
+        return Config.Aimbot.PingCompensation
+    end, function(v)
+        Config.Aimbot.PingCompensation = v
+    end)
 
-addSectionHeader(AimbotPage, 11, "FOV & Target Filters")
-addSlider(AimbotPage, 12, "FOV Radius", 30, 420, 5, function(v)
-    return string.format("%d px", math.round(v))
-end, function()
-    return Config.Aimbot.FOVRadius
-end, function(v)
-    Config.Aimbot.FOVRadius = v
-end)
+    addSectionHeader(AimbotPage, 11, "FOV & Target Filters")
+    addSlider(AimbotPage, 12, "FOV Radius", 30, 420, 5, function(v)
+        return string.format("%d px", math.round(v))
+    end, function()
+        return Config.Aimbot.FOVRadius
+    end, function(v)
+        Config.Aimbot.FOVRadius = v
+    end)
 
-addToggle(AimbotPage, 13, "Show FOV Circle", "Displays centered FOV ring around crosshair", function()
-    return Config.Aimbot.ShowFOV
-end, function(v)
-    Config.Aimbot.ShowFOV = v
-end)
+    addToggle(AimbotPage, 13, "Show FOV Circle", "Displays centered FOV ring around crosshair", function()
+        return Config.Aimbot.ShowFOV
+    end, function(v)
+        Config.Aimbot.ShowFOV = v
+    end)
 
-addToggle(AimbotPage, 14, "Ignore Bots (Aimbot)", "Skips NPCs/bots so aimbot locks onto real players only", function()
-    return Config.Aimbot.IgnoreBots
-end, function(v)
-    Config.Aimbot.IgnoreBots = v
-    syncWorkspaceBots()
-end)
+    addToggle(AimbotPage, 14, "Ignore Bots (Aimbot)", "Skips NPCs/bots so aimbot locks onto real players only", function()
+        return Config.Aimbot.IgnoreBots
+    end, function(v)
+        Config.Aimbot.IgnoreBots = v
+        syncWorkspaceBots()
+    end)
 
-addToggle(AimbotPage, 15, "Team Check", "Skips teammates (FFA-safe Auto mode)", function()
-    return Config.Aimbot.TeamCheck
-end, function(v)
-    Config.Aimbot.TeamCheck = v
-end)
+    addToggle(AimbotPage, 15, "Team Check", "Skips teammates (FFA-safe Auto mode)", function()
+        return Config.Aimbot.TeamCheck
+    end, function(v)
+        Config.Aimbot.TeamCheck = v
+    end)
 
-addToggle(AimbotPage, 16, "Visible / Wall Check", "Blocks aim lock through solid walls", function()
-    return Config.Aimbot.VisibleCheck
-end, function(v)
-    Config.Aimbot.VisibleCheck = v
-end)
+    addToggle(AimbotPage, 16, "Visible / Wall Check", "Blocks aim lock through solid walls", function()
+        return Config.Aimbot.VisibleCheck
+    end, function(v)
+        Config.Aimbot.VisibleCheck = v
+    end)
 
-addToggle(AimbotPage, 17, "Sticky Target Lock", "Maintains lock while target remains valid", function()
-    return Config.Aimbot.StickyTarget
-end, function(v)
-    Config.Aimbot.StickyTarget = v
-end)
+    addToggle(AimbotPage, 17, "Sticky Target Lock", "Maintains lock while target remains valid", function()
+        return Config.Aimbot.StickyTarget
+    end, function(v)
+        Config.Aimbot.StickyTarget = v
+    end)
+end
 
 -- 2. TRIGGER BOT TAB
-local TriggerPage = TabPages["Trigger"]
-addSectionHeader(TriggerPage, 1, "Trigger Bot Engine")
-addToggle(TriggerPage, 2, "Enable Trigger Bot", "Fires mobile Shoot button, Tool, client mouse & server remote safely", function()
-    return Config.TriggerBot.Enabled
-end, function(v)
-    Config.TriggerBot.Enabled = v
-    Config.UI.MobileTriggerLocked = v
-end)
+do
+    local TriggerPage = TabPages["Trigger"]
+    addSectionHeader(TriggerPage, 1, "Trigger Bot Engine")
+    addToggle(TriggerPage, 2, "Enable Trigger Bot", "Fires mobile Shoot button, Tool, client mouse & server remote safely", function()
+        return Config.TriggerBot.Enabled
+    end, function(v)
+        Config.TriggerBot.Enabled = v
+        Config.UI.MobileTriggerLocked = v
+    end)
 
-addToggle(TriggerPage, 3, "Server Remote Fire", "Send FireServer request directly when no client shoot handler fires", function()
-    return Config.TriggerBot.ServerRemoteFire
-end, function(v)
-    Config.TriggerBot.ServerRemoteFire = v
-end)
+    addToggle(TriggerPage, 3, "Server Remote Fire", "Send FireServer request directly when no client shoot handler fires", function()
+        return Config.TriggerBot.ServerRemoteFire
+    end, function(v)
+        Config.TriggerBot.ServerRemoteFire = v
+    end)
 
-addToggle(TriggerPage, 4, "Hold Fire While Locked", "Hold trigger continuously vs timed tap shots", function()
-    return Config.TriggerBot.HoldToFire
-end, function(v)
-    Config.TriggerBot.HoldToFire = v
-end)
+    addToggle(TriggerPage, 4, "Hold Fire While Locked", "Hold trigger continuously vs timed tap shots", function()
+        return Config.TriggerBot.HoldToFire
+    end, function(v)
+        Config.TriggerBot.HoldToFire = v
+    end)
 
-addSectionHeader(TriggerPage, 5, "Hitbox & Timing")
-addSelector(TriggerPage, 6, "Target Part Filter", {"Any Part", "Head & Chest", "Head Only"}, function()
-    return Config.TriggerBot.TargetFilter
-end, function(v)
-    Config.TriggerBot.TargetFilter = v
-end, false)
+    addSectionHeader(TriggerPage, 5, "Hitbox & Timing")
+    addSelector(TriggerPage, 6, "Target Part Filter", {"Any Part", "Head & Chest", "Head Only"}, function()
+        return Config.TriggerBot.TargetFilter
+    end, function(v)
+        Config.TriggerBot.TargetFilter = v
+    end, false)
 
-addSlider(TriggerPage, 7, "Crosshair Tolerance", 0, 28, 1, function(v)
-    local n = math.round(v)
-    return (n == 0) and "0 px (Exact)" or string.format("%d px", n)
-end, function()
-    return Config.TriggerBot.CrosshairTolerance
-end, function(v)
-    Config.TriggerBot.CrosshairTolerance = math.round(v)
-end)
+    addSlider(TriggerPage, 7, "Crosshair Tolerance", 0, 28, 1, function(v)
+        local n = math.round(v)
+        return (n == 0) and "0 px (Exact)" or string.format("%d px", n)
+    end, function()
+        return Config.TriggerBot.CrosshairTolerance
+    end, function(v)
+        Config.TriggerBot.CrosshairTolerance = math.round(v)
+    end)
 
-addSlider(TriggerPage, 8, "Reaction Delay", 0.00, 0.30, 0.01, function(v)
-    return string.format("%.2fs", v)
-end, function()
-    return Config.TriggerBot.ReactionDelay
-end, function(v)
-    Config.TriggerBot.ReactionDelay = v
-end)
+    addSlider(TriggerPage, 8, "Reaction Delay", 0.00, 0.30, 0.01, function(v)
+        return string.format("%.2fs", v)
+    end, function()
+        return Config.TriggerBot.ReactionDelay
+    end, function(v)
+        Config.TriggerBot.ReactionDelay = v
+    end)
 
-addSlider(TriggerPage, 9, "Shot Cooldown", 0.02, 0.60, 0.01, function(v)
-    return string.format("%.2fs", v)
-end, function()
-    return Config.TriggerBot.ShotCooldown
-end, function(v)
-    Config.TriggerBot.ShotCooldown = v
-end)
+    addSlider(TriggerPage, 9, "Shot Cooldown", 0.02, 0.60, 0.01, function(v)
+        return string.format("%.2fs", v)
+    end, function()
+        return Config.TriggerBot.ShotCooldown
+    end, function(v)
+        Config.TriggerBot.ShotCooldown = v
+    end)
 
-addSectionHeader(TriggerPage, 10, "Checks & Reticle HUD")
-addToggle(TriggerPage, 11, "Ignore Bots (Trigger)", "Skips NPCs/bots when Trigger Bot is active", function()
-    return Config.TriggerBot.IgnoreBots
-end, function(v)
-    Config.TriggerBot.IgnoreBots = v
-    syncWorkspaceBots()
-end)
+    addSectionHeader(TriggerPage, 10, "Checks & Reticle HUD")
+    addToggle(TriggerPage, 11, "Ignore Bots (Trigger)", "Skips NPCs/bots when Trigger Bot is active", function()
+        return Config.TriggerBot.IgnoreBots
+    end, function(v)
+        Config.TriggerBot.IgnoreBots = v
+        syncWorkspaceBots()
+    end)
 
-addToggle(TriggerPage, 12, "Trigger Team Check", "Never shoots teammates (FFA-safe Auto mode)", function()
-    return Config.TriggerBot.TeamCheck
-end, function(v)
-    Config.TriggerBot.TeamCheck = v
-end)
+    addToggle(TriggerPage, 12, "Trigger Team Check", "Never shoots teammates (FFA-safe Auto mode)", function()
+        return Config.TriggerBot.TeamCheck
+    end, function(v)
+        Config.TriggerBot.TeamCheck = v
+    end)
 
-addToggle(TriggerPage, 13, "Trigger Visible Check", "Blocks shots when enemy is behind walls", function()
-    return Config.TriggerBot.VisibleCheck
-end, function(v)
-    Config.TriggerBot.VisibleCheck = v
-end)
+    addToggle(TriggerPage, 13, "Trigger Visible Check", "Blocks shots when enemy is behind walls", function()
+        return Config.TriggerBot.VisibleCheck
+    end, function(v)
+        Config.TriggerBot.VisibleCheck = v
+    end)
 
-addToggle(TriggerPage, 14, "Show Crosshair Indicator", "Center reticle dot pulses mint when target locked", function()
-    return Config.TriggerBot.ShowIndicator
-end, function(v)
-    Config.TriggerBot.ShowIndicator = v
-end)
+    addToggle(TriggerPage, 14, "Show Crosshair Indicator", "Center reticle dot pulses mint when target locked", function()
+        return Config.TriggerBot.ShowIndicator
+    end, function(v)
+        Config.TriggerBot.ShowIndicator = v
+    end)
+end
 
 -- 3. ESP VISUALS TAB
-local EspPage = TabPages["ESP"]
-addSectionHeader(EspPage, 1, "Boxes & Silhouettes")
-addToggle(EspPage, 2, "Master ESP", "Enables or disables all ESP layers", function()
-    return Config.ESP.Enabled
-end, function(v)
-    Config.ESP.Enabled = v
-end)
+do
+    local EspPage = TabPages["ESP"]
+    addSectionHeader(EspPage, 1, "Boxes & Silhouettes")
+    addToggle(EspPage, 2, "Master ESP", "Enables or disables all ESP layers", function()
+        return Config.ESP.Enabled
+    end, function(v)
+        Config.ESP.Enabled = v
+    end)
 
-addToggle(EspPage, 3, "Box ESP", "Projected 2D bounding box around characters", function()
-    return Config.ESP.BoxESP
-end, function(v)
-    Config.ESP.BoxESP = v
-end)
+    addToggle(EspPage, 3, "Box ESP", "Projected 2D bounding box around characters", function()
+        return Config.ESP.BoxESP
+    end, function(v)
+        Config.ESP.BoxESP = v
+    end)
 
-addSelector(EspPage, 4, "Box Style", {"Corner", "Full"}, function()
-    return Config.ESP.BoxStyle
-end, function(v)
-    Config.ESP.BoxStyle = v
-end, false)
+    addSelector(EspPage, 4, "Box Style", {"Corner", "Full"}, function()
+        return Config.ESP.BoxStyle
+    end, function(v)
+        Config.ESP.BoxStyle = v
+    end, false)
 
-addToggle(EspPage, 5, "Highlight ESP", "AlwaysOnTop silhouette reactive to visibility", function()
-    return Config.ESP.HighlightESP
-end, function(v)
-    Config.ESP.HighlightESP = v
-end)
+    addToggle(EspPage, 5, "Highlight ESP", "AlwaysOnTop silhouette reactive to visibility", function()
+        return Config.ESP.HighlightESP
+    end, function(v)
+        Config.ESP.HighlightESP = v
+    end)
 
-addToggle(EspPage, 6, "Highlight Visible Only", "Hide highlight when enemy is behind walls", function()
-    return Config.ESP.HighlightVisibleOnly
-end, function(v)
-    Config.ESP.HighlightVisibleOnly = v
-end)
+    addToggle(EspPage, 6, "Highlight Visible Only", "Hide highlight when enemy is behind walls", function()
+        return Config.ESP.HighlightVisibleOnly
+    end, function(v)
+        Config.ESP.HighlightVisibleOnly = v
+    end)
 
-addSectionHeader(EspPage, 7, "Health, Name & Feet Distance")
-addToggle(EspPage, 8, "Health Bar (0% - 100%)", "Vertical sidebar health indicator beside box", function()
-    return Config.ESP.HealthBar
-end, function(v)
-    Config.ESP.HealthBar = v
-end)
+    addSectionHeader(EspPage, 7, "Health, Name & Feet Distance")
+    addToggle(EspPage, 8, "Health Bar (0% - 100%)", "Vertical sidebar health indicator beside box", function()
+        return Config.ESP.HealthBar
+    end, function(v)
+        Config.ESP.HealthBar = v
+    end)
 
-addToggle(EspPage, 9, "Health % Readout", "Shows numeric 0%-100% health beside bar", function()
-    return Config.ESP.ShowHealthPercent
-end, function(v)
-    Config.ESP.ShowHealthPercent = v
-end)
+    addToggle(EspPage, 9, "Health % Readout", "Shows numeric 0%-100% health beside bar", function()
+        return Config.ESP.ShowHealthPercent
+    end, function(v)
+        Config.ESP.ShowHealthPercent = v
+    end)
 
-addToggle(EspPage, 10, "Show Player Name", "Displays player or bot name above target head", function()
-    return Config.ESP.ShowName
-end, function(v)
-    Config.ESP.ShowName = v
-end)
+    addToggle(EspPage, 10, "Show Player Name", "Displays player or bot name above target head", function()
+        return Config.ESP.ShowName
+    end, function(v)
+        Config.ESP.ShowName = v
+    end)
 
-addToggle(EspPage, 11, "Distance Under Feet", "Renders stud distance directly beneath enemy feet", function()
-    return Config.ESP.ShowDistance
-end, function(v)
-    Config.ESP.ShowDistance = v
-end)
+    addToggle(EspPage, 11, "Distance Under Feet", "Renders stud distance directly beneath enemy feet", function()
+        return Config.ESP.ShowDistance
+    end, function(v)
+        Config.ESP.ShowDistance = v
+    end)
 
-addSectionHeader(EspPage, 12, "Tracers & 360° Alerts")
-addToggle(EspPage, 13, "ESP Lines (Tracers)", "Smart-anchored tracers matched to target bones", function()
-    return Config.ESP.TracerESP
-end, function(v)
-    Config.ESP.TracerESP = v
-end)
+    addSectionHeader(EspPage, 12, "Tracers & 360° Alerts")
+    addToggle(EspPage, 13, "ESP Lines (Tracers)", "Smart-anchored tracers matched to target bones", function()
+        return Config.ESP.TracerESP
+    end, function(v)
+        Config.ESP.TracerESP = v
+    end)
 
-addSelector(EspPage, 14, "Tracer Origin -> Anchor", {"Bottom", "Center", "Top"}, function()
-    return Config.ESP.TracerOrigin
-end, function(v)
-    Config.ESP.TracerOrigin = v
-end, false)
+    addSelector(EspPage, 14, "Tracer Origin -> Anchor", {"Bottom", "Center", "Top"}, function()
+        return Config.ESP.TracerOrigin
+    end, function(v)
+        Config.ESP.TracerOrigin = v
+    end, false)
 
-addToggle(EspPage, 15, "360° Off-Screen Alert", "Arrows shift dynamically between Visible and Hidden", function()
-    return Config.ESP.Alert360
-end, function(v)
-    Config.ESP.Alert360 = v
-end)
+    addToggle(EspPage, 15, "360° Off-Screen Alert", "Arrows shift dynamically between Visible and Hidden", function()
+        return Config.ESP.Alert360
+    end, function(v)
+        Config.ESP.Alert360 = v
+    end)
 
-addToggle(EspPage, 16, "360° Alert Visible Only", "Hide 360° arrows when enemy is behind walls", function()
-    return Config.ESP.Alert360VisibleOnly
-end, function(v)
-    Config.ESP.Alert360VisibleOnly = v
-end)
+    addToggle(EspPage, 16, "360° Alert Visible Only", "Hide 360° arrows when enemy is behind walls", function()
+        return Config.ESP.Alert360VisibleOnly
+    end, function(v)
+        Config.ESP.Alert360VisibleOnly = v
+    end)
 
-addSectionHeader(EspPage, 17, "ESP Filters & Visibility")
-addToggle(EspPage, 18, "Ignore Bots (ESP)", "Hides NPCs/bots from ESP boxes, tracers & highlights", function()
-    return Config.ESP.IgnoreBots
-end, function(v)
-    Config.ESP.IgnoreBots = v
-    syncWorkspaceBots()
-end)
+    addSectionHeader(EspPage, 17, "ESP Filters & Visibility")
+    addToggle(EspPage, 18, "Ignore Bots (ESP)", "Hides NPCs/bots from ESP boxes, tracers & highlights", function()
+        return Config.ESP.IgnoreBots
+    end, function(v)
+        Config.ESP.IgnoreBots = v
+        syncWorkspaceBots()
+    end)
 
-addToggle(EspPage, 19, "ESP Team Check", "Hides ESP elements for teammates (FFA-safe)", function()
-    return Config.ESP.TeamCheck
-end, function(v)
-    Config.ESP.TeamCheck = v
-end)
+    addToggle(EspPage, 19, "ESP Team Check", "Hides ESP elements for teammates (FFA-safe)", function()
+        return Config.ESP.TeamCheck
+    end, function(v)
+        Config.ESP.TeamCheck = v
+    end)
 
-addToggle(EspPage, 20, "Master Visible Filter", "Hides all ESP completely when behind walls", function()
-    return Config.ESP.VisibleCheck
-end, function(v)
-    Config.ESP.VisibleCheck = v
-end)
+    addToggle(EspPage, 20, "Master Visible Filter", "Hides all ESP completely when behind walls", function()
+        return Config.ESP.VisibleCheck
+    end, function(v)
+        Config.ESP.VisibleCheck = v
+    end)
 
-addToggle(EspPage, 21, "Color By Visibility", "Tints Box, Tracer & 360° Alert by line-of-sight", function()
-    return Config.ESP.ColorByVisibility
-end, function(v)
-    Config.ESP.ColorByVisibility = v
-end)
+    addToggle(EspPage, 21, "Color By Visibility", "Tints Box, Tracer & 360° Alert by line-of-sight", function()
+        return Config.ESP.ColorByVisibility
+    end, function(v)
+        Config.ESP.ColorByVisibility = v
+    end)
+end
 
 -- 4. COLORS & THICKNESS TAB
-local ColorsPage = TabPages["Colors"]
-addSectionHeader(ColorsPage, 1, "Live Thickness Controls")
+do
+    local ColorsPage = TabPages["Colors"]
+    addSectionHeader(ColorsPage, 1, "Live Thickness Controls")
 
-addSlider(ColorsPage, 2, "FOV Circle Thickness", 1.0, 10.0, 0.5, function(v)
-    return string.format("%.1f px", v)
-end, function()
-    return Config.Aimbot.FOVThickness
-end, function(v)
-    Config.Aimbot.FOVThickness = v
-    applyThicknessImmediate()
-end)
+    addSlider(ColorsPage, 2, "FOV Circle Thickness", 1.0, 10.0, 0.5, function(v)
+        return string.format("%.1f px", v)
+    end, function()
+        return Config.Aimbot.FOVThickness
+    end, function(v)
+        Config.Aimbot.FOVThickness = v
+        applyThicknessImmediate()
+    end)
 
-addSlider(ColorsPage, 3, "ESP Line Thickness", 1.0, 10.0, 0.5, function(v)
-    return string.format("%.1f px", v)
-end, function()
-    return Config.ESP.LineThickness
-end, function(v)
-    Config.ESP.LineThickness = v
-    applyThicknessImmediate()
-end)
+    addSlider(ColorsPage, 3, "ESP Line Thickness", 1.0, 10.0, 0.5, function(v)
+        return string.format("%.1f px", v)
+    end, function()
+        return Config.ESP.LineThickness
+    end, function(v)
+        Config.ESP.LineThickness = v
+        applyThicknessImmediate()
+    end)
 
-addSlider(ColorsPage, 4, "ESP Box Thickness", 1.0, 10.0, 0.5, function(v)
-    return string.format("%.1f px", v)
-end, function()
-    return Config.ESP.BoxThickness
-end, function(v)
-    Config.ESP.BoxThickness = v
-    applyThicknessImmediate()
-end)
+    addSlider(ColorsPage, 4, "ESP Box Thickness", 1.0, 10.0, 0.5, function(v)
+        return string.format("%.1f px", v)
+    end, function()
+        return Config.ESP.BoxThickness
+    end, function(v)
+        Config.ESP.BoxThickness = v
+        applyThicknessImmediate()
+    end)
 
-addSectionHeader(ColorsPage, 5, "Channel Color Editor")
+    addSectionHeader(ColorsPage, 5, "Channel Color Editor")
 
-local ColorChannelDefs = {
-    { Key = "Visible", Label = "Visible" },
-    { Key = "Hidden", Label = "Hidden" },
-    { Key = "Box", Label = "Box" },
-    { Key = "Tracer", Label = "Tracer" },
-    { Key = "Alert360", Label = "360 Alert" },
-    { Key = "FOV", Label = "FOV Ring" },
-}
+    local colorChannelDefs = {
+        { Key = "Visible", Label = "Visible" },
+        { Key = "Hidden", Label = "Hidden" },
+        { Key = "Box", Label = "Box" },
+        { Key = "Tracer", Label = "Tracer" },
+        { Key = "Alert360", Label = "360 Alert" },
+        { Key = "FOV", Label = "FOV Ring" },
+    }
 
-local ChannelCard = createCardRow(ColorsPage, 98, 6)
-local ChannelTitle = Instance.new("TextLabel")
-ChannelTitle.BackgroundTransparency = 1
-ChannelTitle.Position = UDim2.fromOffset(0, 0)
-ChannelTitle.Size = UDim2.new(1, -60, 0, 18)
-ChannelTitle.Font = Enum.Font.GothamMedium
-ChannelTitle.Text = "Active Color Channel"
-ChannelTitle.TextSize = 13
-ChannelTitle.TextColor3 = Palette.TextHeader
-ChannelTitle.TextXAlignment = Enum.TextXAlignment.Left
-ChannelTitle.ZIndex = 5
-ChannelTitle.Parent = ChannelCard
+    local channelCard = createCardRow(ColorsPage, 98, 6)
+    local channelTitle = Instance.new("TextLabel")
+    channelTitle.BackgroundTransparency = 1
+    channelTitle.Position = UDim2.fromOffset(0, 0)
+    channelTitle.Size = UDim2.new(1, -60, 0, 18)
+    channelTitle.Font = Enum.Font.GothamMedium
+    channelTitle.Text = "Active Color Channel"
+    channelTitle.TextSize = 13
+    channelTitle.TextColor3 = Palette.TextHeader
+    channelTitle.TextXAlignment = Enum.TextXAlignment.Left
+    channelTitle.ZIndex = 5
+    channelTitle.Parent = channelCard
 
-local LiveSwatch = Instance.new("Frame")
-LiveSwatch.AnchorPoint = Vector2.new(1, 0)
-LiveSwatch.Position = UDim2.new(1, 0, 0, 0)
-LiveSwatch.Size = UDim2.fromOffset(44, 18)
-LiveSwatch.BorderSizePixel = 0
-LiveSwatch.ZIndex = 5
-LiveSwatch.Parent = ChannelCard
+    local liveSwatch = Instance.new("Frame")
+    liveSwatch.AnchorPoint = Vector2.new(1, 0)
+    liveSwatch.Position = UDim2.new(1, 0, 0, 0)
+    liveSwatch.Size = UDim2.fromOffset(44, 18)
+    liveSwatch.BorderSizePixel = 0
+    liveSwatch.ZIndex = 5
+    liveSwatch.Parent = channelCard
 
-local SwatchCorner = Instance.new("UICorner")
-SwatchCorner.CornerRadius = UDim.new(0, 6)
-SwatchCorner.Parent = LiveSwatch
+    local swatchCorner = Instance.new("UICorner")
+    swatchCorner.CornerRadius = UDim.new(0, 6)
+    swatchCorner.Parent = liveSwatch
 
-local SwatchStroke = Instance.new("UIStroke")
-SwatchStroke.Thickness = 1
-SwatchStroke.Transparency = 0.4
-SwatchStroke.Color = Palette.TextHeader
-SwatchStroke.Parent = LiveSwatch
+    local swatchStroke = Instance.new("UIStroke")
+    swatchStroke.Thickness = 1
+    swatchStroke.Transparency = 0.4
+    swatchStroke.Color = Palette.TextHeader
+    swatchStroke.Parent = liveSwatch
 
-local ChannelBar = Instance.new("Frame")
-ChannelBar.AnchorPoint = Vector2.new(0.5, 1)
-ChannelBar.Position = UDim2.new(0.5, 0, 1, 0)
-ChannelBar.Size = UDim2.new(1, 0, 0, 54)
-ChannelBar.BackgroundColor3 = Palette.GlassBase
-ChannelBar.BackgroundTransparency = 0.22
-ChannelBar.BorderSizePixel = 0
-ChannelBar.ZIndex = 5
-ChannelBar.Parent = ChannelCard
+    local channelBar = Instance.new("Frame")
+    channelBar.AnchorPoint = Vector2.new(0.5, 1)
+    channelBar.Position = UDim2.new(0.5, 0, 1, 0)
+    channelBar.Size = UDim2.new(1, 0, 0, 54)
+    channelBar.BackgroundColor3 = Palette.GlassBase
+    channelBar.BackgroundTransparency = 0.22
+    channelBar.BorderSizePixel = 0
+    channelBar.ZIndex = 5
+    channelBar.Parent = channelCard
 
-local ChannelBarCorner = Instance.new("UICorner")
-ChannelBarCorner.CornerRadius = UDim.new(0, 8)
-ChannelBarCorner.Parent = ChannelBar
+    local channelBarCorner = Instance.new("UICorner")
+    channelBarCorner.CornerRadius = UDim.new(0, 8)
+    channelBarCorner.Parent = channelBar
 
-local ChannelPad = Instance.new("UIPadding")
-ChannelPad.PaddingLeft = UDim.new(0, 4)
-ChannelPad.PaddingRight = UDim.new(0, 4)
-ChannelPad.PaddingTop = UDim.new(0, 4)
-ChannelPad.PaddingBottom = UDim.new(0, 4)
-ChannelPad.Parent = ChannelBar
+    local channelPad = Instance.new("UIPadding")
+    channelPad.PaddingLeft = UDim.new(0, 4)
+    channelPad.PaddingRight = UDim.new(0, 4)
+    channelPad.PaddingTop = UDim.new(0, 4)
+    channelPad.PaddingBottom = UDim.new(0, 4)
+    channelPad.Parent = channelBar
 
-local ChannelGrid = Instance.new("UIGridLayout")
-ChannelGrid.CellSize = UDim2.new(0.333, -4, 0, 21)
-ChannelGrid.CellPadding = UDim2.fromOffset(4, 4)
-ChannelGrid.HorizontalAlignment = Enum.HorizontalAlignment.Center
-ChannelGrid.VerticalAlignment = Enum.VerticalAlignment.Center
-ChannelGrid.SortOrder = Enum.SortOrder.LayoutOrder
-ChannelGrid.Parent = ChannelBar
+    local channelGrid = Instance.new("UIGridLayout")
+    channelGrid.CellSize = UDim2.new(0.333, -4, 0, 21)
+    channelGrid.CellPadding = UDim2.fromOffset(4, 4)
+    channelGrid.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    channelGrid.VerticalAlignment = Enum.VerticalAlignment.Center
+    channelGrid.SortOrder = Enum.SortOrder.LayoutOrder
+    channelGrid.Parent = channelBar
 
-local channelBtns = {}
-local syncRed = nil
-local syncGreen = nil
-local syncBlue = nil
+    local channelBtns = {}
+    local syncRed = nil
+    local syncGreen = nil
+    local syncBlue = nil
 
-local function refreshColorControls()
-    local c = Config.Colors[Config.UI.SelectedColorKey]
-    LiveSwatch.BackgroundColor3 = c
-    for key, btn in pairs(channelBtns) do
-        local active = (key == Config.UI.SelectedColorKey)
-        tween(btn, 0.14, {
-            BackgroundColor3 = active and Palette.PrimaryAccent or Palette.GlassBase,
-            BackgroundTransparency = active and 0.15 or 1,
-            TextColor3 = active and Palette.TextHeader or Palette.TextSilver,
-        })
+    UI.refreshColorControls = function()
+        local c = Config.Colors[Config.UI.SelectedColorKey]
+        liveSwatch.BackgroundColor3 = c
+        for key, btn in pairs(channelBtns) do
+            local active = (key == Config.UI.SelectedColorKey)
+            tween(btn, 0.14, {
+                BackgroundColor3 = active and Palette.PrimaryAccent or Palette.GlassBase,
+                BackgroundTransparency = active and 0.15 or 1,
+                TextColor3 = active and Palette.TextHeader or Palette.TextSilver,
+            })
+        end
+        if syncRed then syncRed() end
+        if syncGreen then syncGreen() end
+        if syncBlue then syncBlue() end
+        notifyColorUpdated()
     end
-    if syncRed then syncRed() end
-    if syncGreen then syncGreen() end
-    if syncBlue then syncBlue() end
-    notifyColorUpdated()
-end
 
-for idx, def in ipairs(ColorChannelDefs) do
-    local b = Instance.new("TextButton")
-    b.LayoutOrder = idx
-    b.Text = def.Label
-    b.Font = Enum.Font.GothamMedium
-    b.TextSize = 10
-    b.TextTruncate = Enum.TextTruncate.AtEnd
-    b.AutoButtonColor = false
-    b.BorderSizePixel = 0
-    b.ZIndex = 6
-    b.Parent = ChannelBar
+    for idx, def in ipairs(colorChannelDefs) do
+        local b = Instance.new("TextButton")
+        b.LayoutOrder = idx
+        b.Text = def.Label
+        b.Font = Enum.Font.GothamMedium
+        b.TextSize = 10
+        b.TextTruncate = Enum.TextTruncate.AtEnd
+        b.AutoButtonColor = false
+        b.BorderSizePixel = 0
+        b.ZIndex = 6
+        b.Parent = channelBar
 
-    local bc = Instance.new("UICorner")
-    bc.CornerRadius = UDim.new(0, 6)
-    bc.Parent = b
+        local bc = Instance.new("UICorner")
+        bc.CornerRadius = UDim.new(0, 6)
+        bc.Parent = b
 
-    bindSafeTap(b, ColorsPage, function()
-        Config.UI.SelectedColorKey = def.Key
-        refreshColorControls()
+        bindSafeTap(b, ColorsPage, function()
+            Config.UI.SelectedColorKey = def.Key
+            UI.refreshColorControls()
+        end)
+
+        channelBtns[def.Key] = b
+    end
+
+    local function updateChannelRGB(r, g, b)
+        local key = Config.UI.SelectedColorKey
+        local cur = Config.Colors[key]
+        local nr = (r ~= nil) and r or math.round(cur.R * 255)
+        local ng = (g ~= nil) and g or math.round(cur.G * 255)
+        local nb = (b ~= nil) and b or math.round(cur.B * 255)
+        Config.Colors[key] = Color3.fromRGB(nr, ng, nb)
+        liveSwatch.BackgroundColor3 = Config.Colors[key]
+        notifyColorUpdated()
+    end
+
+    syncRed = addSlider(ColorsPage, 7, "Red Channel", 0, 255, 1, function(v)
+        return string.format("%d", math.round(v))
+    end, function()
+        return math.round(Config.Colors[Config.UI.SelectedColorKey].R * 255)
+    end, function(v)
+        updateChannelRGB(math.round(v), nil, nil)
     end)
 
-    channelBtns[def.Key] = b
-end
-
-local function updateChannelRGB(r, g, b)
-    local key = Config.UI.SelectedColorKey
-    local cur = Config.Colors[key]
-    local nr = (r ~= nil) and r or math.round(cur.R * 255)
-    local ng = (g ~= nil) and g or math.round(cur.G * 255)
-    local nb = (b ~= nil) and b or math.round(cur.B * 255)
-    Config.Colors[key] = Color3.fromRGB(nr, ng, nb)
-    LiveSwatch.BackgroundColor3 = Config.Colors[key]
-    notifyColorUpdated()
-end
-
-syncRed = addSlider(ColorsPage, 7, "Red Channel", 0, 255, 1, function(v)
-    return string.format("%d", math.round(v))
-end, function()
-    return math.round(Config.Colors[Config.UI.SelectedColorKey].R * 255)
-end, function(v)
-    updateChannelRGB(math.round(v), nil, nil)
-end)
-
-syncGreen = addSlider(ColorsPage, 8, "Green Channel", 0, 255, 1, function(v)
-    return string.format("%d", math.round(v))
-end, function()
-    return math.round(Config.Colors[Config.UI.SelectedColorKey].G * 255)
-end, function(v)
-    updateChannelRGB(nil, math.round(v), nil)
-end)
-
-syncBlue = addSlider(ColorsPage, 9, "Blue Channel", 0, 255, 1, function(v)
-    return string.format("%d", math.round(v))
-end, function()
-    return math.round(Config.Colors[Config.UI.SelectedColorKey].B * 255)
-end, function(v)
-    updateChannelRGB(nil, nil, math.round(v))
-end)
-
-local SwatchesCard = createCardRow(ColorsPage, 68, 10)
-local SwatchTitle = Instance.new("TextLabel")
-SwatchTitle.BackgroundTransparency = 1
-SwatchTitle.Position = UDim2.fromOffset(0, 0)
-SwatchTitle.Size = UDim2.new(1, 0, 0, 18)
-SwatchTitle.Font = Enum.Font.GothamMedium
-SwatchTitle.Text = "Quick Color Presets"
-SwatchTitle.TextSize = 13
-SwatchTitle.TextColor3 = Palette.TextHeader
-SwatchTitle.TextXAlignment = Enum.TextXAlignment.Left
-SwatchTitle.ZIndex = 5
-SwatchTitle.Parent = SwatchesCard
-
-local SwatchRow = Instance.new("Frame")
-SwatchRow.AnchorPoint = Vector2.new(0.5, 1)
-SwatchRow.Position = UDim2.new(0.5, 0, 1, 0)
-SwatchRow.Size = UDim2.new(1, 0, 0, 26)
-SwatchRow.BackgroundTransparency = 1
-SwatchRow.ZIndex = 5
-SwatchRow.Parent = SwatchesCard
-
-local SwatchLayout = Instance.new("UIListLayout")
-SwatchLayout.FillDirection = Enum.FillDirection.Horizontal
-SwatchLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
-SwatchLayout.VerticalAlignment = Enum.VerticalAlignment.Center
-SwatchLayout.Padding = UDim.new(0, 10)
-SwatchLayout.Parent = SwatchRow
-
-local PresetPalette = {
-    Color3.fromRGB(56, 232, 198),
-    Color3.fromRGB(88, 156, 255),
-    Color3.fromRGB(244, 63, 94),
-    Color3.fromRGB(251, 146, 60),
-    Color3.fromRGB(168, 85, 247),
-    Color3.fromRGB(250, 204, 21),
-    Color3.fromRGB(242, 245, 252),
-    Color3.fromRGB(52, 211, 153),
-}
-
-for _, swatchColor in ipairs(PresetPalette) do
-    local sb = Instance.new("TextButton")
-    sb.Size = UDim2.fromOffset(24, 24)
-    sb.Text = ""
-    sb.BackgroundColor3 = swatchColor
-    sb.AutoButtonColor = false
-    sb.BorderSizePixel = 0
-    sb.ZIndex = 6
-    sb.Parent = SwatchRow
-
-    local sc = Instance.new("UICorner")
-    sc.CornerRadius = UDim.new(1, 0)
-    sc.Parent = sb
-
-    local ss = Instance.new("UIStroke")
-    ss.Thickness = 1
-    ss.Transparency = 0.45
-    ss.Color = Palette.TextHeader
-    ss.Parent = sb
-
-    bindSafeTap(sb, ColorsPage, function()
-        Config.Colors[Config.UI.SelectedColorKey] = swatchColor
-        refreshColorControls()
+    syncGreen = addSlider(ColorsPage, 8, "Green Channel", 0, 255, 1, function(v)
+        return string.format("%d", math.round(v))
+    end, function()
+        return math.round(Config.Colors[Config.UI.SelectedColorKey].G * 255)
+    end, function(v)
+        updateChannelRGB(nil, math.round(v), nil)
     end)
-end
 
-refreshColorControls()
+    syncBlue = addSlider(ColorsPage, 9, "Blue Channel", 0, 255, 1, function(v)
+        return string.format("%d", math.round(v))
+    end, function()
+        return math.round(Config.Colors[Config.UI.SelectedColorKey].B * 255)
+    end, function(v)
+        updateChannelRGB(nil, nil, math.round(v))
+    end)
+
+    local swatchesCard = createCardRow(ColorsPage, 68, 10)
+    local swatchTitle = Instance.new("TextLabel")
+    swatchTitle.BackgroundTransparency = 1
+    swatchTitle.Position = UDim2.fromOffset(0, 0)
+    swatchTitle.Size = UDim2.new(1, 0, 0, 18)
+    swatchTitle.Font = Enum.Font.GothamMedium
+    swatchTitle.Text = "Quick Color Presets"
+    swatchTitle.TextSize = 13
+    swatchTitle.TextColor3 = Palette.TextHeader
+    swatchTitle.TextXAlignment = Enum.TextXAlignment.Left
+    swatchTitle.ZIndex = 5
+    swatchTitle.Parent = swatchesCard
+
+    local swatchRow = Instance.new("Frame")
+    swatchRow.AnchorPoint = Vector2.new(0.5, 1)
+    swatchRow.Position = UDim2.new(0.5, 0, 1, 0)
+    swatchRow.Size = UDim2.new(1, 0, 0, 26)
+    swatchRow.BackgroundTransparency = 1
+    swatchRow.ZIndex = 5
+    swatchRow.Parent = swatchesCard
+
+    local swatchLayout = Instance.new("UIListLayout")
+    swatchLayout.FillDirection = Enum.FillDirection.Horizontal
+    swatchLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    swatchLayout.VerticalAlignment = Enum.VerticalAlignment.Center
+    swatchLayout.Padding = UDim.new(0, 10)
+    swatchLayout.Parent = swatchRow
+
+    local presetPalette = {
+        Color3.fromRGB(56, 232, 198),
+        Color3.fromRGB(88, 156, 255),
+        Color3.fromRGB(244, 63, 94),
+        Color3.fromRGB(251, 146, 60),
+        Color3.fromRGB(168, 85, 247),
+        Color3.fromRGB(250, 204, 21),
+        Color3.fromRGB(242, 245, 252),
+        Color3.fromRGB(52, 211, 153),
+    }
+
+    for _, swatchColor in ipairs(presetPalette) do
+        local sb = Instance.new("TextButton")
+        sb.Size = UDim2.fromOffset(24, 24)
+        sb.Text = ""
+        sb.BackgroundColor3 = swatchColor
+        sb.AutoButtonColor = false
+        sb.BorderSizePixel = 0
+        sb.ZIndex = 6
+        sb.Parent = swatchRow
+
+        local sc = Instance.new("UICorner")
+        sc.CornerRadius = UDim.new(1, 0)
+        sc.Parent = sb
+
+        local ss = Instance.new("UIStroke")
+        ss.Thickness = 1
+        ss.Transparency = 0.45
+        ss.Color = Palette.TextHeader
+        ss.Parent = sb
+
+        bindSafeTap(sb, ColorsPage, function()
+            Config.Colors[Config.UI.SelectedColorKey] = swatchColor
+            UI.refreshColorControls()
+        end)
+    end
+
+    UI.refreshColorControls()
+end
 
 -- 5. SETTINGS & PERFORMANCE TAB
-local SettingsPage = TabPages["Settings"]
-local settingsOrder = 1
+do
+    local settingsOrder = 1
 
-addSectionHeader(SettingsPage, settingsOrder, "Performance & FPS Booster")
-settingsOrder = settingsOrder + 1
-
-addToggle(SettingsPage, settingsOrder, "Potato Graphics (FPS Boost)", "Drops quality, shadows, particles & map textures for max FPS", function()
-    return Config.Performance.PotatoGraphics
-end, function(v)
-    applyPotatoGraphics(v)
-end)
-settingsOrder = settingsOrder + 1
-
-addSectionHeader(SettingsPage, settingsOrder, "Detection & Render Engine")
-settingsOrder = settingsOrder + 1
-
-addSelector(SettingsPage, settingsOrder, "Team Check Mode", {"Auto", "Team Property", "TeamColor", "Off"}, function()
-    return Config.Resolver.TeamCheckMode
-end, function(v)
-    Config.Resolver.TeamCheckMode = v
-end, true)
-settingsOrder = settingsOrder + 1
-
-if DrawingSupported then
-    addSelector(SettingsPage, settingsOrder, "ESP Render Engine", {"ScreenGui", "Drawing"}, function()
-        return Config.ESP.RenderEngine
-    end, function(v)
-        Config.ESP.RenderEngine = v
-    end, false)
+    addSectionHeader(SettingsPage, settingsOrder, "Performance & FPS Booster")
     settingsOrder = settingsOrder + 1
+
+    addToggle(SettingsPage, settingsOrder, "Potato Graphics (FPS Boost)", "Drops quality, shadows, particles & map textures for max FPS", function()
+        return Config.Performance.PotatoGraphics
+    end, function(v)
+        applyPotatoGraphics(v)
+    end)
+    settingsOrder = settingsOrder + 1
+
+    addSectionHeader(SettingsPage, settingsOrder, "Detection & Render Engine")
+    settingsOrder = settingsOrder + 1
+
+    addSelector(SettingsPage, settingsOrder, "Team Check Mode", {"Auto", "Team Property", "TeamColor", "Off"}, function()
+        return Config.Resolver.TeamCheckMode
+    end, function(v)
+        Config.Resolver.TeamCheckMode = v
+    end, true)
+    settingsOrder = settingsOrder + 1
+
+    if DrawingSupported then
+        addSelector(SettingsPage, settingsOrder, "ESP Render Engine", {"ScreenGui", "Drawing"}, function()
+            return Config.ESP.RenderEngine
+        end, function(v)
+            Config.ESP.RenderEngine = v
+        end, false)
+        settingsOrder = settingsOrder + 1
+    end
+
+    addToggle(SettingsPage, settingsOrder, "Workspace Container Scan", "Scans custom Players / Characters / Entities folders", function()
+        return Config.Resolver.CustomContainerScan
+    end, function(v)
+        Config.Resolver.CustomContainerScan = v
+        ScheduleReload("CustomContainerScanToggle", false)
+    end)
+    settingsOrder = settingsOrder + 1
+
+    addToggle(SettingsPage, settingsOrder, "Ignore Transparent Glass & Water", "Allows raycast wall check through glass/water", function()
+        return Config.ESP.IgnoreGlassWater
+    end, function(v)
+        Config.ESP.IgnoreGlassWater = v
+    end)
+    settingsOrder = settingsOrder + 1
+
+    addSectionHeader(SettingsPage, settingsOrder, "Floating Quick Buttons & Limits")
+    settingsOrder = settingsOrder + 1
+
+    addToggle(SettingsPage, settingsOrder, "Show Aim Lock GUI Button", "Displays floating draggable Aim Lock ON/OFF button", function()
+        return Config.UI.ShowMobileAimButton
+    end, function(v)
+        Config.UI.ShowMobileAimButton = v
+    end)
+    settingsOrder = settingsOrder + 1
+
+    addToggle(SettingsPage, settingsOrder, "Show Trigger Bot GUI Button", "Displays floating draggable Trigger ON/OFF button", function()
+        return Config.UI.ShowMobileTriggerButton
+    end, function(v)
+        Config.UI.ShowMobileTriggerButton = v
+    end)
+    settingsOrder = settingsOrder + 1
+
+    addSlider(SettingsPage, settingsOrder, "Max Render Distance", 200, 3500, 50, function(v)
+        return string.format("%dm", math.round(v))
+    end, function()
+        return Config.ESP.MaxDistance
+    end, function(v)
+        Config.ESP.MaxDistance = v
+        Config.Aimbot.MaxDistance = v
+    end)
+    settingsOrder = settingsOrder + 1
+
+    addSlider(SettingsPage, settingsOrder, "360° Alert Ring Radius", 80, 280, 5, function(v)
+        return string.format("%d px", math.round(v))
+    end, function()
+        return Config.ESP.AlertRingRadius
+    end, function(v)
+        Config.ESP.AlertRingRadius = v
+    end)
+    settingsOrder = settingsOrder + 1
+
+    addSectionHeader(SettingsPage, settingsOrder, "System Actions")
+    settingsOrder = settingsOrder + 1
+
+    local actionCard = createCardRow(SettingsPage, 54, settingsOrder)
+    local actionGrid = Instance.new("UIGridLayout")
+    actionGrid.CellSize = UDim2.new(0.333, -6, 1, 0)
+    actionGrid.CellPadding = UDim2.fromOffset(8, 0)
+    actionGrid.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    actionGrid.VerticalAlignment = Enum.VerticalAlignment.Center
+    actionGrid.Parent = actionCard
+
+    ForceReloadBtn = Instance.new("TextButton")
+    ForceReloadBtn.Text = "Reload All"
+    ForceReloadBtn.Font = Enum.Font.GothamMedium
+    ForceReloadBtn.TextSize = 11.5
+    ForceReloadBtn.TextColor3 = Palette.TextHeader
+    ForceReloadBtn.BackgroundColor3 = Palette.PrimaryAccent
+    ForceReloadBtn.BackgroundTransparency = 0.25
+    ForceReloadBtn.AutoButtonColor = false
+    ForceReloadBtn.BorderSizePixel = 0
+    ForceReloadBtn.ZIndex = 6
+    ForceReloadBtn.Parent = actionCard
+    local frc = Instance.new("UICorner")
+    frc.CornerRadius = UDim.new(0, 8)
+    frc.Parent = ForceReloadBtn
+
+    ResetBtn = Instance.new("TextButton")
+    ResetBtn.Text = "Reset Defaults"
+    ResetBtn.Font = Enum.Font.GothamMedium
+    ResetBtn.TextSize = 11.5
+    ResetBtn.TextColor3 = Palette.TextHeader
+    ResetBtn.BackgroundColor3 = Palette.SurfaceSoft
+    ResetBtn.AutoButtonColor = false
+    ResetBtn.BorderSizePixel = 0
+    ResetBtn.ZIndex = 6
+    ResetBtn.Parent = actionCard
+    local rc = Instance.new("UICorner")
+    rc.CornerRadius = UDim.new(0, 8)
+    rc.Parent = ResetBtn
+
+    UnloadBtn = Instance.new("TextButton")
+    UnloadBtn.Text = "Unload AKI"
+    UnloadBtn.Font = Enum.Font.GothamMedium
+    UnloadBtn.TextSize = 11.5
+    UnloadBtn.TextColor3 = Palette.TextHeader
+    UnloadBtn.BackgroundColor3 = Palette.Danger
+    UnloadBtn.BackgroundTransparency = 0.2
+    UnloadBtn.AutoButtonColor = false
+    UnloadBtn.BorderSizePixel = 0
+    UnloadBtn.ZIndex = 6
+    UnloadBtn.Parent = actionCard
+    local uc = Instance.new("UICorner")
+    uc.CornerRadius = UDim.new(0, 8)
+    uc.Parent = UnloadBtn
 end
+end -- end populateAllTabs
 
-addToggle(SettingsPage, settingsOrder, "Workspace Container Scan", "Scans custom Players / Characters / Entities folders", function()
-    return Config.Resolver.CustomContainerScan
-end, function(v)
-    Config.Resolver.CustomContainerScan = v
-    ScheduleReload("CustomContainerScanToggle", false)
-end)
-settingsOrder = settingsOrder + 1
-
-addToggle(SettingsPage, settingsOrder, "Ignore Transparent Glass & Water", "Allows raycast wall check through glass/water", function()
-    return Config.ESP.IgnoreGlassWater
-end, function(v)
-    Config.ESP.IgnoreGlassWater = v
-end)
-settingsOrder = settingsOrder + 1
-
-addSectionHeader(SettingsPage, settingsOrder, "Floating Quick Buttons & Limits")
-settingsOrder = settingsOrder + 1
-
-addToggle(SettingsPage, settingsOrder, "Show Aim Lock GUI Button", "Displays floating draggable Aim Lock ON/OFF button", function()
-    return Config.UI.ShowMobileAimButton
-end, function(v)
-    Config.UI.ShowMobileAimButton = v
-end)
-settingsOrder = settingsOrder + 1
-
-addToggle(SettingsPage, settingsOrder, "Show Trigger Bot GUI Button", "Displays floating draggable Trigger ON/OFF button", function()
-    return Config.UI.ShowMobileTriggerButton
-end, function(v)
-    Config.UI.ShowMobileTriggerButton = v
-end)
-settingsOrder = settingsOrder + 1
-
-addSlider(SettingsPage, settingsOrder, "Max Render Distance", 200, 3500, 50, function(v)
-    return string.format("%dm", math.round(v))
-end, function()
-    return Config.ESP.MaxDistance
-end, function(v)
-    Config.ESP.MaxDistance = v
-    Config.Aimbot.MaxDistance = v
-end)
-settingsOrder = settingsOrder + 1
-
-addSlider(SettingsPage, settingsOrder, "360° Alert Ring Radius", 80, 280, 5, function(v)
-    return string.format("%d px", math.round(v))
-end, function()
-    return Config.ESP.AlertRingRadius
-end, function(v)
-    Config.ESP.AlertRingRadius = v
-end)
-settingsOrder = settingsOrder + 1
-
-addSectionHeader(SettingsPage, settingsOrder, "System Actions")
-settingsOrder = settingsOrder + 1
-
-local ActionCard = createCardRow(SettingsPage, 54, settingsOrder)
-local ActionGrid = Instance.new("UIGridLayout")
-ActionGrid.CellSize = UDim2.new(0.333, -6, 1, 0)
-ActionGrid.CellPadding = UDim2.fromOffset(8, 0)
-ActionGrid.HorizontalAlignment = Enum.HorizontalAlignment.Center
-ActionGrid.VerticalAlignment = Enum.VerticalAlignment.Center
-ActionGrid.Parent = ActionCard
-
-local ForceReloadBtn = Instance.new("TextButton")
-ForceReloadBtn.Text = "Reload All"
-ForceReloadBtn.Font = Enum.Font.GothamMedium
-ForceReloadBtn.TextSize = 11.5
-ForceReloadBtn.TextColor3 = Palette.TextHeader
-ForceReloadBtn.BackgroundColor3 = Palette.PrimaryAccent
-ForceReloadBtn.BackgroundTransparency = 0.25
-ForceReloadBtn.AutoButtonColor = false
-ForceReloadBtn.BorderSizePixel = 0
-ForceReloadBtn.ZIndex = 6
-ForceReloadBtn.Parent = ActionCard
-
-local ForceReloadCorner = Instance.new("UICorner")
-ForceReloadCorner.CornerRadius = UDim.new(0, 8)
-ForceReloadCorner.Parent = ForceReloadBtn
-
-local ResetBtn = Instance.new("TextButton")
-ResetBtn.Text = "Reset Defaults"
-ResetBtn.Font = Enum.Font.GothamMedium
-ResetBtn.TextSize = 11.5
-ResetBtn.TextColor3 = Palette.TextHeader
-ResetBtn.BackgroundColor3 = Palette.SurfaceSoft
-ResetBtn.AutoButtonColor = false
-ResetBtn.BorderSizePixel = 0
-ResetBtn.ZIndex = 6
-ResetBtn.Parent = ActionCard
-
-local ResetCorner = Instance.new("UICorner")
-ResetCorner.CornerRadius = UDim.new(0, 8)
-ResetCorner.Parent = ResetBtn
-
-local UnloadBtn = Instance.new("TextButton")
-UnloadBtn.Text = "Unload AKI"
-UnloadBtn.Font = Enum.Font.GothamMedium
-UnloadBtn.TextSize = 11.5
-UnloadBtn.TextColor3 = Palette.TextHeader
-UnloadBtn.BackgroundColor3 = Palette.Danger
-UnloadBtn.BackgroundTransparency = 0.2
-UnloadBtn.AutoButtonColor = false
-UnloadBtn.BorderSizePixel = 0
-UnloadBtn.ZIndex = 6
-UnloadBtn.Parent = ActionCard
-
-local UnloadCorner = Instance.new("UICorner")
-UnloadCorner.CornerRadius = UDim.new(0, 8)
-UnloadCorner.Parent = UnloadBtn
+populateAllTabs()
 
 -- ============================================================================
 -- [SECTION 12] FLOATING MOBILE PILL BUTTONS & CLEAN UNLOAD
@@ -6186,10 +6249,6 @@ MobileToggle.BorderSizePixel = 0
 MobileToggle.ZIndex = 20
 MobileToggle.Parent = MainGui
 
-local ToggleCorner = Instance.new("UICorner")
-ToggleCorner.CornerRadius = UDim.new(1, 0)
-ToggleCorner.Parent = MobileToggle
-
 local ToggleStroke = applyGlassStroke(MobileToggle, 1.4, 0.35)
 ToggleStroke.Color = Palette.ActiveGlow
 
@@ -6209,10 +6268,6 @@ MobileAimBtn.BorderSizePixel = 0
 MobileAimBtn.Visible = true
 MobileAimBtn.ZIndex = 20
 MobileAimBtn.Parent = MainGui
-
-local AimBtnCorner = Instance.new("UICorner")
-AimBtnCorner.CornerRadius = UDim.new(1, 0)
-AimBtnCorner.Parent = MobileAimBtn
 
 local AimBtnStroke = applyGlassStroke(MobileAimBtn, 1.4, 0.45)
 
@@ -6251,11 +6306,15 @@ MobileTriggerBtn.Visible = true
 MobileTriggerBtn.ZIndex = 20
 MobileTriggerBtn.Parent = MainGui
 
-local TriggerBtnCorner = Instance.new("UICorner")
-TriggerBtnCorner.CornerRadius = UDim.new(1, 0)
-TriggerBtnCorner.Parent = MobileTriggerBtn
-
 local TriggerBtnStroke = applyGlassStroke(MobileTriggerBtn, 1.4, 0.45)
+
+do
+    for _, pill in ipairs({MobileToggle, MobileAimBtn, MobileTriggerBtn}) do
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(1, 0)
+        c.Parent = pill
+    end
+end
 
 local function refreshMobileTriggerStyle()
     local on = Config.TriggerBot.Enabled
@@ -6390,9 +6449,11 @@ makeDraggableButton(MobileTriggerBtn, function()
     SyncDependentSettings(false)
 end)
 
-MinimizeBtn.Activated:Connect(function()
-    setPanelVisible(false)
-end)
+if UI.MinimizeBtn then
+    UI.MinimizeBtn.Activated:Connect(function()
+        setPanelVisible(false)
+    end)
+end
 
 addConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
     if not gameProcessed and input.KeyCode == Enum.KeyCode.RightShift then
@@ -6437,7 +6498,9 @@ bindSafeTap(ResetBtn, SettingsPage, function()
     for _, sync in ipairs(SyncCallbacks) do
         pcall(sync)
     end
-    refreshColorControls()
+    if UI.refreshColorControls then
+        UI.refreshColorControls()
+    end
     applyThicknessImmediate()
     SyncDependentSettings(true, "ResetDefaults")
     ResetBtn.Text = "Reset!"
@@ -6500,5 +6563,7 @@ end
 
 globalEnv.TEAM_AKI_UNLOAD = unloadScript
 
-UnloadHeaderBtn.Activated:Connect(unloadScript)
+if UI.UnloadHeaderBtn then
+    UI.UnloadHeaderBtn.Activated:Connect(unloadScript)
+end
 bindSafeTap(UnloadBtn, SettingsPage, unloadScript)
