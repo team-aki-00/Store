@@ -187,7 +187,7 @@ local Config = {
         ProjectileSpeed = 0,            -- 0 = pure lead time; >0 adds Distance / Speed
         PingCompensation = false,
         FOVRadius = 135,                -- pixels
-        FOVThickness = 2.0,             -- 1 .. 10 pixels
+        FOVThickness = 1.5,             -- 0.1 .. 5.0 pixels
         ShowFOV = true,
         TeamCheck = true,
         VisibleCheck = true,
@@ -197,8 +197,16 @@ local Config = {
     },
     TriggerBot = {
         Enabled = false,
-        FireMode = "Mouse",             -- Touch-safe Mouse input (no PC-mode lock, no UI self-clicks)
-        HardwareMouse = true,           -- Uses guarded mouse1press/release/click with anti-UI & respawn Touch lock protection
+        FireMethod = "Auto",            -- "Auto" | "FireButton" | "Tool" | "VIM Touch" | "Mouse (Guard)"
+        HardwareMouse = true,           -- Guarded mouse fallback if VIM/FireButton/Tool unavailable
+        AutoRestoreMobile = true,       -- Automatically restores mobile Touch mode if PC mode triggers on death/respawn
+        PointerLocked = false,          -- Locks draggable VIM Touch target pointer for full touch passthrough
+        ShowPointer = true,             -- Displays floating VIM Touch target pointer
+        PointerOffsetX = 0.78,          -- Normalized viewport X (0.03 .. 0.97)
+        PointerOffsetY = 0.68,          -- Normalized viewport Y (0.05 .. 0.95)
+        SavedMethod = "",               -- Auto-saved working method for this game (PlaceId)
+        SavedButtonPath = "",           -- Auto-saved mobile fire button path for this game
+        SavedButtonName = "",           -- Auto-saved mobile fire button label/name
         SyncWithAimbot = true,          -- Syncs lead prediction, Auto Predict, ProjectileSpeed & lock target with Aimbot
         TargetFilter = "Any Part",      -- "Any Part" | "Head & Chest" | "Head Only"
         HoldToFire = false,             -- true = hold trigger while locked; false = timed tap shots
@@ -216,12 +224,12 @@ local Config = {
         RenderEngine = "ScreenGui",     -- "ScreenGui" (100% reliable mobile) | "Drawing"
         BoxESP = true,
         BoxStyle = "Corner",            -- "Corner" | "Full"
-        BoxThickness = 2.0,             -- 1 .. 10 pixels
+        BoxThickness = 1.5,             -- 0.1 .. 5.0 pixels
         HealthBar = true,
         ShowHealthPercent = true,
         TracerESP = true,
         TracerOrigin = "Bottom",        -- "Bottom" | "Center" | "Top"
-        LineThickness = 2.0,            -- 1 .. 10 pixels
+        LineThickness = 1.5,            -- 0.1 .. 5.0 pixels
         Alert360 = true,
         Alert360VisibleOnly = false,
         AlertRingRadius = 155,
@@ -243,7 +251,7 @@ local Config = {
         CustomContainerScan = true,
     },
     Performance = {
-        PotatoGraphics = false,         -- Aggressive FPS booster (lowers quality, shadows, effects, textures)
+        PotatoGraphics = false,         -- Extreme FPS booster (lowers quality, lighting, shadows, particles & textures)
     },
     Colors = {
         Visible = Color3.fromRGB(56, 232, 198),     -- Mint-Cyan (Unobstructed)
@@ -257,6 +265,7 @@ local Config = {
         Visible = true,
         ActiveTab = "Aimbot",
         SelectedColorKey = "Visible",
+        AutoSave = true,
         ShowMobileAimButton = true,
         MobileAimLocked = false,
         ShowMobileTriggerButton = true,
@@ -299,13 +308,23 @@ local State = {
     TriggerHolding = false,
     TriggerMouseHeld = false,
     TriggerFakeMouseHeld = false,
+    TriggerVimHeld = false,
+    TriggerBtnRef = nil,
     TriggerToolRef = nil,
+    TriggerPointerBtn = nil,
     LastTriggerMousePos = Vector2.zero,
+    ActiveTriggerMethodLabel = "Auto (Ready)",
+    LastActiveTriggerMethod = "",
+    LastActiveTriggerTag = "",
+    BlacklistedTriggerCandidates = {},
+    CachedFireButton = nil,
+    LastFireBtnScan = 0,
     TouchGuardToken = 0,
     TouchGuardLifecycleToken = 0,
     LastHardwareMouseTime = 0,
     LastTouchEnforceTime = 0,
     LastTouchBroadcastTime = 0,
+    LastAutoRestoreAttempt = 0,
     HasUsedHardwareMouse = false,
     NeedsTouchBroadcast = false,
     IsSynthesizingMouse = false,
@@ -320,6 +339,7 @@ local State = {
     ColorListeners = {},
     SavedGraphics = nil,
     PotatoDescConn = nil,
+    SaveTimerToken = 0,
     FrameIndex = 0,
     LastRenderTick = 0,
     ReloadCount = 0,
@@ -343,6 +363,179 @@ local function addOwnUserInputConn(signalObj, fn)
 end
 
 local TriggerGuard = {}
+TriggerGuard.VIM = tryGetService("VirtualInputManager")
+
+local ConfigStore = {
+    Http = tryGetService("HttpService"),
+    Folder = "TEAM_AKI_Configs",
+}
+
+function ConfigStore.getGameKey()
+    local pid = tonumber(game.PlaceId) or 0
+    local gid = tonumber(game.GameId) or 0
+    if pid > 0 then
+        return "game_" .. tostring(pid)
+    elseif gid > 0 then
+        return "universe_" .. tostring(gid)
+    end
+    return "session_default"
+end
+
+function ConfigStore.getFilePath()
+    return ConfigStore.Folder .. "/" .. ConfigStore.getGameKey() .. ".json"
+end
+
+function ConfigStore.encodeConfig()
+    local payload = {
+        Aimbot = shallowClone(Config.Aimbot),
+        TriggerBot = shallowClone(Config.TriggerBot),
+        ESP = shallowClone(Config.ESP),
+        Resolver = shallowClone(Config.Resolver),
+        Performance = shallowClone(Config.Performance),
+        UI = {
+            ActiveTab = Config.UI.ActiveTab,
+            SelectedColorKey = Config.UI.SelectedColorKey,
+            AutoSave = Config.UI.AutoSave,
+            ShowMobileAimButton = Config.UI.ShowMobileAimButton,
+            ShowMobileTriggerButton = Config.UI.ShowMobileTriggerButton,
+        },
+        Colors = {},
+    }
+    for k, c in pairs(Config.Colors) do
+        if typeof(c) == "Color3" then
+            payload.Colors[k] = {
+                math.round(c.R * 255),
+                math.round(c.G * 255),
+                math.round(c.B * 255),
+            }
+        end
+    end
+    return payload
+end
+
+function ConfigStore.applyLoaded(data)
+    if type(data) ~= "table" then
+        return false
+    end
+    local function mergeSection(secName)
+        if type(data[secName]) == "table" and type(Config[secName]) == "table" then
+            for k, defaultVal in pairs(Config[secName]) do
+                local v = data[secName][k]
+                if v ~= nil and type(v) == type(defaultVal) then
+                    Config[secName][k] = v
+                end
+            end
+        end
+    end
+    mergeSection("Aimbot")
+    mergeSection("TriggerBot")
+    mergeSection("ESP")
+    mergeSection("Resolver")
+    mergeSection("Performance")
+    if type(data.UI) == "table" then
+        for _, key in ipairs({"ActiveTab", "SelectedColorKey", "AutoSave", "ShowMobileAimButton", "ShowMobileTriggerButton"}) do
+            local v = data.UI[key]
+            if v ~= nil and type(v) == type(Config.UI[key]) then
+                Config.UI[key] = v
+            end
+        end
+    end
+    if type(data.Colors) == "table" then
+        for k, arr in pairs(data.Colors) do
+            if type(arr) == "table" and #arr == 3 and Config.Colors[k] ~= nil then
+                Config.Colors[k] = Color3.fromRGB(
+                    math.clamp(tonumber(arr[1]) or 255, 0, 255),
+                    math.clamp(tonumber(arr[2]) or 255, 0, 255),
+                    math.clamp(tonumber(arr[3]) or 255, 0, 255)
+                )
+            end
+        end
+    end
+
+    -- Clamp ultra-fine thickness & normalized pointer offsets safely
+    Config.Aimbot.FOVThickness = math.clamp(math.round((Config.Aimbot.FOVThickness or 1.5) * 10) / 10, 0.1, 5.0)
+    Config.ESP.BoxThickness = math.clamp(math.round((Config.ESP.BoxThickness or 1.5) * 10) / 10, 0.1, 5.0)
+    Config.ESP.LineThickness = math.clamp(math.round((Config.ESP.LineThickness or 1.5) * 10) / 10, 0.1, 5.0)
+    Config.TriggerBot.PointerOffsetX = math.clamp(Config.TriggerBot.PointerOffsetX or 0.78, 0.03, 0.97)
+    Config.TriggerBot.PointerOffsetY = math.clamp(Config.TriggerBot.PointerOffsetY or 0.68, 0.05, 0.95)
+    Config.UI.MobileAimLocked = Config.Aimbot.Enabled
+    Config.UI.MobileTriggerLocked = Config.TriggerBot.Enabled
+    if Config.TriggerBot.SavedMethod ~= "" then
+        local btnTag = (Config.TriggerBot.SavedButtonName ~= "") and (" (" .. Config.TriggerBot.SavedButtonName .. ")") or ""
+        State.ActiveTriggerMethodLabel = "Saved: " .. Config.TriggerBot.SavedMethod .. btnTag
+    end
+    return true
+end
+
+function ConfigStore.save()
+    local payload = ConfigStore.encodeConfig()
+    local key = ConfigStore.getGameKey()
+    if type(globalEnv.TEAM_AKI_SAVED_CONFIGS) ~= "table" then
+        globalEnv.TEAM_AKI_SAVED_CONFIGS = {}
+    end
+    globalEnv.TEAM_AKI_SAVED_CONFIGS[key] = payload
+
+    local http = ConfigStore.Http
+    if not http or type(writefile) ~= "function" then
+        return true
+    end
+    local okJson, jsonText = pcall(function()
+        return http:JSONEncode(payload)
+    end)
+    if not okJson or type(jsonText) ~= "string" then
+        return false
+    end
+    if type(isfolder) == "function" and type(makefolder) == "function" then
+        pcall(function()
+            if not isfolder(ConfigStore.Folder) then
+                makefolder(ConfigStore.Folder)
+            end
+        end)
+    elseif type(makefolder) == "function" then
+        pcall(makefolder, ConfigStore.Folder)
+    end
+    local okWrite = pcall(writefile, ConfigStore.getFilePath(), jsonText)
+    return okWrite
+end
+
+function ConfigStore.load()
+    local key = ConfigStore.getGameKey()
+    local http = ConfigStore.Http
+    if http and type(isfile) == "function" and type(readfile) == "function" then
+        local path = ConfigStore.getFilePath()
+        local okExists, exists = pcall(isfile, path)
+        if okExists and exists then
+            local okRead, raw = pcall(readfile, path)
+            if okRead and type(raw) == "string" and raw ~= "" then
+                local okDec, decoded = pcall(function()
+                    return http:JSONDecode(raw)
+                end)
+                if okDec and type(decoded) == "table" then
+                    return ConfigStore.applyLoaded(decoded)
+                end
+            end
+        end
+    end
+    if type(globalEnv.TEAM_AKI_SAVED_CONFIGS) == "table" and type(globalEnv.TEAM_AKI_SAVED_CONFIGS[key]) == "table" then
+        return ConfigStore.applyLoaded(globalEnv.TEAM_AKI_SAVED_CONFIGS[key])
+    end
+    return false
+end
+
+function ConfigStore.scheduleSave()
+    if not Config.UI.AutoSave or State.Unloaded then
+        return
+    end
+    State.SaveTimerToken = State.SaveTimerToken + 1
+    local myToken = State.SaveTimerToken
+    task.delay(0.35, function()
+        if (not State.Unloaded) and State.SaveTimerToken == myToken and Config.UI.AutoSave then
+            ConfigStore.save()
+        end
+    end)
+end
+
+ConfigStore.load()
 
 local function notifyColorUpdated()
     for _, callback in ipairs(State.ColorListeners) do
@@ -774,7 +967,7 @@ local function createRegistryVisualBundle()
                 pcall(function()
                     if state.ShowBox then
                         local x, y, w, h = state.BX, state.BY, state.BW, state.BH
-                        local t = math.max(state.BoxThickness, 1)
+                        local t = math.clamp(state.BoxThickness, 0.1, 5.0)
                         local col = state.BoxColor
                         if state.BoxStyle == "Full" then
                             d.Box.Visible = true
@@ -866,7 +1059,7 @@ local function createRegistryVisualBundle()
                         d.Tracer.From = state.TracerFrom
                         d.Tracer.To = state.TracerTo
                         d.Tracer.Color = state.TracerColor
-                        d.Tracer.Thickness = math.max(state.LineThickness, 1)
+                        d.Tracer.Thickness = math.clamp(state.LineThickness, 0.1, 5.0)
                     else
                         d.Tracer.Visible = false
                     end
@@ -882,7 +1075,7 @@ local function createRegistryVisualBundle()
                             d.Arrow.PointB = baseCenter + perp * 7
                             d.Arrow.PointC = baseCenter - perp * 7
                             d.Arrow.Color = state.ArrowColor
-                            d.Arrow.Thickness = math.clamp(state.LineThickness, 1, 6)
+                            d.Arrow.Thickness = math.clamp(state.LineThickness, 0.1, 5.0)
                         else
                             d.Arrow.Visible = false
                         end
@@ -896,7 +1089,7 @@ local function createRegistryVisualBundle()
 
             if state.ShowBox then
                 local x, y, w, h = state.BX, state.BY, state.BW, state.BH
-                local t = math.max(state.BoxThickness, 1)
+                local t = math.clamp(state.BoxThickness, 0.1, 5.0)
                 local col = state.BoxColor
 
                 if state.BoxStyle == "Full" then
@@ -983,7 +1176,7 @@ local function createRegistryVisualBundle()
             if state.ShowTracer then
                 local delta = state.TracerTo - state.TracerFrom
                 local mid = (state.TracerFrom + state.TracerTo) * 0.5
-                local lineT = math.max(state.LineThickness, 1)
+                local lineT = math.clamp(state.LineThickness, 0.1, 5.0)
                 tracerFrame.Visible = true
                 tracerFrame.Position = UDim2.fromOffset(mid.X, mid.Y)
                 tracerFrame.Size = UDim2.fromOffset(math.max(delta.Magnitude, 1), lineT)
@@ -994,7 +1187,7 @@ local function createRegistryVisualBundle()
             end
 
             if state.ShowArrow then
-                local arrowT = math.clamp(state.LineThickness, 1.5, 6)
+                local arrowT = math.clamp(state.LineThickness, 0.1, 5.0)
                 arrowHolder.Visible = true
                 arrowHolder.Position = UDim2.fromOffset(state.ArrowPos.X, state.ArrowPos.Y)
                 arrowHolder.Rotation = math.deg(state.ArrowAngle) + 90
@@ -2080,6 +2273,17 @@ addConnection(LocalPlayer.CharacterAdded:Connect(function(char)
     end
 end))
 
+addConnection(LocalPlayer.CharacterAppearanceLoaded:Connect(function(char)
+    if not State.Unloaded then
+        if char and State.LocalCharacter ~= char then
+            bindLocalCharacter(char)
+        elseif type(TriggerGuard.onCharacterLifecycle) == "function" then
+            pcall(TriggerGuard.onCharacterLifecycle, "AppearanceLoaded")
+        end
+        ScheduleReload("LocalAppearanceLoaded", false)
+    end
+end))
+
 addConnection(LocalPlayer.CharacterRemoving:Connect(function()
     clearLocalCharacterState()
     if not State.Unloaded then
@@ -2336,6 +2540,10 @@ local function getCharacterHealth(entry)
         if attrHp == nil then attrHp = char:GetAttribute("HP") end
         local attrMax = char:GetAttribute("MaxHealth")
         if attrMax == nil then attrMax = char:GetAttribute("MaxHP") end
+        if type(attrHp) ~= "number" and entry.Player then
+            attrHp = entry.Player:GetAttribute("Health") or entry.Player:GetAttribute("HP")
+            attrMax = attrMax or entry.Player:GetAttribute("MaxHealth") or entry.Player:GetAttribute("MaxHP")
+        end
         if type(attrHp) == "number" then
             local maxHp = (type(attrMax) == "number" and attrMax > 0) and attrMax or 100
             local hp = math.clamp(attrHp, 0, maxHp)
@@ -3637,6 +3845,12 @@ function TriggerGuard.keepTouchGuiActive()
             local tcf = touchGui:FindFirstChild("TouchControlFrame")
             if tcf and tcf:IsA("GuiObject") then
                 tcf.Visible = true
+                for _, childName in ipairs({"ThumbstickFrame", "DynamicThumbstickFrame", "JumpButton"}) do
+                    local ctrl = tcf:FindFirstChild(childName)
+                    if ctrl and ctrl:IsA("GuiObject") then
+                        ctrl.Visible = true
+                    end
+                end
             end
         end)
     end
@@ -3658,27 +3872,46 @@ function TriggerGuard.keepTouchGuiActive()
     end
 end
 
-function TriggerGuard.broadcastTouchInputMode()
+function TriggerGuard.broadcastTouchInputMode(includeCoreModules)
     if not UserInputService.TouchEnabled or type(getconnections) ~= "function" then
         return
     end
     State.LastTouchBroadcastTime = os.clock()
+    local function shouldSkipConn(conn)
+        if not conn or conn.Enabled == false then
+            return true
+        end
+        if conn.Function and State.OwnInputFunctions[conn.Function] then
+            return true
+        end
+        if includeCoreModules then
+            local src = getConnectionSourceText(conn)
+            if src ~= "|" and src ~= "" then
+                if string.find(src, "team_aki", 1, true)
+                    or string.find(src, "coregui", 1, true)
+                    or string.find(src, "corepackages", 1, true)
+                    or string.find(src, "robloxgui", 1, true) then
+                    return true
+                end
+            end
+            return false
+        end
+        return isBlockedCoreInputConnection(conn)
+    end
+
     local okLast, lastConns = pcall(getconnections, UserInputService.LastInputTypeChanged)
     if okLast and type(lastConns) == "table" then
         for _, conn in ipairs(lastConns) do
-            if conn and conn.Enabled ~= false then
-                local isOwn = conn.Function and State.OwnInputFunctions[conn.Function]
-                if (not isOwn) and (not isBlockedCoreInputConnection(conn)) then
-                    pcall(function()
-                        if type(conn.Fire) == "function" then
-                            task.spawn(function()
-                                pcall(conn.Fire, conn, Enum.UserInputType.Touch)
-                            end)
-                        elseif type(conn.Function) == "function" then
-                            task.spawn(conn.Function, Enum.UserInputType.Touch)
-                        end
-                    end)
-                end
+            if not shouldSkipConn(conn) then
+                pcall(function()
+                    if type(conn.Fire) == "function" then
+                        task.spawn(function()
+                            pcall(conn.Fire, conn, Enum.UserInputType.Touch)
+                        end)
+                    elseif type(conn.Function) == "function" then
+                        task.spawn(conn.Function, Enum.UserInputType.Touch)
+                    end
+                end)
             end
         end
     end
@@ -3690,19 +3923,16 @@ function TriggerGuard.broadcastTouchInputMode()
         local okPref, prefConns = pcall(getconnections, prefSig)
         if okPref and type(prefConns) == "table" then
             for _, conn in ipairs(prefConns) do
-                if conn and conn.Enabled ~= false then
-                    local isOwn = conn.Function and State.OwnInputFunctions[conn.Function]
-                    if (not isOwn) and (not isBlockedCoreInputConnection(conn)) then
-                        pcall(function()
-                            if type(conn.Fire) == "function" then
-                                task.spawn(function()
-                                    pcall(conn.Fire, conn)
-                                end)
-                            elseif type(conn.Function) == "function" then
-                                task.spawn(conn.Function)
-                            end
-                        end)
-                    end
+                if not shouldSkipConn(conn) then
+                    pcall(function()
+                        if type(conn.Fire) == "function" then
+                            task.spawn(function()
+                                pcall(conn.Fire, conn)
+                            end)
+                        elseif type(conn.Function) == "function" then
+                            task.spawn(conn.Function)
+                        end
+                    end)
                 end
             end
         end
@@ -3720,6 +3950,12 @@ function TriggerGuard.enforceTouchControls(forceBroadcast)
             if type(pm.GetControls) == "function" then
                 local controls = pm:GetControls()
                 if type(controls) == "table" then
+                    if type(controls.SelectTouchModule) == "function" then
+                        local okMod, touchMod = pcall(controls.SelectTouchModule, controls)
+                        if okMod and touchMod and type(controls.SwitchToController) == "function" then
+                            pcall(controls.SwitchToController, controls, touchMod)
+                        end
+                    end
                     if type(controls.OnLastInputTypeChanged) == "function" then
                         pcall(controls.OnLastInputTypeChanged, controls, Enum.UserInputType.Touch)
                     end
@@ -3732,38 +3968,166 @@ function TriggerGuard.enforceTouchControls(forceBroadcast)
         pcall(function()
             if type(pm.GetCameras) == "function" then
                 local cameras = pm:GetCameras()
-                if type(cameras) == "table" and type(cameras.OnLastInputTypeChanged) == "function" then
-                    pcall(cameras.OnLastInputTypeChanged, cameras, Enum.UserInputType.Touch)
+                if type(cameras) == "table" then
+                    if cameras.activeMouseLockController and type(cameras.activeMouseLockController.EnableMouseLock) == "function" then
+                        local okML, isLocked = pcall(function()
+                            return cameras.activeMouseLockController:GetIsMouseLocked()
+                        end)
+                        if okML and isLocked then
+                            pcall(cameras.activeMouseLockController.EnableMouseLock, cameras.activeMouseLockController, false)
+                        end
+                    end
+                    if type(cameras.OnLastInputTypeChanged) == "function" then
+                        pcall(cameras.OnLastInputTypeChanged, cameras, Enum.UserInputType.Touch)
+                    end
                 end
             end
         end)
     end
     if forceBroadcast then
-        TriggerGuard.broadcastTouchInputMode()
+        TriggerGuard.broadcastTouchInputMode(true)
     end
+end
+
+function TriggerGuard.isInPcMode()
+    if not UserInputService.TouchEnabled then
+        return false
+    end
+    local okLast, lastType = pcall(function()
+        return UserInputService:GetLastInputType()
+    end)
+    if okLast and (lastType == Enum.UserInputType.MouseButton1
+        or lastType == Enum.UserInputType.MouseButton2
+        or lastType == Enum.UserInputType.MouseMovement
+        or lastType == Enum.UserInputType.Keyboard) then
+        return true
+    end
+    local okPref, pref = pcall(function()
+        return UserInputService.PreferredInput
+    end)
+    if okPref and pref ~= nil and pref ~= Enum.PreferredInput.Touch then
+        return true
+    end
+    local okIcon, iconOn = pcall(function()
+        return UserInputService.MouseIconEnabled
+    end)
+    if okIcon and iconOn == true and State.SavedMouseIconEnabled ~= true then
+        return true
+    end
+    local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local touchGui = pg and pg:FindFirstChild("TouchGui")
+    if touchGui and touchGui:IsA("ScreenGui") and touchGui.Enabled == false then
+        return true
+    end
+    local okBeh, beh = pcall(function()
+        return UserInputService.MouseBehavior
+    end)
+    if okBeh and (beh == Enum.MouseBehavior.LockCenter or beh == Enum.MouseBehavior.LockCurrentPosition) then
+        local cam = State.Camera or Workspace.CurrentCamera
+        if cam then
+            local dist = (cam.CFrame.Position - cam.Focus.Position).Magnitude
+            if dist > 1.2 then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+function TriggerGuard.restoreMobileMode(reason)
+    if not UserInputService.TouchEnabled or State.Unloaded then
+        return false
+    end
+    State.LastAutoRestoreAttempt = os.clock()
+    State.IsSynthesizingMouse = false
+
+    -- 1) Release stuck left mouse button if a prior life/shot left C++ mouse state pressed
+    if type(mouse1release) == "function" then
+        local okPressed, isDown = pcall(function()
+            return UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)
+        end)
+        if State.TriggerMouseHeld or (okPressed and isDown) then
+            State.TriggerMouseHeld = false
+            pcall(mouse1release)
+        end
+    end
+
+    -- 2) Re-enable any paused signal connections before re-synchronizing PlayerModule
+    if #State.PausedCoreInputConns > 0 then
+        for _, conn in ipairs(State.PausedCoreInputConns) do
+            pcall(function()
+                if conn and type(conn.Enable) == "function" then conn:Enable() end
+            end)
+        end
+        clearTable(State.PausedCoreInputConns)
+    end
+    if #State.PausedLastInputConns > 0 then
+        for _, conn in ipairs(State.PausedLastInputConns) do
+            pcall(function()
+                if conn and type(conn.Enable) == "function" then conn:Enable() end
+            end)
+        end
+        clearTable(State.PausedLastInputConns)
+    end
+    if #State.PausedPreferredInputConns > 0 then
+        for _, conn in ipairs(State.PausedPreferredInputConns) do
+            pcall(function()
+                if conn and type(conn.Enable) == "function" then conn:Enable() end
+            end)
+        end
+        clearTable(State.PausedPreferredInputConns)
+    end
+
+    -- 3) Unlock cursor/mouse lock & clear accidental ModalEnabled unless intentional
+    State.SavedMouseIconEnabled = false
+    State.SavedMouseBehavior = Enum.MouseBehavior.Default
+    pcall(function()
+        UserInputService.MouseIconEnabled = false
+    end)
+    pcall(function()
+        local cam = State.Camera or Workspace.CurrentCamera
+        local isThirdPerson = (not cam) or ((cam.CFrame.Position - cam.Focus.Position).Magnitude > 1.2)
+        if isThirdPerson and UserInputService.MouseBehavior ~= Enum.MouseBehavior.Default then
+            UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+        end
+    end)
+    pcall(function()
+        if UserInputService.ModalEnabled then
+            UserInputService.ModalEnabled = false
+        end
+    end)
+
+    -- 4) Force PlayerModule ControlModule back onto TouchModule + broadcast Touch to game UIs
+    TriggerGuard.enforceTouchControls(true)
+    State.NeedsTouchBroadcast = false
+    State.LastReloadReason = reason or "RestoreMobileMode"
+    return true
 end
 
 function TriggerGuard.onCharacterLifecycle(_)
     if not UserInputService.TouchEnabled or State.Unloaded then
         return
     end
-    State.SavedMouseIconEnabled = nil
-    State.SavedMouseBehavior = nil
-    if State.HasUsedHardwareMouse or Config.TriggerBot.Enabled then
-        State.NeedsTouchBroadcast = true
-    end
-    if (not State.HasUsedHardwareMouse) and (not Config.TriggerBot.Enabled) then
+    local shouldRestore = Config.TriggerBot.AutoRestoreMobile
+        or State.HasUsedHardwareMouse
+        or Config.TriggerBot.Enabled
+        or TriggerGuard.isInPcMode()
+    if not shouldRestore then
         return
     end
 
     State.TouchGuardLifecycleToken = (State.TouchGuardLifecycleToken or 0) + 1
     local myToken = State.TouchGuardLifecycleToken
 
-    TriggerGuard.enforceTouchControls(true)
-    for _, waitSec in ipairs({0.05, 0.25, 0.70, 1.40}) do
+    TriggerGuard.restoreMobileMode("CharacterLifecycle")
+    for _, waitSec in ipairs({0.05, 0.25, 0.65, 1.25, 2.20}) do
         task.delay(waitSec, function()
             if (not State.Unloaded) and State.TouchGuardLifecycleToken == myToken and UserInputService.TouchEnabled then
-                TriggerGuard.enforceTouchControls(true)
+                if TriggerGuard.isInPcMode() or State.HasUsedHardwareMouse or Config.TriggerBot.Enabled then
+                    TriggerGuard.restoreMobileMode("LifecycleVerify")
+                else
+                    TriggerGuard.keepTouchGuiActive()
+                end
             end
         end)
     end
@@ -3812,6 +4176,9 @@ function TriggerGuard.restoreAll()
     State.IsSynthesizingMouse = false
     TriggerGuard.restoreCoreInputConns()
     TriggerGuard.restoreLastInputConns()
+    if UserInputService.TouchEnabled and Config.TriggerBot.AutoRestoreMobile then
+        TriggerGuard.restoreMobileMode("RestoreAll")
+    end
 end
 
 function TriggerGuard.isPointOverMenu(screenPos)
@@ -3914,7 +4281,7 @@ addOwnUserInputConn(UserInputService.LastInputTypeChanged, function(lastType)
     end
     if lastType == Enum.UserInputType.Touch then
         State.NeedsTouchBroadcast = false
-    elseif State.HasUsedHardwareMouse or Config.TriggerBot.Enabled then
+    elseif Config.TriggerBot.AutoRestoreMobile or State.HasUsedHardwareMouse or Config.TriggerBot.Enabled then
         State.NeedsTouchBroadcast = true
         task.defer(function()
             if not State.Unloaded and UserInputService.TouchEnabled then
@@ -3929,10 +4296,10 @@ do
     if pg then
         addConnection(pg.ChildAdded:Connect(function(child)
             if UserInputService.TouchEnabled and (not State.Unloaded) and child and child.Name == "TouchGui" then
-                if State.HasUsedHardwareMouse or Config.TriggerBot.Enabled then
+                if Config.TriggerBot.AutoRestoreMobile or State.HasUsedHardwareMouse or Config.TriggerBot.Enabled then
                     task.defer(function()
                         if not State.Unloaded then
-                            TriggerGuard.enforceTouchControls(true)
+                            TriggerGuard.restoreMobileMode("TouchGuiAdded")
                         end
                     end)
                 end
@@ -4028,7 +4395,7 @@ function TriggerGuard.withTouchModePreserved(fn)
 end
 
 function TriggerGuard.fireExecutorMousePulse(screenCenter, holdMode)
-    if not Config.TriggerBot.HardwareMouse then
+    if not Config.TriggerBot.HardwareMouse and Config.TriggerBot.FireMethod ~= "Mouse (Guard)" then
         return false
     end
     local hasPress = (type(mouse1press) == "function")
@@ -4043,7 +4410,6 @@ function TriggerGuard.fireExecutorMousePulse(screenCenter, holdMode)
     State.IsSynthesizingMouse = true
 
     local didFire = TriggerGuard.withTouchModePreserved(function()
-        -- Move virtual cursor cleanly to center crosshair when supported
         if screenCenter and type(mousemoveabs) == "function" then
             pcall(mousemoveabs, math.round(screenCenter.X), math.round(screenCenter.Y))
         end
@@ -4053,7 +4419,6 @@ function TriggerGuard.fireExecutorMousePulse(screenCenter, holdMode)
         end)
         local actualLoc = (okLoc and typeof(loc) == "Vector2") and loc or screenCenter
 
-        -- Temporarily pause any non-shoot game HUD buttons under the cursor for this synchronous frame instead of dropping shots
         TriggerGuard.pauseGameUiUnderPoints(State.Camera or Workspace.CurrentCamera, {screenCenter, actualLoc})
 
         if holdMode and hasPress then
@@ -4107,12 +4472,461 @@ function TriggerGuard.fireExecutorMousePulse(screenCenter, holdMode)
     return didFire
 end
 
+-- Multi-Method Self-Adapting Mobile Triggerbot Adapter (FireButton signals -> Tool:Activate -> VIM Touch -> Guarded Mouse)
+local TriggerAdapter = {
+    FIRE_KEYWORDS = {"shoot", "fire", "attack", "trigger", "gunbtn", "firebtn", "shootbtn", "combat", "slash", "swing"},
+    SKIP_KEYWORDS = {"shop", "store", "menu", "setting", "inventory", "bag", "emote", "chat", "close", "exit", "jump", "crouch", "sprint", "reload", "aim", "scope", "ads", "inspect", "drop", "team", "trade", "crate", "skin"},
+}
+
+function TriggerAdapter.getButtonLabel(btn)
+    local txt = ""
+    if btn:IsA("TextButton") then
+        txt = btn.Text or ""
+    end
+    if txt == "" then
+        for _, child in ipairs(btn:GetChildren()) do
+            if child:IsA("TextLabel") and child.Text ~= "" then
+                txt = child.Text
+                break
+            end
+        end
+    end
+    return (txt ~= "") and txt or btn.Name
+end
+
+function TriggerAdapter.scoreFireButton(btn)
+    if not btn or not btn:IsA("GuiButton") or not isGuiButtonTreeVisible(btn) then
+        return -1
+    end
+    if (State.MainGui and btn:IsDescendantOf(State.MainGui)) or (State.OverlayGui and btn:IsDescendantOf(State.OverlayGui)) then
+        return -1
+    end
+    if btn:FindFirstAncestor("TouchGui") ~= nil then
+        return -1
+    end
+    local okPath, fullPath = pcall(function()
+        return btn:GetFullName()
+    end)
+    local pathStr = okPath and fullPath or btn.Name
+    if State.BlacklistedTriggerCandidates[pathStr] then
+        return -1
+    end
+
+    local lowerPath = string.lower(pathStr)
+    local lowerText = string.lower(TriggerAdapter.getButtonLabel(btn))
+    for _, bad in ipairs(TriggerAdapter.SKIP_KEYWORDS) do
+        if string.find(string.lower(btn.Name), bad, 1, true) or string.find(lowerText, bad, 1, true) then
+            return -1
+        end
+    end
+
+    local score = 0
+    for _, kw in ipairs(TriggerAdapter.FIRE_KEYWORDS) do
+        if string.find(lowerPath, kw, 1, true) or string.find(lowerText, kw, 1, true) then
+            score = score + 30
+        end
+    end
+    if score == 0 then
+        return -1
+    end
+
+    if hasSignalConnections(btn.MouseButton1Down) then score = score + 22 end
+    if hasSignalConnections(btn.Activated) then score = score + 20 end
+    if hasSignalConnections(btn.MouseButton1Click) then score = score + 18 end
+    if hasSignalConnections(btn.InputBegan) then score = score + 15 end
+    if btn.Active ~= false then score = score + 5 end
+    local sz = btn.AbsoluteSize
+    if sz.X >= 24 and sz.Y >= 24 and sz.X <= 360 and sz.Y <= 360 then
+        score = score + 5
+    end
+    return score, pathStr
+end
+
+function TriggerAdapter.scanFireButtons()
+    local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if not pg then
+        return {}
+    end
+    local candidates = {}
+    for _, desc in ipairs(pg:GetDescendants()) do
+        if desc:IsA("GuiButton") then
+            local sc, fullPath = TriggerAdapter.scoreFireButton(desc)
+            if sc and sc > 0 then
+                table.insert(candidates, {
+                    Button = desc,
+                    Score = sc,
+                    Path = fullPath,
+                    Label = TriggerAdapter.getButtonLabel(desc),
+                })
+            end
+        end
+    end
+    table.sort(candidates, function(a, b)
+        return a.Score > b.Score
+    end)
+    return candidates
+end
+
+function TriggerAdapter.resolveSavedFireButton()
+    if Config.TriggerBot.SavedButtonPath == "" then
+        return nil, nil
+    end
+    if State.BlacklistedTriggerCandidates[Config.TriggerBot.SavedButtonPath] then
+        return nil, nil
+    end
+    local c = State.CachedFireButton
+    if c and c.Parent and isGuiButtonTreeVisible(c) then
+        local okP, p = pcall(function() return c:GetFullName() end)
+        if okP and p == Config.TriggerBot.SavedButtonPath then
+            return c, p
+        end
+    end
+    local cands = TriggerAdapter.scanFireButtons()
+    for _, item in ipairs(cands) do
+        if item.Path == Config.TriggerBot.SavedButtonPath or (Config.TriggerBot.SavedButtonName ~= "" and item.Button.Name == Config.TriggerBot.SavedButtonName) then
+            State.CachedFireButton = item.Button
+            return item.Button, item.Path
+        end
+    end
+    return nil, nil
+end
+
+function TriggerAdapter.fireButtonCandidate(btn, holdMode)
+    if not btn or not btn.Parent or not isGuiButtonTreeVisible(btn) then
+        return false
+    end
+    local ap = btn.AbsolutePosition
+    local as = btn.AbsoluteSize
+    local cx = ap.X + as.X * 0.5
+    local cy = ap.Y + as.Y * 0.5
+    local fakeBegin = createFakeInputObject(Enum.UserInputType.Touch, Vector2.new(cx, cy), true)
+    local fakeEnd = createFakeInputObject(Enum.UserInputType.Touch, Vector2.new(cx, cy), false)
+
+    local fired = false
+    if invokeSignal(btn.MouseButton1Down, cx, cy) then fired = true end
+    if invokeSignal(btn.InputBegan, fakeBegin, false) then fired = true end
+    if invokeSignal(btn.Activated, fakeBegin, 1) then fired = true end
+    if not holdMode then
+        if invokeSignal(btn.MouseButton1Click) then fired = true end
+        if invokeSignal(btn.MouseButton1Up, cx, cy) then fired = true end
+        if invokeSignal(btn.InputEnded, fakeEnd, false) then fired = true end
+    else
+        State.TriggerBtnRef = btn
+    end
+    return fired
+end
+
+function TriggerAdapter.releaseButtonCandidate(btn)
+    if not btn or not btn.Parent then
+        return
+    end
+    local ap = btn.AbsolutePosition
+    local as = btn.AbsoluteSize
+    local cx = ap.X + as.X * 0.5
+    local cy = ap.Y + as.Y * 0.5
+    local fakeEnd = createFakeInputObject(Enum.UserInputType.Touch, Vector2.new(cx, cy), false)
+    invokeSignal(btn.MouseButton1Up, cx, cy)
+    invokeSignal(btn.InputEnded, fakeEnd, false)
+    invokeSignal(btn.MouseButton1Click)
+end
+
+function TriggerAdapter.getPointerScreenCoords(camera)
+    local ptr = State.TriggerPointerBtn
+    if ptr and ptr.Parent then
+        local ap = ptr.AbsolutePosition
+        local as = ptr.AbsoluteSize
+        if as.X > 0 and as.Y > 0 then
+            return Vector2.new(ap.X + as.X * 0.5, ap.Y + as.Y * 0.5)
+        end
+    end
+    local cam = camera or State.Camera or Workspace.CurrentCamera
+    local vp = cam and cam.ViewportSize or Vector2.new(1280, 720)
+    return Vector2.new(vp.X * Config.TriggerBot.PointerOffsetX, vp.Y * Config.TriggerBot.PointerOffsetY)
+end
+
+function TriggerAdapter.fireVimTouch(camera, holdMode)
+    local vim = TriggerGuard.VIM
+    if not vim or type(vim.SendTouchEvent) ~= "function" then
+        return false
+    end
+    local pos = TriggerAdapter.getPointerScreenCoords(camera)
+    local px = math.round(pos.X)
+    local py = math.round(pos.Y)
+    local ptr = State.TriggerPointerBtn
+    local prevActive = ptr and ptr.Active or false
+    if ptr then
+        ptr.Active = false
+    end
+
+    local okBegin = pcall(function()
+        vim:SendTouchEvent(9, 0, px, py)
+    end)
+    if okBegin then
+        State.LastTriggerMousePos = pos
+        if holdMode then
+            State.TriggerVimHeld = true
+        else
+            State.TriggerVimHeld = true
+            task.delay(0.032, function()
+                if not State.TriggerHolding and State.TriggerVimHeld then
+                    State.TriggerVimHeld = false
+                    pcall(function()
+                        vim:SendTouchEvent(9, 2, px, py)
+                    end)
+                end
+            end)
+        end
+    end
+    if ptr and not Config.TriggerBot.PointerLocked then
+        task.defer(function()
+            if ptr and ptr.Parent and not Config.TriggerBot.PointerLocked then
+                ptr.Active = prevActive
+            end
+        end)
+    end
+    return okBegin
+end
+
+function TriggerAdapter.releaseVimTouch()
+    if not State.TriggerVimHeld then
+        return
+    end
+    State.TriggerVimHeld = false
+    local vim = TriggerGuard.VIM
+    if vim and type(vim.SendTouchEvent) == "function" then
+        local pos = TriggerAdapter.getPointerScreenCoords(State.Camera or Workspace.CurrentCamera)
+        pcall(function()
+            vim:SendTouchEvent(9, 2, math.round(pos.X), math.round(pos.Y))
+        end)
+    end
+end
+
+function TriggerAdapter.tryActivateTool(holdMode, strictCheck)
+    local localChar = State.LocalCharacter or LocalPlayer.Character
+    local tool = localChar and localChar:FindFirstChildOfClass("Tool") or nil
+    if not tool then
+        return false, nil
+    end
+    if strictCheck then
+        local hasAct = hasSignalConnections(tool.Activated)
+        local hasScript = (tool:FindFirstChildOfClass("LocalScript") ~= nil) or (tool:FindFirstChildWhichIsA("RemoteEvent", true) ~= nil)
+        if not hasAct and not hasScript then
+            return false, nil
+        end
+    end
+    local okTool = pcall(function()
+        tool:Activate()
+    end)
+    local invokedAct = invokeSignal(tool.Activated)
+    if okTool or invokedAct then
+        if holdMode then
+            State.TriggerToolRef = tool
+        else
+            task.delay(0.03, function()
+                if not State.TriggerHolding and tool and tool.Parent then
+                    pcall(function()
+                        tool:Deactivate()
+                    end)
+                end
+            end)
+        end
+        return true, tool
+    end
+    return false, nil
+end
+
+function TriggerAdapter.markMethodSuccess(methodName, tag, buttonObj, buttonPath)
+    State.LastActiveTriggerMethod = methodName
+    State.LastActiveTriggerTag = tag or methodName
+    local changed = (Config.TriggerBot.SavedMethod ~= methodName)
+    Config.TriggerBot.SavedMethod = methodName
+    if buttonObj and buttonPath then
+        local bName = TriggerAdapter.getButtonLabel(buttonObj)
+        if Config.TriggerBot.SavedButtonPath ~= buttonPath then
+            changed = true
+        end
+        Config.TriggerBot.SavedButtonPath = buttonPath
+        Config.TriggerBot.SavedButtonName = bName
+        State.ActiveTriggerMethodLabel = methodName .. " (" .. bName .. ")"
+    else
+        State.ActiveTriggerMethodLabel = methodName
+    end
+    if State.OnTriggerMethodChanged then
+        pcall(State.OnTriggerMethodChanged)
+    end
+    if changed then
+        ConfigStore.scheduleSave()
+    end
+end
+
+function TriggerAdapter.executeFire(camera, screenCenter, now, holdMode)
+    local mode = Config.TriggerBot.FireMethod
+    local function tryFireButtonMode()
+        local savedBtn, savedPath = TriggerAdapter.resolveSavedFireButton()
+        if savedBtn and TriggerAdapter.fireButtonCandidate(savedBtn, holdMode) then
+            TriggerAdapter.markMethodSuccess("FireButton", savedPath, savedBtn, savedPath)
+            return true
+        end
+        if (now - (State.LastFireBtnScan or 0)) >= 0.35 or #TriggerAdapter.scanFireButtons() > 0 then
+            State.LastFireBtnScan = now
+            local cands = TriggerAdapter.scanFireButtons()
+            for _, item in ipairs(cands) do
+                if TriggerAdapter.fireButtonCandidate(item.Button, holdMode) then
+                    State.CachedFireButton = item.Button
+                    TriggerAdapter.markMethodSuccess("FireButton", item.Path, item.Button, item.Path)
+                    return true
+                end
+            end
+        end
+        return false
+    end
+
+    local function tryMouseGuardMode()
+        if State.BlacklistedTriggerCandidates["Mouse (Guard)"] and mode == "Auto" then
+            return false
+        end
+        local fired = false
+        if TriggerGuard.fireExecutorMousePulse(screenCenter, holdMode) then
+            fired = true
+        elseif firePlayerMouseSignal("Button1Down") then
+            fired = true
+        else
+            local inputAny = dispatchClientMouseSignal(
+                UserInputService.InputBegan,
+                createFakeInputObject(Enum.UserInputType.MouseButton1, screenCenter, true)
+            )
+            if inputAny then
+                fired = true
+                if holdMode then
+                    State.TriggerFakeMouseHeld = true
+                else
+                    task.delay(0.03, function()
+                        if not State.TriggerHolding then
+                            State.TriggerFakeMouseHeld = false
+                            firePlayerMouseSignal("Button1Up")
+                            dispatchClientMouseSignal(UserInputService.InputEnded, createFakeInputObject(Enum.UserInputType.MouseButton1, screenCenter, false))
+                        end
+                    end)
+                end
+            end
+        end
+        if fired then
+            TriggerAdapter.markMethodSuccess("Mouse (Guard)", "Mouse (Guard)")
+        end
+        return fired
+    end
+
+    if mode == "FireButton" then
+        return tryFireButtonMode()
+    elseif mode == "Tool" then
+        local ok, tool = TriggerAdapter.tryActivateTool(holdMode, false)
+        if ok then
+            TriggerAdapter.markMethodSuccess("Tool", tool and tool.Name or "Tool")
+        end
+        return ok
+    elseif mode == "VIM Touch" then
+        local ok = TriggerAdapter.fireVimTouch(camera, holdMode)
+        if ok then
+            TriggerAdapter.markMethodSuccess("VIM Touch", "VIM Touch")
+        end
+        return ok
+    elseif mode == "Mouse (Guard)" then
+        return tryMouseGuardMode()
+    end
+
+    -- "Auto" adaptive priority cascade: Saved method -> FireButton -> Tool -> VIM Touch -> Guarded Mouse
+    local saved = Config.TriggerBot.SavedMethod
+    if saved == "FireButton" and tryFireButtonMode() then
+        return true
+    elseif saved == "Tool" and (not State.BlacklistedTriggerCandidates["Tool"]) then
+        local ok, tool = TriggerAdapter.tryActivateTool(holdMode, true)
+        if ok then
+            TriggerAdapter.markMethodSuccess("Tool", tool and tool.Name or "Tool")
+            return true
+        end
+    elseif saved == "VIM Touch" and (not State.BlacklistedTriggerCandidates["VIM Touch"]) then
+        if TriggerAdapter.fireVimTouch(camera, holdMode) then
+            TriggerAdapter.markMethodSuccess("VIM Touch", "VIM Touch")
+            return true
+        end
+    end
+
+    if tryFireButtonMode() then
+        return true
+    end
+    if not State.BlacklistedTriggerCandidates["Tool"] then
+        local ok, tool = TriggerAdapter.tryActivateTool(holdMode, true)
+        if ok then
+            TriggerAdapter.markMethodSuccess("Tool", tool and tool.Name or "Tool")
+            return true
+        end
+    end
+    if not State.BlacklistedTriggerCandidates["VIM Touch"] and TriggerAdapter.fireVimTouch(camera, holdMode) then
+        TriggerAdapter.markMethodSuccess("VIM Touch", "VIM Touch")
+        return true
+    end
+    if tryMouseGuardMode() then
+        return true
+    end
+    State.ActiveTriggerMethodLabel = "No Firing Call Found"
+    return false
+end
+
+function TriggerAdapter.rescanAndCycle()
+    if State.LastActiveTriggerTag ~= "" then
+        State.BlacklistedTriggerCandidates[State.LastActiveTriggerTag] = true
+    end
+    if State.LastActiveTriggerMethod ~= "" and State.LastActiveTriggerMethod ~= "FireButton" then
+        State.BlacklistedTriggerCandidates[State.LastActiveTriggerMethod] = true
+    end
+    Config.TriggerBot.SavedMethod = ""
+    Config.TriggerBot.SavedButtonPath = ""
+    Config.TriggerBot.SavedButtonName = ""
+    State.CachedFireButton = nil
+    State.LastFireBtnScan = 0
+
+    local order = {"Auto", "FireButton", "Tool", "VIM Touch", "Mouse (Guard)"}
+    local nextMethod = "Auto"
+    if Config.TriggerBot.FireMethod == "Auto" then
+        local cands = TriggerAdapter.scanFireButtons()
+        if #cands == 0 then
+            if not State.BlacklistedTriggerCandidates["Tool"] then
+                nextMethod = "Tool"
+            elseif not State.BlacklistedTriggerCandidates["VIM Touch"] then
+                nextMethod = "VIM Touch"
+            else
+                clearTable(State.BlacklistedTriggerCandidates)
+                nextMethod = "Auto"
+            end
+        end
+    else
+        for i, opt in ipairs(order) do
+            if opt == Config.TriggerBot.FireMethod then
+                nextMethod = order[(i % #order) + 1]
+                break
+            end
+        end
+    end
+    Config.TriggerBot.FireMethod = nextMethod
+    State.ActiveTriggerMethodLabel = "Re-scanned -> " .. nextMethod
+    ConfigStore.scheduleSave()
+    return nextMethod
+end
+
 releaseTriggerFire = function()
     if State.TriggerFakeMouseHeld then
         State.TriggerFakeMouseHeld = false
         firePlayerMouseSignal("Button1Up")
         dispatchClientMouseSignal(UserInputService.InputEnded, createFakeInputObject(Enum.UserInputType.MouseButton1, State.LastTriggerMousePos, false))
     end
+
+    if State.TriggerBtnRef then
+        local btn = State.TriggerBtnRef
+        State.TriggerBtnRef = nil
+        TriggerAdapter.releaseButtonCandidate(btn)
+    end
+
+    TriggerAdapter.releaseVimTouch()
 
     if State.TriggerToolRef and State.TriggerToolRef.Parent then
         pcall(function()
@@ -4141,70 +4955,12 @@ releaseTriggerFire = function()
 end
 
 local function triggerOnceOrPress(camera, screenCenter, now, holdMode)
-    local localChar = State.LocalCharacter or LocalPlayer.Character
-    local equippedTool = localChar and localChar:FindFirstChildOfClass("Tool") or nil
-    local firedAny = false
-
     State.LastTriggerMousePos = screenCenter or Vector2.new(640, 360)
-
-    -- 1) Equipped Tool activation (classic tools + local tool scripts)
-    if equippedTool then
-        local okTool = pcall(function()
-            equippedTool:Activate()
-        end)
-        local invokedAct = invokeSignal(equippedTool.Activated)
-        if okTool then
-            State.TriggerToolRef = equippedTool
-            firedAny = true
-        elseif invokedAct then
-            firedAny = true
-        end
-    end
-
-    -- 2) Mouse Fire Channel: Touch-safe executor mouse1 primary; fallback to filtered client mouse signals only if hardware mouse unavailable
-    local hardwareFired = TriggerGuard.fireExecutorMousePulse(State.LastTriggerMousePos, holdMode)
-    if hardwareFired then
-        firedAny = true
-    else
-        if firePlayerMouseSignal("Button1Down") then
-            firedAny = true
-        end
-
-        local inputAny = dispatchClientMouseSignal(
-            UserInputService.InputBegan,
-            createFakeInputObject(Enum.UserInputType.MouseButton1, State.LastTriggerMousePos, true)
-        )
-        if inputAny then
-            firedAny = true
-            if holdMode then
-                State.TriggerFakeMouseHeld = true
-            end
-        end
-    end
-
+    local firedAny = TriggerAdapter.executeFire(camera, State.LastTriggerMousePos, now, holdMode)
     if holdMode and firedAny then
         State.TriggerHolding = true
     else
         State.TriggerHolding = false
-        if firedAny then
-            local endCenter = State.LastTriggerMousePos
-            local toolToRelease = State.TriggerToolRef
-            local needFakeRelease = State.TriggerFakeMouseHeld or (not hardwareFired)
-            task.delay(0.03, function()
-                if not State.TriggerHolding then
-                    if needFakeRelease then
-                        State.TriggerFakeMouseHeld = false
-                        firePlayerMouseSignal("Button1Up")
-                        dispatchClientMouseSignal(UserInputService.InputEnded, createFakeInputObject(Enum.UserInputType.MouseButton1, endCenter, false))
-                    end
-                    if toolToRelease and toolToRelease.Parent then
-                        pcall(function()
-                            toolToRelease:Deactivate()
-                        end)
-                    end
-                end
-            end)
-        end
     end
 end
 
@@ -4667,7 +5423,7 @@ local function onRenderStepFrame(dt)
             if showFov and useDrawingFov then
                 DrawingFOV.Position = screenCenter
                 DrawingFOV.Radius = Config.Aimbot.FOVRadius
-                DrawingFOV.Thickness = math.max(Config.Aimbot.FOVThickness, 1)
+                DrawingFOV.Thickness = math.clamp(Config.Aimbot.FOVThickness, 0.1, 5.0)
                 DrawingFOV.Color = Config.Colors.FOV
                 DrawingFOV.Transparency = Config.Aimbot.Enabled and 0.92 or 0.65
             end
@@ -4679,7 +5435,7 @@ local function onRenderStepFrame(dt)
         local diameter = Config.Aimbot.FOVRadius * 2
         FOVRingFrame.Size = UDim2.fromOffset(diameter, diameter)
         FOVStroke.Color = Config.Colors.FOV
-        FOVStroke.Thickness = math.max(Config.Aimbot.FOVThickness, 1)
+        FOVStroke.Thickness = math.clamp(Config.Aimbot.FOVThickness, 0.1, 5.0)
         FOVStroke.Transparency = Config.Aimbot.Enabled and 0.15 or 0.45
     end
 
@@ -4689,21 +5445,28 @@ local function onRenderStepFrame(dt)
         bindLocalCharacter(liveLocalChar)
     end
 
-    -- Enforce mobile Touch controls after hardware mouse pulses and across death/respawn so mobile never gets stuck in PC mode
-    if UserInputService.TouchEnabled and (State.HasUsedHardwareMouse or Config.TriggerBot.Enabled) then
-        local okLast, lastInput = pcall(function()
-            return UserInputService:GetLastInputType()
-        end)
-        local isTouchLast = okLast and lastInput == Enum.UserInputType.Touch
+    -- Enforce mobile Touch controls & auto-restore if PC mode triggers on death/respawn or mouse pulses
+    if UserInputService.TouchEnabled then
         local recentShot = (now - (State.LastHardwareMouseTime or 0)) < 1.25
-        if isTouchLast and not recentShot then
-            State.NeedsTouchBroadcast = false
-        elseif recentShot or (not isTouchLast) or State.NeedsTouchBroadcast then
+        if Config.TriggerBot.AutoRestoreMobile and TriggerGuard.isInPcMode() then
             TriggerGuard.keepTouchGuiActive()
-            if recentShot or (now - (State.LastTouchEnforceTime or 0)) >= 0.18 then
-                State.LastTouchEnforceTime = now
-                local shouldBroadcast = (not isTouchLast) and ((now - (State.LastTouchBroadcastTime or 0)) >= 0.45)
-                TriggerGuard.enforceTouchControls(shouldBroadcast)
+            if (now - (State.LastAutoRestoreAttempt or 0)) >= 0.25 then
+                TriggerGuard.restoreMobileMode("AutoDetectPC")
+            end
+        elseif State.HasUsedHardwareMouse or Config.TriggerBot.Enabled then
+            local okLast, lastInput = pcall(function()
+                return UserInputService:GetLastInputType()
+            end)
+            local isTouchLast = okLast and lastInput == Enum.UserInputType.Touch
+            if isTouchLast and not recentShot then
+                State.NeedsTouchBroadcast = false
+            elseif recentShot or (not isTouchLast) or State.NeedsTouchBroadcast then
+                TriggerGuard.keepTouchGuiActive()
+                if recentShot or (now - (State.LastTouchEnforceTime or 0)) >= 0.18 then
+                    State.LastTouchEnforceTime = now
+                    local shouldBroadcast = (not isTouchLast) and ((now - (State.LastTouchBroadcastTime or 0)) >= 0.45)
+                    TriggerGuard.enforceTouchControls(shouldBroadcast)
+                end
             end
         end
     end
@@ -4763,15 +5526,38 @@ local function potatoOptimizeInstance(inst, saved)
         pcall(function()
             inst.Enabled = false
         end)
-    elseif inst:IsA("PostEffect") or inst:IsA("Atmosphere") then
-        if inst:IsA("PostEffect") then
-            if saved.Effects[inst] == nil then
-                saved.Effects[inst] = inst.Enabled
-            end
-            pcall(function()
-                inst.Enabled = false
-            end)
+    elseif inst:IsA("Explosion") then
+        if saved.Explosions[inst] == nil then
+            saved.Explosions[inst] = inst.Visible
         end
+        pcall(function()
+            inst.Visible = false
+        end)
+    elseif inst:IsA("PostEffect") then
+        if saved.Effects[inst] == nil then
+            saved.Effects[inst] = inst.Enabled
+        end
+        pcall(function()
+            inst.Enabled = false
+        end)
+    elseif inst:IsA("Clouds") then
+        if saved.Effects[inst] == nil then
+            saved.Effects[inst] = inst.Enabled
+        end
+        pcall(function()
+            inst.Enabled = false
+        end)
+    elseif inst:IsA("Atmosphere") then
+        if not saved.Atmospheres[inst] then
+            saved.Atmospheres[inst] = {
+                Density = inst.Density,
+                Haze = inst.Haze,
+            }
+        end
+        pcall(function()
+            inst.Density = 0
+            inst.Haze = 0
+        end)
     end
 end
 
@@ -4783,8 +5569,13 @@ local function applyPotatoGraphics(enabled)
                 QualityLevel = nil,
                 GlobalShadows = nil,
                 ShadowSoftness = nil,
+                FogEnd = nil,
+                EnvDiffuse = nil,
+                EnvSpecular = nil,
                 Terrain = nil,
                 Effects = {},
+                Atmospheres = {},
+                Explosions = {},
                 Parts = {},
                 Decals = {},
                 Particles = {},
@@ -4799,6 +5590,9 @@ local function applyPotatoGraphics(enabled)
                 pcall(function()
                     saved.GlobalShadows = Lighting.GlobalShadows
                     saved.ShadowSoftness = Lighting.ShadowSoftness
+                    saved.FogEnd = Lighting.FogEnd
+                    saved.EnvDiffuse = Lighting.EnvironmentDiffuseScale
+                    saved.EnvSpecular = Lighting.EnvironmentSpecularScale
                 end)
             end
             local terrain = Workspace:FindFirstChildOfClass("Terrain")
@@ -4827,6 +5621,9 @@ local function applyPotatoGraphics(enabled)
             pcall(function()
                 Lighting.GlobalShadows = false
                 Lighting.ShadowSoftness = 0
+                Lighting.FogEnd = 100000
+                Lighting.EnvironmentDiffuseScale = 0
+                Lighting.EnvironmentSpecularScale = 0
             end)
             for _, desc in ipairs(Lighting:GetDescendants()) do
                 potatoOptimizeInstance(desc, saved)
@@ -4841,6 +5638,9 @@ local function applyPotatoGraphics(enabled)
                 terrain.WaterTransparency = 1
                 terrain.Decoration = false
             end)
+            for _, desc in ipairs(terrain:GetChildren()) do
+                potatoOptimizeInstance(desc, saved)
+            end
         end
 
         task.spawn(function()
@@ -4889,6 +5689,15 @@ local function applyPotatoGraphics(enabled)
                     if saved.ShadowSoftness ~= nil then
                         Lighting.ShadowSoftness = saved.ShadowSoftness
                     end
+                    if saved.FogEnd ~= nil then
+                        Lighting.FogEnd = saved.FogEnd
+                    end
+                    if saved.EnvDiffuse ~= nil then
+                        Lighting.EnvironmentDiffuseScale = saved.EnvDiffuse
+                    end
+                    if saved.EnvSpecular ~= nil then
+                        Lighting.EnvironmentSpecularScale = saved.EnvSpecular
+                    end
                 end)
             end
             if saved.Terrain and saved.Terrain.Ref and saved.Terrain.Ref.Parent then
@@ -4905,6 +5714,21 @@ local function applyPotatoGraphics(enabled)
                 if inst and inst.Parent then
                     pcall(function()
                         inst.Enabled = wasEnabled
+                    end)
+                end
+            end
+            for inst, props in pairs(saved.Atmospheres) do
+                if inst and inst.Parent then
+                    pcall(function()
+                        inst.Density = props.Density
+                        inst.Haze = props.Haze
+                    end)
+                end
+            end
+            for inst, wasVis in pairs(saved.Explosions) do
+                if inst and inst.Parent then
+                    pcall(function()
+                        inst.Visible = wasVis
                     end)
                 end
             end
@@ -4937,7 +5761,7 @@ local function applyPotatoGraphics(enabled)
 end
 
 local function applyThicknessImmediate()
-    local fovT = math.max(Config.Aimbot.FOVThickness, 1)
+    local fovT = math.clamp(Config.Aimbot.FOVThickness, 0.1, 5.0)
     FOVStroke.Thickness = fovT
     if DrawingFOV then
         pcall(function()
@@ -5097,6 +5921,138 @@ do
     local frostCorner = Instance.new("UICorner")
     frostCorner.CornerRadius = UDim.new(1, 0)
     frostCorner.Parent = frostedOverlay
+end
+
+-- Liquid Glass Startup Loading Animation
+do
+    local startVisible = Config.UI.Visible
+    MainCard.Visible = false
+    CardShadow.Visible = false
+
+    local splash = Instance.new("Frame")
+    splash.Name = "TEAM_AKI_Splash"
+    splash.AnchorPoint = Vector2.new(0.5, 0.5)
+    splash.Position = UDim2.fromScale(0.5, 0.5)
+    splash.Size = UDim2.fromOffset(304, 128)
+    splash.BackgroundColor3 = Palette.GlassBase
+    splash.BackgroundTransparency = 0.16
+    splash.BorderSizePixel = 0
+    splash.ZIndex = 40
+    splash.Parent = MainGui
+
+    local sc = Instance.new("UICorner")
+    sc.CornerRadius = UDim.new(0, 18)
+    sc.Parent = splash
+
+    applyGlassStroke(splash, 1.4, 0.45)
+
+    local sGrad = Instance.new("UIGradient")
+    sGrad.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(24, 34, 54)),
+        ColorSequenceKeypoint.new(0.6, Color3.fromRGB(11, 14, 22)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(18, 26, 40)),
+    })
+    sGrad.Rotation = 135
+    sGrad.Parent = splash
+
+    local logo = Instance.new("TextLabel")
+    logo.BackgroundTransparency = 1
+    logo.Position = UDim2.new(0, 18, 0, 18)
+    logo.Size = UDim2.new(1, -36, 0, 26)
+    logo.Font = Enum.Font.GothamBold
+    logo.Text = "TEAM AKI"
+    logo.TextSize = 20
+    logo.TextColor3 = Palette.TextHeader
+    logo.TextXAlignment = Enum.TextXAlignment.Left
+    logo.ZIndex = 41
+    logo.Parent = splash
+
+    local profileBadge = Instance.new("TextLabel")
+    profileBadge.BackgroundColor3 = Palette.PrimaryAccent
+    profileBadge.BackgroundTransparency = 0.82
+    profileBadge.AnchorPoint = Vector2.new(1, 0)
+    profileBadge.Position = UDim2.new(1, -18, 0, 20)
+    profileBadge.Size = UDim2.fromOffset(106, 22)
+    profileBadge.Font = Enum.Font.Code
+    profileBadge.Text = ConfigStore.getGameKey()
+    profileBadge.TextSize = 10
+    profileBadge.TextColor3 = Palette.ActiveGlow
+    profileBadge.TextTruncate = Enum.TextTruncate.AtEnd
+    profileBadge.ZIndex = 41
+    profileBadge.Parent = splash
+    local pbc = Instance.new("UICorner")
+    pbc.CornerRadius = UDim.new(0, 6)
+    pbc.Parent = profileBadge
+
+    local statusLbl = Instance.new("TextLabel")
+    statusLbl.BackgroundTransparency = 1
+    statusLbl.Position = UDim2.new(0, 18, 0, 52)
+    statusLbl.Size = UDim2.new(1, -36, 0, 18)
+    statusLbl.Font = Enum.Font.GothamMedium
+    statusLbl.Text = "Initializing Liquid Glass UI..."
+    statusLbl.TextSize = 11.5
+    statusLbl.TextColor3 = Palette.TextSilver
+    statusLbl.TextXAlignment = Enum.TextXAlignment.Left
+    statusLbl.ZIndex = 41
+    statusLbl.Parent = splash
+
+    local barBg = Instance.new("Frame")
+    barBg.Position = UDim2.new(0, 18, 0, 86)
+    barBg.Size = UDim2.new(1, -36, 0, 8)
+    barBg.BackgroundColor3 = Palette.ToggleOff
+    barBg.BorderSizePixel = 0
+    barBg.ZIndex = 41
+    barBg.Parent = splash
+    local bbc = Instance.new("UICorner")
+    bbc.CornerRadius = UDim.new(1, 0)
+    bbc.Parent = barBg
+
+    local barFill = Instance.new("Frame")
+    barFill.Size = UDim2.fromScale(0.15, 1)
+    barFill.BackgroundColor3 = Palette.ActiveGlow
+    barFill.BorderSizePixel = 0
+    barFill.ZIndex = 42
+    barFill.Parent = barBg
+    local bfc = Instance.new("UICorner")
+    bfc.CornerRadius = UDim.new(1, 0)
+    bfc.Parent = barFill
+
+    tween(barFill, 0.25, {Size = UDim2.fromScale(0.42, 1)})
+    task.delay(0.24, function()
+        if State.Unloaded or not splash.Parent then return end
+        statusLbl.Text = "Syncing Per-Game Config..."
+        tween(barFill, 0.24, {Size = UDim2.fromScale(0.76, 1)})
+    end)
+    task.delay(0.48, function()
+        if State.Unloaded or not splash.Parent then return end
+        statusLbl.Text = "Engaging Mobile Input Guard..."
+        tween(barFill, 0.22, {Size = UDim2.fromScale(1, 1)})
+    end)
+    task.delay(0.74, function()
+        if State.Unloaded or not splash.Parent then return end
+        local fadeTw = tween(splash, 0.22, {BackgroundTransparency = 1, Size = UDim2.fromOffset(324, 136)})
+        tween(logo, 0.18, {TextTransparency = 1})
+        tween(statusLbl, 0.18, {TextTransparency = 1})
+        tween(profileBadge, 0.18, {TextTransparency = 1, BackgroundTransparency = 1})
+        tween(barBg, 0.18, {BackgroundTransparency = 1})
+        tween(barFill, 0.18, {BackgroundTransparency = 1})
+        fadeTw.Completed:Connect(function()
+            if splash and splash.Parent then
+                splash:Destroy()
+            end
+            if not State.Unloaded and startVisible and Config.UI.Visible then
+                MainCard.Visible = true
+                CardShadow.Visible = true
+                MainCard.Size = UDim2.fromOffset(BASE_CARD_W - 22, BASE_CARD_H - 22)
+                MainCard.BackgroundTransparency = 0.45
+                tween(MainCard, 0.22, {
+                    Size = UDim2.fromOffset(BASE_CARD_W, BASE_CARD_H),
+                    BackgroundTransparency = 0.22,
+                })
+                tween(CardShadow, 0.22, {BackgroundTransparency = 0.55})
+            end
+        end)
+    end)
 end
 
 do
@@ -5429,6 +6385,7 @@ end
 local SyncCallbacks = {}
 local syncMobileAimVisibility = function() end
 local syncMobileTriggerVisibility = function() end
+local syncAimPointerVisibility = function() end
 
 local function SyncDependentSettings(needsFullReload, reason)
     if not Config.Aimbot.Enabled then
@@ -5456,6 +6413,11 @@ local function SyncDependentSettings(needsFullReload, reason)
     State.LastTeamScan = -1
     syncMobileAimVisibility()
     syncMobileTriggerVisibility()
+    syncAimPointerVisibility()
+    if UI.refreshTriggerStatus then
+        pcall(UI.refreshTriggerStatus)
+    end
+    ConfigStore.scheduleSave()
     if needsFullReload then
         ScheduleReload(reason or "ConfigMutation", false)
     end
@@ -5751,9 +6713,10 @@ local function addSlider(parent, order, title, minVal, maxVal, step, formatFn, g
 
     local function applyValue(raw)
         local stepped = math.round((raw - minVal) / step) * step + minVal
-        local clamped = math.clamp(stepped, minVal, maxVal)
+        local clamped = math.clamp(math.round(stepped * 100) / 100, minVal, maxVal)
         setter(clamped)
         sync()
+        ConfigStore.scheduleSave()
     end
 
     bindSafeTap(minusBtn, parent, function()
@@ -6090,40 +7053,151 @@ end
 -- 2. TRIGGER BOT TAB
 do
     local TriggerPage = TabPages["Trigger"]
-    addSectionHeader(TriggerPage, 1, "Trigger Bot Engine")
-    addToggle(TriggerPage, 2, "Enable Trigger Bot", "Mouse input stays ON after shots without PC-mode lock or self-clicks", function()
+    addSectionHeader(TriggerPage, 1, "Adaptive Trigger Bot Engine")
+    addToggle(TriggerPage, 2, "Enable Trigger Bot", "Auto-adapts FireButton / Tool / VIM Touch without PC-mode lock", function()
         return Config.TriggerBot.Enabled
     end, function(v)
         Config.TriggerBot.Enabled = v
         Config.UI.MobileTriggerLocked = v
     end)
 
-    addToggle(TriggerPage, 3, "Sync With Aimbot & Prediction", "Syncs lead prediction, Auto Predict, ProjectileSpeed & Aimbot target lock", function()
+    addSelector(TriggerPage, 3, "Fire Method (Manual Override)", {"Auto", "FireButton", "Tool", "VIM Touch", "Mouse (Guard)"}, function()
+        return Config.TriggerBot.FireMethod
+    end, function(v)
+        Config.TriggerBot.FireMethod = v
+        State.ActiveTriggerMethodLabel = "Selected: " .. v
+    end, false)
+
+    do
+        local statusCard = createCardRow(TriggerPage, 66, 4)
+        local statusLbl = Instance.new("TextLabel")
+        statusLbl.BackgroundTransparency = 1
+        statusLbl.Position = UDim2.fromOffset(0, 0)
+        statusLbl.Size = UDim2.new(1, 0, 0, 18)
+        statusLbl.Font = Enum.Font.GothamMedium
+        statusLbl.Text = "Active Call: " .. (State.ActiveTriggerMethodLabel or "Auto")
+        statusLbl.TextSize = 11.5
+        statusLbl.TextColor3 = Palette.ActiveGlow
+        statusLbl.TextXAlignment = Enum.TextXAlignment.Left
+        statusLbl.TextTruncate = Enum.TextTruncate.AtEnd
+        statusLbl.ZIndex = 5
+        statusLbl.Parent = statusCard
+
+        local rescanBtn = Instance.new("TextButton")
+        rescanBtn.AnchorPoint = Vector2.new(0.5, 1)
+        rescanBtn.Position = UDim2.new(0.5, 0, 1, 0)
+        rescanBtn.Size = UDim2.new(1, 0, 0, 26)
+        rescanBtn.BackgroundColor3 = Palette.SurfaceSoft
+        rescanBtn.Font = Enum.Font.GothamBold
+        rescanBtn.Text = "Method Not Working / Re-Scan & Switch"
+        rescanBtn.TextSize = 11
+        rescanBtn.TextColor3 = Palette.TextHeader
+        rescanBtn.AutoButtonColor = false
+        rescanBtn.BorderSizePixel = 0
+        rescanBtn.ZIndex = 6
+        rescanBtn.Parent = statusCard
+        local rbc = Instance.new("UICorner")
+        rbc.CornerRadius = UDim.new(0, 7)
+        rbc.Parent = rescanBtn
+        applyGlassStroke(rescanBtn, 1, 0.65)
+
+        UI.refreshTriggerStatus = function()
+            if statusLbl and statusLbl.Parent then
+                statusLbl.Text = "Active Call: " .. tostring(State.ActiveTriggerMethodLabel or Config.TriggerBot.FireMethod)
+            end
+        end
+        State.OnTriggerMethodChanged = UI.refreshTriggerStatus
+
+        bindSafeTap(rescanBtn, TriggerPage, function()
+            local nextM = TriggerAdapter.rescanAndCycle()
+            for _, sync in ipairs(SyncCallbacks) do
+                pcall(sync)
+            end
+            UI.refreshTriggerStatus()
+            rescanBtn.Text = "Switched -> " .. nextM
+            task.delay(1.1, function()
+                if not State.Unloaded and rescanBtn and rescanBtn.Parent then
+                    rescanBtn.Text = "Method Not Working / Re-Scan & Switch"
+                end
+            end)
+        end)
+    end
+
+    addSectionHeader(TriggerPage, 5, "Floating VIM Touch Pointer & Mobile Guard")
+    addToggle(TriggerPage, 6, "Lock Floating Touch Pointer", "Locks crosshair position so touch drags & taps pass through", function()
+        return Config.TriggerBot.PointerLocked
+    end, function(v)
+        Config.TriggerBot.PointerLocked = v
+    end)
+
+    addToggle(TriggerPage, 7, "Show Floating Touch Pointer", "Draggable aim pointer defining VirtualInputManager tap X/Y", function()
+        return Config.TriggerBot.ShowPointer
+    end, function(v)
+        Config.TriggerBot.ShowPointer = v
+    end)
+
+    addToggle(TriggerPage, 8, "Auto Restore Mobile Mode", "Automatically exits PC mode after death, respawn, or shots", function()
+        return Config.TriggerBot.AutoRestoreMobile
+    end, function(v)
+        Config.TriggerBot.AutoRestoreMobile = v
+    end)
+
+    do
+        local restoreRow = createCardRow(TriggerPage, 46, 9)
+        local restoreNowBtn = Instance.new("TextButton")
+        restoreNowBtn.Size = UDim2.fromScale(1, 1)
+        restoreNowBtn.BackgroundColor3 = Palette.ActiveGlow
+        restoreNowBtn.BackgroundTransparency = 0.80
+        restoreNowBtn.Font = Enum.Font.GothamBold
+        restoreNowBtn.Text = "Restore Mobile Mode Now"
+        restoreNowBtn.TextSize = 11.5
+        restoreNowBtn.TextColor3 = Palette.TextHeader
+        restoreNowBtn.AutoButtonColor = false
+        restoreNowBtn.BorderSizePixel = 0
+        restoreNowBtn.ZIndex = 6
+        restoreNowBtn.Parent = restoreRow
+        local rnc = Instance.new("UICorner")
+        rnc.CornerRadius = UDim.new(0, 8)
+        rnc.Parent = restoreNowBtn
+        applyGlassStroke(restoreNowBtn, 1, 0.55)
+
+        bindSafeTap(restoreNowBtn, TriggerPage, function()
+            TriggerGuard.restoreMobileMode("TriggerTabManualRestore")
+            restoreNowBtn.Text = "Mobile Touch Controls Restored!"
+            task.delay(1.0, function()
+                if not State.Unloaded and restoreNowBtn and restoreNowBtn.Parent then
+                    restoreNowBtn.Text = "Restore Mobile Mode Now"
+                end
+            end)
+        end)
+    end
+
+    addToggle(TriggerPage, 10, "Sync With Aimbot & Prediction", "Syncs lead prediction, Auto Predict, ProjectileSpeed & Aimbot target lock", function()
         return Config.TriggerBot.SyncWithAimbot
     end, function(v)
         Config.TriggerBot.SyncWithAimbot = v
     end)
 
-    addToggle(TriggerPage, 4, "Hardware Mouse Click (mouse1)", "Uses Touch-guarded mouse1press/release while keeping Touch mode across respawns", function()
-        return Config.TriggerBot.HardwareMouse
-    end, function(v)
-        Config.TriggerBot.HardwareMouse = v
-    end)
-
-    addToggle(TriggerPage, 5, "Hold Fire While Locked", "Hold trigger continuously vs timed tap shots", function()
+    addToggle(TriggerPage, 11, "Hold Fire While Locked", "Hold trigger continuously vs timed tap shots", function()
         return Config.TriggerBot.HoldToFire
     end, function(v)
         Config.TriggerBot.HoldToFire = v
     end)
 
-    addSectionHeader(TriggerPage, 8, "Hitbox & Timing")
-    addSelector(TriggerPage, 9, "Target Part Filter", {"Any Part", "Head & Chest", "Head Only"}, function()
+    addToggle(TriggerPage, 12, "Allow Guarded Mouse Fallback", "Uses Touch-safe mouse1 only if FireButton/Tool/VIM are unavailable", function()
+        return Config.TriggerBot.HardwareMouse
+    end, function(v)
+        Config.TriggerBot.HardwareMouse = v
+    end)
+
+    addSectionHeader(TriggerPage, 13, "Hitbox & Timing")
+    addSelector(TriggerPage, 14, "Target Part Filter", {"Any Part", "Head & Chest", "Head Only"}, function()
         return Config.TriggerBot.TargetFilter
     end, function(v)
         Config.TriggerBot.TargetFilter = v
     end, false)
 
-    addSlider(TriggerPage, 10, "Crosshair Tolerance", 0, 28, 1, function(v)
+    addSlider(TriggerPage, 15, "Crosshair Tolerance", 0, 28, 1, function(v)
         local n = math.round(v)
         return (n == 0) and "0 px (Exact)" or string.format("%d px", n)
     end, function()
@@ -6132,7 +7206,7 @@ do
         Config.TriggerBot.CrosshairTolerance = math.round(v)
     end)
 
-    addSlider(TriggerPage, 11, "Reaction Delay", 0.00, 0.30, 0.01, function(v)
+    addSlider(TriggerPage, 16, "Reaction Delay", 0.00, 0.30, 0.01, function(v)
         return string.format("%.2fs", v)
     end, function()
         return Config.TriggerBot.ReactionDelay
@@ -6140,7 +7214,7 @@ do
         Config.TriggerBot.ReactionDelay = v
     end)
 
-    addSlider(TriggerPage, 12, "Shot Cooldown", 0.02, 0.60, 0.01, function(v)
+    addSlider(TriggerPage, 17, "Shot Cooldown", 0.02, 0.60, 0.01, function(v)
         return string.format("%.2fs", v)
     end, function()
         return Config.TriggerBot.ShotCooldown
@@ -6148,27 +7222,27 @@ do
         Config.TriggerBot.ShotCooldown = v
     end)
 
-    addSectionHeader(TriggerPage, 13, "Checks & Reticle HUD")
-    addToggle(TriggerPage, 14, "Ignore Bots (Trigger)", "Skips NPCs/bots when Trigger Bot is active", function()
+    addSectionHeader(TriggerPage, 18, "Checks & Reticle HUD")
+    addToggle(TriggerPage, 19, "Ignore Bots (Trigger)", "Skips NPCs/bots when Trigger Bot is active", function()
         return Config.TriggerBot.IgnoreBots
     end, function(v)
         Config.TriggerBot.IgnoreBots = v
         syncWorkspaceBots()
     end)
 
-    addToggle(TriggerPage, 15, "Trigger Team Check", "Never shoots teammates (FFA-safe Auto mode)", function()
+    addToggle(TriggerPage, 20, "Trigger Team Check", "Never shoots teammates (FFA-safe Auto mode)", function()
         return Config.TriggerBot.TeamCheck
     end, function(v)
         Config.TriggerBot.TeamCheck = v
     end)
 
-    addToggle(TriggerPage, 16, "Trigger Visible Check", "Blocks shots when enemy is behind walls", function()
+    addToggle(TriggerPage, 21, "Trigger Visible Check", "Blocks shots when enemy is behind walls", function()
         return Config.TriggerBot.VisibleCheck
     end, function(v)
         Config.TriggerBot.VisibleCheck = v
     end)
 
-    addToggle(TriggerPage, 17, "Show Crosshair Indicator", "Center reticle dot pulses mint when target locked", function()
+    addToggle(TriggerPage, 22, "Show Crosshair Indicator", "Center reticle dot pulses mint when target locked", function()
         return Config.TriggerBot.ShowIndicator
     end, function(v)
         Config.TriggerBot.ShowIndicator = v
@@ -6291,7 +7365,7 @@ do
     local ColorsPage = TabPages["Colors"]
     addSectionHeader(ColorsPage, 1, "Live Thickness Controls")
 
-    addSlider(ColorsPage, 2, "FOV Circle Thickness", 1.0, 10.0, 0.5, function(v)
+    addSlider(ColorsPage, 2, "FOV Circle Thickness", 0.1, 5.0, 0.1, function(v)
         return string.format("%.1f px", v)
     end, function()
         return Config.Aimbot.FOVThickness
@@ -6300,7 +7374,7 @@ do
         applyThicknessImmediate()
     end)
 
-    addSlider(ColorsPage, 3, "ESP Line Thickness", 1.0, 10.0, 0.5, function(v)
+    addSlider(ColorsPage, 3, "ESP Line Thickness", 0.1, 5.0, 0.1, function(v)
         return string.format("%.1f px", v)
     end, function()
         return Config.ESP.LineThickness
@@ -6309,7 +7383,7 @@ do
         applyThicknessImmediate()
     end)
 
-    addSlider(ColorsPage, 4, "ESP Box Thickness", 1.0, 10.0, 0.5, function(v)
+    addSlider(ColorsPage, 4, "ESP Box Thickness", 0.1, 5.0, 0.1, function(v)
         return string.format("%.1f px", v)
     end, function()
         return Config.ESP.BoxThickness
@@ -6444,6 +7518,7 @@ do
         Config.Colors[key] = Color3.fromRGB(nr, ng, nb)
         liveSwatch.BackgroundColor3 = Config.Colors[key]
         notifyColorUpdated()
+        ConfigStore.scheduleSave()
     end
 
     syncRed = addSlider(ColorsPage, 7, "Red Channel", 0, 255, 1, function(v)
@@ -6532,6 +7607,7 @@ do
         bindSafeTap(sb, ColorsPage, function()
             Config.Colors[Config.UI.SelectedColorKey] = swatchColor
             UI.refreshColorControls()
+            ConfigStore.scheduleSave()
         end)
     end
 
@@ -6542,13 +7618,23 @@ end
 do
     local settingsOrder = 1
 
-    addSectionHeader(SettingsPage, settingsOrder, "Performance & FPS Booster")
+    addSectionHeader(SettingsPage, settingsOrder, "Extreme Performance & Persistence")
     settingsOrder = settingsOrder + 1
 
-    addToggle(SettingsPage, settingsOrder, "Potato Graphics (FPS Boost)", "Drops quality, shadows, particles & map textures for max FPS", function()
+    addToggle(SettingsPage, settingsOrder, "Potato Graphics (Extreme FPS)", "Drops quality, shadows, sky/post-FX, particles & textures (reversible)", function()
         return Config.Performance.PotatoGraphics
     end, function(v)
         applyPotatoGraphics(v)
+    end)
+    settingsOrder = settingsOrder + 1
+
+    addToggle(SettingsPage, settingsOrder, "Auto-Save Config Per Game", "Saves & loads settings automatically per game (" .. ConfigStore.getGameKey() .. ")", function()
+        return Config.UI.AutoSave
+    end, function(v)
+        Config.UI.AutoSave = v
+        if v then
+            ConfigStore.save()
+        end
     end)
     settingsOrder = settingsOrder + 1
 
@@ -6622,60 +7708,41 @@ do
     end)
     settingsOrder = settingsOrder + 1
 
-    addSectionHeader(SettingsPage, settingsOrder, "System Actions")
+    addSectionHeader(SettingsPage, settingsOrder, "System Actions & Mobile Recovery")
     settingsOrder = settingsOrder + 1
 
-    local actionCard = createCardRow(SettingsPage, 54, settingsOrder)
+    local actionCard = createCardRow(SettingsPage, 88, settingsOrder)
     local actionGrid = Instance.new("UIGridLayout")
-    actionGrid.CellSize = UDim2.new(0.333, -6, 1, 0)
-    actionGrid.CellPadding = UDim2.fromOffset(8, 0)
+    actionGrid.CellSize = UDim2.new(0.333, -6, 0, 32)
+    actionGrid.CellPadding = UDim2.fromOffset(8, 8)
     actionGrid.HorizontalAlignment = Enum.HorizontalAlignment.Center
     actionGrid.VerticalAlignment = Enum.VerticalAlignment.Center
     actionGrid.Parent = actionCard
 
-    ForceReloadBtn = Instance.new("TextButton")
-    ForceReloadBtn.Text = "Reload All"
-    ForceReloadBtn.Font = Enum.Font.GothamMedium
-    ForceReloadBtn.TextSize = 11.5
-    ForceReloadBtn.TextColor3 = Palette.TextHeader
-    ForceReloadBtn.BackgroundColor3 = Palette.PrimaryAccent
-    ForceReloadBtn.BackgroundTransparency = 0.25
-    ForceReloadBtn.AutoButtonColor = false
-    ForceReloadBtn.BorderSizePixel = 0
-    ForceReloadBtn.ZIndex = 6
-    ForceReloadBtn.Parent = actionCard
-    local frc = Instance.new("UICorner")
-    frc.CornerRadius = UDim.new(0, 8)
-    frc.Parent = ForceReloadBtn
+    local function makeActionBtn(labelTxt, bg, bgTrans)
+        local b = Instance.new("TextButton")
+        b.Text = labelTxt
+        b.Font = Enum.Font.GothamMedium
+        b.TextSize = 10.5
+        b.TextTruncate = Enum.TextTruncate.AtEnd
+        b.TextColor3 = Palette.TextHeader
+        b.BackgroundColor3 = bg
+        b.BackgroundTransparency = bgTrans
+        b.AutoButtonColor = false
+        b.BorderSizePixel = 0
+        b.ZIndex = 6
+        b.Parent = actionCard
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, 8)
+        c.Parent = b
+        return b
+    end
 
-    ResetBtn = Instance.new("TextButton")
-    ResetBtn.Text = "Reset Defaults"
-    ResetBtn.Font = Enum.Font.GothamMedium
-    ResetBtn.TextSize = 11.5
-    ResetBtn.TextColor3 = Palette.TextHeader
-    ResetBtn.BackgroundColor3 = Palette.SurfaceSoft
-    ResetBtn.AutoButtonColor = false
-    ResetBtn.BorderSizePixel = 0
-    ResetBtn.ZIndex = 6
-    ResetBtn.Parent = actionCard
-    local rc = Instance.new("UICorner")
-    rc.CornerRadius = UDim.new(0, 8)
-    rc.Parent = ResetBtn
-
-    UnloadBtn = Instance.new("TextButton")
-    UnloadBtn.Text = "Unload AKI"
-    UnloadBtn.Font = Enum.Font.GothamMedium
-    UnloadBtn.TextSize = 11.5
-    UnloadBtn.TextColor3 = Palette.TextHeader
-    UnloadBtn.BackgroundColor3 = Palette.Danger
-    UnloadBtn.BackgroundTransparency = 0.2
-    UnloadBtn.AutoButtonColor = false
-    UnloadBtn.BorderSizePixel = 0
-    UnloadBtn.ZIndex = 6
-    UnloadBtn.Parent = actionCard
-    local uc = Instance.new("UICorner")
-    uc.CornerRadius = UDim.new(0, 8)
-    uc.Parent = UnloadBtn
+    ForceReloadBtn = makeActionBtn("Reload All", Palette.PrimaryAccent, 0.25)
+    UI.RestoreMobileBtn = makeActionBtn("Restore Mobile", Palette.ActiveGlow, 0.72)
+    UI.SaveConfigBtn = makeActionBtn("Save Config", Palette.SurfaceSoft, 0)
+    ResetBtn = makeActionBtn("Reset Defaults", Palette.SurfaceSoft, 0)
+    UnloadBtn = makeActionBtn("Unload AKI", Palette.Danger, 0.2)
 end
 end -- end populateAllTabs
 
@@ -6918,6 +7985,102 @@ addOwnUserInputConn(UserInputService.InputBegan, function(input, gameProcessed)
     end
 end)
 
+-- Floating VIM Touch Target Pointer (mounted inside OverlayGui for 1:1 raw screen pixel coordinates)
+do
+    local aimPointer = Instance.new("TextButton")
+    aimPointer.Name = "TEAM_AKI_AimPointer"
+    aimPointer.AnchorPoint = Vector2.new(0.5, 0.5)
+    aimPointer.Position = UDim2.fromScale(Config.TriggerBot.PointerOffsetX, Config.TriggerBot.PointerOffsetY)
+    aimPointer.Size = UDim2.fromOffset(48, 48)
+    aimPointer.BackgroundColor3 = Palette.GlassBase
+    aimPointer.BackgroundTransparency = 0.35
+    aimPointer.Text = "+"
+    aimPointer.Font = Enum.Font.GothamBold
+    aimPointer.TextSize = 22
+    aimPointer.TextColor3 = Palette.ActiveGlow
+    aimPointer.AutoButtonColor = false
+    aimPointer.BorderSizePixel = 0
+    aimPointer.ZIndex = 30
+    aimPointer.Parent = OverlayGui
+    State.TriggerPointerBtn = aimPointer
+
+    local pc = Instance.new("UICorner")
+    pc.CornerRadius = UDim.new(1, 0)
+    pc.Parent = aimPointer
+
+    local pStroke = Instance.new("UIStroke")
+    pStroke.Thickness = 1.6
+    pStroke.Transparency = 0.2
+    pStroke.Color = Palette.ActiveGlow
+    pStroke.Parent = aimPointer
+
+    local lockBadge = Instance.new("TextLabel")
+    lockBadge.BackgroundColor3 = Palette.CardElevated
+    lockBadge.BackgroundTransparency = 0.15
+    lockBadge.AnchorPoint = Vector2.new(0.5, 0)
+    lockBadge.Position = UDim2.new(0.5, 0, 1, 4)
+    lockBadge.Size = UDim2.fromOffset(66, 15)
+    lockBadge.Font = Enum.Font.GothamBold
+    lockBadge.TextSize = 9
+    lockBadge.TextColor3 = Palette.TextHeader
+    lockBadge.ZIndex = 31
+    lockBadge.Parent = aimPointer
+    local lbc = Instance.new("UICorner")
+    lbc.CornerRadius = UDim.new(1, 0)
+    lbc.Parent = lockBadge
+
+    syncAimPointerVisibility = function()
+        local shouldShow = Config.TriggerBot.ShowPointer
+            and (Config.TriggerBot.Enabled or Config.TriggerBot.FireMethod == "VIM Touch" or not Config.TriggerBot.PointerLocked)
+        aimPointer.Visible = shouldShow
+        aimPointer.Position = UDim2.fromScale(Config.TriggerBot.PointerOffsetX, Config.TriggerBot.PointerOffsetY)
+        local locked = Config.TriggerBot.PointerLocked == true
+        aimPointer.Active = not locked
+        lockBadge.Text = locked and "VIM LOCKED" or "DRAG AIM"
+        pStroke.Color = locked and Palette.ActiveGlow or Palette.PrimaryAccent
+        aimPointer.TextColor3 = locked and Palette.ActiveGlow or Palette.TextHeader
+    end
+    syncAimPointerVisibility()
+
+    local activePtrInput = nil
+    local ptrDragStart = nil
+    local ptrStartNorm = nil
+
+    aimPointer.InputBegan:Connect(function(input)
+        if Config.TriggerBot.PointerLocked or TriggerGuard.shouldBlockUiMouseClick(input) then
+            return
+        end
+        if not activePtrInput and (input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1) then
+            activePtrInput = input
+            ptrDragStart = input.Position
+            ptrStartNorm = Vector2.new(Config.TriggerBot.PointerOffsetX, Config.TriggerBot.PointerOffsetY)
+        end
+    end)
+
+    addOwnUserInputConn(UserInputService.InputChanged, function(input)
+        if Config.TriggerBot.PointerLocked or not activePtrInput or not ptrDragStart or not ptrStartNorm then
+            return
+        end
+        if input == activePtrInput or (activePtrInput.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseMovement) then
+            local cam = State.Camera or Workspace.CurrentCamera
+            local vp = cam and cam.ViewportSize or Vector2.new(1280, 720)
+            local delta = input.Position - ptrDragStart
+            local nx = math.clamp(ptrStartNorm.X + (delta.X / math.max(vp.X, 1)), 0.03, 0.97)
+            local ny = math.clamp(ptrStartNorm.Y + (delta.Y / math.max(vp.Y, 1)), 0.05, 0.95)
+            Config.TriggerBot.PointerOffsetX = nx
+            Config.TriggerBot.PointerOffsetY = ny
+            aimPointer.Position = UDim2.fromScale(nx, ny)
+        end
+    end)
+
+    addOwnUserInputConn(UserInputService.InputEnded, function(input)
+        if input == activePtrInput then
+            activePtrInput = nil
+            ConfigStore.scheduleSave()
+        end
+    end)
+end
+
 bindSafeTap(ForceReloadBtn, SettingsPage, function()
     ReloadAllSystems("ManualButton", true)
     ForceReloadBtn.Text = "Reloaded!"
@@ -6927,6 +8090,30 @@ bindSafeTap(ForceReloadBtn, SettingsPage, function()
         end
     end)
 end)
+
+if UI.RestoreMobileBtn then
+    bindSafeTap(UI.RestoreMobileBtn, SettingsPage, function()
+        TriggerGuard.restoreMobileMode("ManualButton")
+        UI.RestoreMobileBtn.Text = "Restored!"
+        task.delay(0.9, function()
+            if not State.Unloaded and UI.RestoreMobileBtn and UI.RestoreMobileBtn.Parent then
+                UI.RestoreMobileBtn.Text = "Restore Mobile"
+            end
+        end)
+    end)
+end
+
+if UI.SaveConfigBtn then
+    bindSafeTap(UI.SaveConfigBtn, SettingsPage, function()
+        ConfigStore.save()
+        UI.SaveConfigBtn.Text = "Saved!"
+        task.delay(0.9, function()
+            if not State.Unloaded and UI.SaveConfigBtn and UI.SaveConfigBtn.Parent then
+                UI.SaveConfigBtn.Text = "Save Config"
+            end
+        end)
+    end)
+end
 
 bindSafeTap(ResetBtn, SettingsPage, function()
     for k, v in pairs(DefaultConfig.Aimbot) do
@@ -6947,6 +8134,9 @@ bindSafeTap(ResetBtn, SettingsPage, function()
     for k, v in pairs(DefaultConfig.Colors) do
         Config.Colors[k] = v
     end
+    clearTable(State.BlacklistedTriggerCandidates)
+    State.CachedFireButton = nil
+    State.ActiveTriggerMethodLabel = "Auto (Ready)"
     applyPotatoGraphics(Config.Performance.PotatoGraphics)
     Config.UI.ShowMobileAimButton = true
     Config.UI.MobileAimLocked = false
@@ -6960,6 +8150,7 @@ bindSafeTap(ResetBtn, SettingsPage, function()
     end
     applyThicknessImmediate()
     SyncDependentSettings(true, "ResetDefaults")
+    ConfigStore.save()
     ResetBtn.Text = "Reset!"
     task.delay(0.8, function()
         if not State.Unloaded and ResetBtn and ResetBtn.Parent then
@@ -6971,6 +8162,9 @@ end)
 local function unloadScript()
     if State.Unloaded then
         return
+    end
+    if Config.UI.AutoSave then
+        pcall(ConfigStore.save)
     end
     State.Unloaded = true
     State.ReloadToken = State.ReloadToken + 1
@@ -7025,3 +8219,11 @@ if UI.UnloadHeaderBtn then
     bindSafeTap(UI.UnloadHeaderBtn, nil, unloadScript)
 end
 bindSafeTap(UnloadBtn, SettingsPage, unloadScript)
+
+if Config.Performance.PotatoGraphics then
+    task.defer(function()
+        if not State.Unloaded then
+            applyPotatoGraphics(true)
+        end
+    end)
+end
