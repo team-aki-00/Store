@@ -2361,20 +2361,35 @@ end
 
 addConnection(Players.PlayerAdded:Connect(function(player)
     if not State.Unloaded then
+        State.LastTeamScan = -1
         registerPlayerEntry(player)
         ScheduleReload("PlayerAdded:" .. player.Name, false)
     end
 end))
 
 addConnection(Players.PlayerRemoving:Connect(function(player)
+    State.LastTeamScan = -1
     destroyPlayerEntry(player)
     if not State.Unloaded then
         ScheduleReload("PlayerRemoving:" .. player.Name, false)
     end
 end))
 
+addConnection(LocalPlayer:GetPropertyChangedSignal("Team"):Connect(function()
+    State.LastTeamScan = -1
+end))
+
+addConnection(LocalPlayer:GetPropertyChangedSignal("TeamColor"):Connect(function()
+    State.LastTeamScan = -1
+end))
+
+addConnection(LocalPlayer:GetPropertyChangedSignal("Neutral"):Connect(function()
+    State.LastTeamScan = -1
+end))
+
 addConnection(LocalPlayer.CharacterAdded:Connect(function(char)
     if not State.Unloaded then
+        State.LastTeamScan = -1
         bindLocalCharacter(char)
         ScheduleReload("LocalPlayerRespawned", false)
     end
@@ -2416,6 +2431,7 @@ local NON_COMBAT_TEAM_NAMES = {
     ghost = true,
     ffa = true,
     ["free for all"] = true,
+    ["free-for-all"] = true,
     player = true,
     players = true,
     participant = true,
@@ -2433,6 +2449,10 @@ local NON_COMBAT_TEAM_NAMES = {
     ingame = true,
     ["in-game"] = true,
     neutral = true,
+    unassigned = true,
+    ["no team"] = true,
+    noteam = true,
+    solo = true,
     none = true,
     default = true,
     ["0"] = true,
@@ -2441,24 +2461,26 @@ local NON_COMBAT_TEAM_NAMES = {
     [""] = true,
 }
 
-local function readTeamAttribute(inst)
-    if not inst then
-        return nil
-    end
-    local v = inst:GetAttribute("Team")
-    if v == nil then v = inst:GetAttribute("TeamId") end
-    if v == nil then v = inst:GetAttribute("TeamID") end
-    if v == nil then v = inst:GetAttribute("Faction") end
-    if v == nil then v = inst:GetAttribute("Squad") end
-    if v == nil or typeof(v) == "boolean" then
-        return nil
-    end
-    local key = string.lower(tostring(v))
-    if NON_COMBAT_TEAM_NAMES[key] then
-        return nil
-    end
-    return v
-end
+local NEUTRAL_BRICK_COLORS = {
+    ["White"] = true,
+    ["Medium stone grey"] = true,
+    ["Institutional white"] = true,
+    ["Light stone grey"] = true,
+    ["Dark stone grey"] = true,
+    ["Grey"] = true,
+    ["Silver"] = true,
+}
+
+local TEAM_ATTR_KEYS = {
+    "Team", "TeamId", "TeamID", "TeamName", "TeamColor",
+    "Faction", "Squad", "Side", "Role", "Allegiance",
+    "Alliance", "Clan", "TeamIndex", "TeamNumber", "team", "teamId",
+}
+
+local TEAM_VALUE_CHILD_NAMES = {
+    "Team", "TeamValue", "TeamName", "TeamId", "TeamID",
+    "Faction", "Side", "Squad", "Role", "TeamColor",
+}
 
 local function isCombatTeam(teamObj)
     if not teamObj then
@@ -2466,6 +2488,109 @@ local function isCombatTeam(teamObj)
     end
     local lowerName = string.lower(teamObj.Name)
     return not NON_COMBAT_TEAM_NAMES[lowerName]
+end
+
+local function isCombatBrickColor(bc)
+    if typeof(bc) ~= "BrickColor" then
+        return false
+    end
+    return not NEUTRAL_BRICK_COLORS[bc.Name]
+end
+
+local function normalizeTeamTag(val)
+    if val == nil or typeof(val) == "boolean" then
+        return nil
+    end
+    if typeof(val) == "Instance" then
+        if val:IsA("Team") then
+            if isCombatTeam(val) then
+                return "team:" .. string.lower(val.Name)
+            end
+            return nil
+        end
+        return "inst:" .. string.lower(val.Name)
+    end
+    if typeof(val) == "BrickColor" then
+        if isCombatBrickColor(val) then
+            return "bc:" .. string.lower(val.Name)
+        end
+        return nil
+    end
+    if typeof(val) == "Color3" then
+        local okBc, bc = pcall(BrickColor.new, val)
+        if okBc and typeof(bc) == "BrickColor" and NEUTRAL_BRICK_COLORS[bc.Name] then
+            return nil
+        end
+        return string.format("c3:%d,%d,%d", math.round(val.R * 255), math.round(val.G * 255), math.round(val.B * 255))
+    end
+    local trimmed = string.gsub(tostring(val), "^%s*(.-)%s*$", "%1")
+    local key = string.lower(trimmed)
+    if NON_COMBAT_TEAM_NAMES[key] then
+        return nil
+    end
+    return key
+end
+
+local function readTeamTagFromContainer(inst)
+    if not inst then
+        return nil
+    end
+    for _, attrKey in ipairs(TEAM_ATTR_KEYS) do
+        local norm = normalizeTeamTag(inst:GetAttribute(attrKey))
+        if norm ~= nil then
+            return norm
+        end
+    end
+    for _, childName in ipairs(TEAM_VALUE_CHILD_NAMES) do
+        local child = inst:FindFirstChild(childName)
+        if child and child:IsA("ValueBase") then
+            local okVal, v = pcall(function()
+                return child.Value
+            end)
+            if okVal then
+                local norm = normalizeTeamTag(v)
+                if norm ~= nil then
+                    return norm
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local function readCustomTeamTag(player, character)
+    if player then
+        local directTag = readTeamTagFromContainer(player)
+        if directTag ~= nil then
+            return directTag
+        end
+        for _, folderName in ipairs({"leaderstats", "Data", "Stats", "Status", "PlayerData"}) do
+            local sub = player:FindFirstChild(folderName)
+            if sub then
+                local subTag = readTeamTagFromContainer(sub)
+                if subTag ~= nil then
+                    return subTag
+                end
+            end
+        end
+    end
+    if character then
+        local charTag = readTeamTagFromContainer(character)
+        if charTag ~= nil then
+            return charTag
+        end
+    end
+    return nil
+end
+
+local function hasCombatTeamColor(plr)
+    if not plr or plr.Neutral then
+        return false
+    end
+    if plr.Team ~= nil and not isCombatTeam(plr.Team) then
+        return false
+    end
+    return isCombatBrickColor(plr.TeamColor)
 end
 
 local function playerHasLivingWorkspaceChar(plr)
@@ -2489,7 +2614,7 @@ local function playerHasLivingWorkspaceChar(plr)
     return entry ~= nil and entry.Character ~= nil and entry.Character.Parent ~= nil and entry.RootPart ~= nil
 end
 
--- Detects whether this server actually has >= 2 distinct combat teams among active players (never hides everyone!)
+-- Detects whether this server has >= 2 distinct combat teams via Team, TeamColor fallback, or CustomTag
 local function refreshDetectedTeamScheme()
     local now = os.clock()
     if State.LastTeamScan >= 0 and (now - State.LastTeamScan) < 0.75 then
@@ -2499,35 +2624,51 @@ local function refreshDetectedTeamScheme()
 
     local distinctTeams = {}
     local teamCount = 0
-    local distinctAttrs = {}
-    local attrCount = 0
+    local distinctColors = {}
+    local colorCount = 0
+    local distinctTags = {}
+    local tagCount = 0
 
-    for _, plr in ipairs(Players:GetPlayers()) do
-        if playerHasLivingWorkspaceChar(plr) then
-            if isCombatTeam(plr.Team) and not plr.Neutral then
-                if not distinctTeams[plr.Team] then
-                    distinctTeams[plr.Team] = true
+    if Teams then
+        pcall(function()
+            for _, teamObj in ipairs(Teams:GetTeams()) do
+                if isCombatTeam(teamObj) and not distinctTeams[teamObj] then
+                    distinctTeams[teamObj] = true
                     teamCount = teamCount + 1
                 end
             end
-            local attr = readTeamAttribute(plr)
-            if attr == nil and plr.Character then
-                attr = readTeamAttribute(plr.Character)
+        end)
+    end
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if isCombatTeam(plr.Team) and not plr.Neutral then
+            if not distinctTeams[plr.Team] then
+                distinctTeams[plr.Team] = true
+                teamCount = teamCount + 1
             end
-            if attr ~= nil then
-                local ak = tostring(attr)
-                if not distinctAttrs[ak] then
-                    distinctAttrs[ak] = true
-                    attrCount = attrCount + 1
-                end
+        end
+        if hasCombatTeamColor(plr) then
+            local ck = plr.TeamColor.Name
+            if not distinctColors[ck] then
+                distinctColors[ck] = true
+                colorCount = colorCount + 1
             end
+        end
+        local entry = Registry[plr]
+        local char = (entry and entry.Character) or plr.Character
+        local tag = readCustomTeamTag(plr, char)
+        if tag ~= nil and not distinctTags[tag] then
+            distinctTags[tag] = true
+            tagCount = tagCount + 1
         end
     end
 
     if teamCount >= 2 and isCombatTeam(LocalPlayer.Team) and not LocalPlayer.Neutral then
         State.DetectedTeamScheme = "Team"
-    elseif attrCount >= 2 then
-        State.DetectedTeamScheme = "Attribute"
+    elseif colorCount >= 2 and hasCombatTeamColor(LocalPlayer) then
+        State.DetectedTeamScheme = "TeamColor"
+    elseif tagCount >= 2 and readCustomTeamTag(LocalPlayer, State.LocalCharacter or LocalPlayer.Character) ~= nil then
+        State.DetectedTeamScheme = "CustomTag"
     else
         State.DetectedTeamScheme = "FFA"
     end
@@ -2535,34 +2676,56 @@ local function refreshDetectedTeamScheme()
     return State.DetectedTeamScheme
 end
 
-local function rawSchemeTeammateCheck(scheme, player, entry)
-    if scheme == "Team" then
-        if isCombatTeam(LocalPlayer.Team) and isCombatTeam(player.Team) and not LocalPlayer.Neutral and not player.Neutral then
-            return LocalPlayer.Team == player.Team
-        end
+local function isStandardTeamMatch(targetPlr)
+    if not targetPlr or LocalPlayer.Team == nil or targetPlr.Team == nil then
         return false
-    elseif scheme == "Attribute" then
-        local lAttr = readTeamAttribute(LocalPlayer) or readTeamAttribute(State.LocalCharacter or LocalPlayer.Character)
-        local tAttr = readTeamAttribute(player) or readTeamAttribute((entry and entry.Character) or player.Character)
-        if lAttr ~= nil and tAttr ~= nil then
-            return lAttr == tAttr
-        end
+    end
+    if LocalPlayer.Neutral or targetPlr.Neutral then
         return false
+    end
+    if not isCombatTeam(LocalPlayer.Team) or not isCombatTeam(targetPlr.Team) then
+        return false
+    end
+    return LocalPlayer.Team == targetPlr.Team
+end
+
+local function isTeamColorMatch(targetPlr)
+    if not targetPlr or not hasCombatTeamColor(LocalPlayer) or not hasCombatTeamColor(targetPlr) then
+        return false
+    end
+    return LocalPlayer.TeamColor == targetPlr.TeamColor
+end
+
+local function isCustomTagMatch(targetPlr, entry)
+    local lTag = readCustomTeamTag(LocalPlayer, State.LocalCharacter or LocalPlayer.Character)
+    local tChar = (entry and entry.Character) or (targetPlr and targetPlr.Character)
+    local tTag = readCustomTeamTag(targetPlr, tChar)
+    if lTag ~= nil and tTag ~= nil then
+        return lTag == tTag
     end
     return false
 end
 
-local function isTeammate(player, entry)
-    if player == LocalPlayer then
-        return true
-    end
-    if entry and entry.IsBot then
-        local botTeamAttr = readTeamAttribute(entry.Character)
-        local myTeamAttr = readTeamAttribute(LocalPlayer) or readTeamAttribute(State.LocalCharacter or LocalPlayer.Character)
-        if botTeamAttr ~= nil and myTeamAttr ~= nil then
-            return botTeamAttr == myTeamAttr
-        end
+local function IsTeammate(player, entry)
+    if player == nil then
         return false
+    end
+
+    local resolvedEntry = entry or Registry[player]
+    local targetPlr = nil
+
+    if typeof(player) == "Instance" then
+        if player == LocalPlayer or player == State.LocalCharacter or player == LocalPlayer.Character then
+            return true
+        end
+        if player:IsA("Player") then
+            targetPlr = player
+        elseif player:IsA("Model") then
+            targetPlr = Players:GetPlayerFromCharacter(player)
+            if targetPlr == LocalPlayer then
+                return true
+            end
+        end
     end
 
     local mode = Config.Resolver.TeamCheckMode
@@ -2570,48 +2733,52 @@ local function isTeammate(player, entry)
         return false
     end
 
+    -- Bots / Non-player Models: match custom tags against LocalPlayer's Team / TeamColor / CustomTag
+    if (resolvedEntry and resolvedEntry.IsBot) or (targetPlr == nil) then
+        local botModel = (resolvedEntry and resolvedEntry.Character) or (typeof(player) == "Instance" and player or nil)
+        local botTag = readCustomTeamTag(nil, botModel)
+        if botTag == nil then
+            return false
+        end
+        local myTag = readCustomTeamTag(LocalPlayer, State.LocalCharacter or LocalPlayer.Character)
+        if myTag ~= nil and botTag == myTag then
+            return true
+        end
+        if isCombatTeam(LocalPlayer.Team) and not LocalPlayer.Neutral then
+            local myTeamNorm = normalizeTeamTag(LocalPlayer.Team)
+            if botTag == string.lower(LocalPlayer.Team.Name) or (myTeamNorm ~= nil and botTag == myTeamNorm) then
+                return true
+            end
+        end
+        if hasCombatTeamColor(LocalPlayer) then
+            local myColorNorm = normalizeTeamTag(LocalPlayer.TeamColor)
+            if botTag == string.lower(LocalPlayer.TeamColor.Name) or (myColorNorm ~= nil and botTag == myColorNorm) then
+                return true
+            end
+        end
+        return false
+    end
+
     if mode == "Team Property" then
-        if LocalPlayer.Team ~= nil and player.Team ~= nil and not LocalPlayer.Neutral and not player.Neutral then
-            return LocalPlayer.Team == player.Team
-        end
-        return false
+        return isStandardTeamMatch(targetPlr)
+    elseif mode == "TeamColor" then
+        return isTeamColorMatch(targetPlr)
+    elseif mode == "Custom Tags" then
+        return isCustomTagMatch(targetPlr, resolvedEntry)
     end
 
-    if mode == "TeamColor" then
-        if not LocalPlayer.Neutral and not player.Neutral then
-            return LocalPlayer.TeamColor == player.TeamColor
-        end
-        return false
-    end
-
-    -- "Auto" FFA-aware mode with Zero-Enemy safety invariant
+    -- "Auto" FFA-aware mode: Team -> TeamColor fallback -> CustomTag fallback
     local scheme = refreshDetectedTeamScheme()
     if scheme == "FFA" then
         return false
+    elseif scheme == "Team" then
+        return isStandardTeamMatch(targetPlr)
+    elseif scheme == "TeamColor" then
+        return isTeamColorMatch(targetPlr)
+    elseif scheme == "CustomTag" then
+        return isCustomTagMatch(targetPlr, resolvedEntry)
     end
-
-    local matched = rawSchemeTeammateCheck(scheme, player, entry)
-    if not matched then
-        return false
-    end
-
-    -- Safety invariant: if this scheme would hide 100% of living opponents in Workspace, it's an FFA lobby -> render all!
-    local hasAnyLivingEnemy = false
-    for otherKey, otherEntry in pairs(Registry) do
-        if (not otherEntry.IsBot) and otherKey ~= LocalPlayer and otherEntry.Character and otherEntry.Character.Parent and otherEntry.RootPart then
-            if not rawSchemeTeammateCheck(scheme, otherKey, otherEntry) then
-                hasAnyLivingEnemy = true
-                break
-            end
-        end
-    end
-
-    if not hasAnyLivingEnemy then
-        State.DetectedTeamScheme = "FFA"
-        return false
-    end
-
-    return true
+    return false
 end
 
 local function getCharacterHealth(entry)
@@ -2821,8 +2988,11 @@ local function IsValidTarget(targetKey, opts)
         return false, entry, nil, math.huge
     end
 
-    local checkTeam = (opts and opts.checkTeam ~= nil) and opts.checkTeam or Config.ESP.TeamCheck
-    if checkTeam and isTeammate(targetKey, entry) then
+    local checkTeam = Config.ESP.TeamCheck
+    if opts and opts.checkTeam ~= nil then
+        checkTeam = opts.checkTeam
+    end
+    if checkTeam and IsTeammate(targetKey, entry) then
         return false, entry, nil, math.huge
     end
 
@@ -2985,10 +3155,13 @@ local function updateAllESP(camera, viewportSize, screenCenter)
     local highlightCandidates = {}
 
     for targetKey, entry in pairs(Registry) do
-        if not Config.ESP.Enabled then
-            entry.Visuals:HideAll()
-            if entry.Highlight then entry.Highlight.Enabled = false end
-        else
+        local okTarget = pcall(function()
+            if not Config.ESP.Enabled then
+                if entry.Visuals then entry.Visuals:HideAll() end
+                if entry.Highlight then entry.Highlight.Enabled = false end
+                return
+            end
+
             local valid, _, visState, worldDist = IsValidTarget(targetKey, {
                 checkTeam = Config.ESP.TeamCheck,
                 checkVisible = Config.ESP.VisibleCheck,
@@ -2998,157 +3171,164 @@ local function updateAllESP(camera, viewportSize, screenCenter)
             })
 
             if not valid or not visState then
-                entry.Visuals:HideAll()
+                if entry.Visuals then entry.Visuals:HideAll() end
                 if entry.Highlight then entry.Highlight.Enabled = false end
-            else
-                local rootPart = entry.RootPart
-                local boxColor = Config.ESP.ColorByVisibility and visState.activeColor or Config.Colors.Box
-                local tracerColor = Config.ESP.ColorByVisibility and visState.activeColor or Config.Colors.Tracer
+                return
+            end
 
-                local rootVP, rootOnScreen = camera:WorldToViewportPoint(rootPart.Position)
-                local headCheckPart = entry.Head or entry.Torso
-                local headInFront = false
-                if headCheckPart and headCheckPart.Parent then
-                    local hvp = camera:WorldToViewportPoint(headCheckPart.Position)
-                    headInFront = hvp.Z > 0
-                end
-                local isBehind = (rootVP.Z <= 0) and (not headInFront)
-                local screenPos = Vector2.new(rootVP.X, rootVP.Y)
+            local rootPart = entry.RootPart
+            local boxColor = Config.ESP.ColorByVisibility and visState.activeColor or Config.Colors.Box
+            local tracerColor = Config.ESP.ColorByVisibility and visState.activeColor or Config.Colors.Tracer
 
-                local boxValid, bx, by, bw, bh = false, 0, 0, 0, 0
-                if not isBehind then
-                    boxValid, bx, by, bw, bh = computeScreenBox(camera, entry, rootVP, worldDist)
-                end
+            local rootVP, rootOnScreen = camera:WorldToViewportPoint(rootPart.Position)
+            local headCheckPart = entry.Head or entry.Torso
+            local headInFront = false
+            if headCheckPart and headCheckPart.Parent then
+                local hvp = camera:WorldToViewportPoint(headCheckPart.Position)
+                headInFront = hvp.Z > 0
+            end
+            local isBehind = (rootVP.Z <= 0) and (not headInFront)
+            local screenPos = Vector2.new(rootVP.X, rootVP.Y)
 
-                local _, _, hpRatio = getCharacterHealth(entry)
-                local hpColor = getHealthColor(hpRatio)
+            local boxValid, bx, by, bw, bh = false, 0, 0, 0, 0
+            if not isBehind then
+                boxValid, bx, by, bw, bh = computeScreenBox(camera, entry, rootVP, worldDist)
+            end
 
-                local showTracer = Config.ESP.TracerESP and (not isBehind) and rootOnScreen
-                local tracerFrom = Vector2.new(viewportSize.X * 0.5, viewportSize.Y)
-                local tracerTo = boxValid and Vector2.new(bx + bw * 0.5, by + bh) or screenPos
+            local _, _, hpRatio = getCharacterHealth(entry)
+            local hpColor = getHealthColor(hpRatio)
 
-                if Config.ESP.TracerOrigin == "Top" then
-                    tracerFrom = Vector2.new(viewportSize.X * 0.5, 0)
-                    local headPart = getBodyAnchorPart(entry, "Head")
-                    if headPart and headPart.Parent then
-                        local hvp = camera:WorldToViewportPoint(headPart.Position)
-                        if hvp.Z > 0 then
-                            tracerTo = Vector2.new(hvp.X, hvp.Y)
-                        elseif boxValid then
-                            tracerTo = Vector2.new(bx + bw * 0.5, by)
-                        end
+            local showTracer = Config.ESP.TracerESP and (not isBehind) and rootOnScreen
+            local tracerFrom = Vector2.new(viewportSize.X * 0.5, viewportSize.Y)
+            local tracerTo = boxValid and Vector2.new(bx + bw * 0.5, by + bh) or screenPos
+
+            if Config.ESP.TracerOrigin == "Top" then
+                tracerFrom = Vector2.new(viewportSize.X * 0.5, 0)
+                local headPart = getBodyAnchorPart(entry, "Head")
+                if headPart and headPart.Parent then
+                    local hvp = camera:WorldToViewportPoint(headPart.Position)
+                    if hvp.Z > 0 then
+                        tracerTo = Vector2.new(hvp.X, hvp.Y)
                     elseif boxValid then
                         tracerTo = Vector2.new(bx + bw * 0.5, by)
                     end
-                elseif Config.ESP.TracerOrigin == "Center" then
-                    tracerFrom = screenCenter
-                    local chestPart = getBodyAnchorPart(entry, "Chest")
-                    if chestPart and chestPart.Parent then
-                        local cvp = camera:WorldToViewportPoint(chestPart.Position)
-                        if cvp.Z > 0 then
-                            tracerTo = Vector2.new(cvp.X, cvp.Y)
-                        elseif boxValid then
-                            tracerTo = Vector2.new(bx + bw * 0.5, by + bh * 0.45)
-                        end
+                elseif boxValid then
+                    tracerTo = Vector2.new(bx + bw * 0.5, by)
+                end
+            elseif Config.ESP.TracerOrigin == "Center" then
+                tracerFrom = screenCenter
+                local chestPart = getBodyAnchorPart(entry, "Chest")
+                if chestPart and chestPart.Parent then
+                    local cvp = camera:WorldToViewportPoint(chestPart.Position)
+                    if cvp.Z > 0 then
+                        tracerTo = Vector2.new(cvp.X, cvp.Y)
                     elseif boxValid then
                         tracerTo = Vector2.new(bx + bw * 0.5, by + bh * 0.45)
                     end
+                elseif boxValid then
+                    tracerTo = Vector2.new(bx + bw * 0.5, by + bh * 0.45)
+                end
+            else
+                tracerFrom = Vector2.new(viewportSize.X * 0.5, viewportSize.Y)
+                if boxValid then
+                    tracerTo = Vector2.new(bx + bw * 0.5, by + bh)
                 else
-                    tracerFrom = Vector2.new(viewportSize.X * 0.5, viewportSize.Y)
-                    if boxValid then
-                        tracerTo = Vector2.new(bx + bw * 0.5, by + bh)
-                    else
-                        local footPart = getBodyAnchorPart(entry, "Feet")
-                        if footPart and footPart.Parent then
-                            local fvp = camera:WorldToViewportPoint(footPart.Position)
-                            if fvp.Z > 0 then
-                                tracerTo = Vector2.new(fvp.X, fvp.Y)
-                            end
+                    local footPart = getBodyAnchorPart(entry, "Feet")
+                    if footPart and footPart.Parent then
+                        local fvp = camera:WorldToViewportPoint(footPart.Position)
+                        if fvp.Z > 0 then
+                            tracerTo = Vector2.new(fvp.X, fvp.Y)
                         end
                     end
                 end
+            end
 
-                local showArrow = false
-                local arrowPos = Vector2.zero
-                local arrowAngle = 0
-                local arrowColor = Config.ESP.ColorByVisibility and visState.activeColor or Config.Colors.Alert360
+            local showArrow = false
+            local arrowPos = Vector2.zero
+            local arrowAngle = 0
+            local arrowColor = Config.ESP.ColorByVisibility and visState.activeColor or Config.Colors.Alert360
 
-                if Config.ESP.Alert360 then
-                    local alertAllowed = (not Config.ESP.Alert360VisibleOnly) or visState.isVisible
-                    if alertAllowed then
-                        local localSpace = camera.CFrame:PointToObjectSpace(rootPart.Position)
-                        local screenDir = Vector2.new(localSpace.X, -localSpace.Y)
-                        local distFromCenter = (screenPos - screenCenter).Magnitude
-                        local outOfFOV = isBehind or (not rootOnScreen) or (distFromCenter > Config.Aimbot.FOVRadius)
-                        if outOfFOV and screenDir.Magnitude > 0.001 then
-                            showArrow = true
-                            arrowAngle = math.atan2(screenDir.Y, screenDir.X)
-                            local ringR = math.min(
-                                Config.ESP.AlertRingRadius,
-                                math.min(viewportSize.X, viewportSize.Y) * 0.42
-                            )
-                            arrowPos = screenCenter + Vector2.new(math.cos(arrowAngle), math.sin(arrowAngle)) * ringR
-                        end
+            if Config.ESP.Alert360 then
+                local alertAllowed = (not Config.ESP.Alert360VisibleOnly) or visState.isVisible
+                if alertAllowed then
+                    local localSpace = camera.CFrame:PointToObjectSpace(rootPart.Position)
+                    local screenDir = Vector2.new(localSpace.X, -localSpace.Y)
+                    local distFromCenter = (screenPos - screenCenter).Magnitude
+                    local outOfFOV = isBehind or (not rootOnScreen) or (distFromCenter > Config.Aimbot.FOVRadius)
+                    if outOfFOV and screenDir.Magnitude > 0.001 then
+                        showArrow = true
+                        arrowAngle = math.atan2(screenDir.Y, screenDir.X)
+                        local ringR = math.min(
+                            Config.ESP.AlertRingRadius,
+                            math.min(viewportSize.X, viewportSize.Y) * 0.42
+                        )
+                        arrowPos = screenCenter + Vector2.new(math.cos(arrowAngle), math.sin(arrowAngle)) * ringR
                     end
                 end
+            end
 
-                local feetX = boxValid and (bx + bw * 0.5) or screenPos.X
-                local feetY = boxValid and (by + bh + 3) or (screenPos.Y + 12)
-                local footPart = getBodyAnchorPart(entry, "Feet")
-                if not boxValid and footPart and footPart.Parent then
-                    local fvp = camera:WorldToViewportPoint(footPart.Position)
-                    if fvp.Z > 0 then
-                        feetX = fvp.X
-                        feetY = fvp.Y + 6
-                    end
+            local feetX = boxValid and (bx + bw * 0.5) or screenPos.X
+            local feetY = boxValid and (by + bh + 3) or (screenPos.Y + 12)
+            local footPart = getBodyAnchorPart(entry, "Feet")
+            if not boxValid and footPart and footPart.Parent then
+                local fvp = camera:WorldToViewportPoint(footPart.Position)
+                if fvp.Z > 0 then
+                    feetX = fvp.X
+                    feetY = fvp.Y + 6
                 end
+            end
 
-                entry.Visuals:Render({
-                    ShowBox = Config.ESP.BoxESP and boxValid,
-                    BoxStyle = Config.ESP.BoxStyle,
-                    BoxThickness = Config.ESP.BoxThickness,
-                    BoxColor = boxColor,
-                    BX = bx,
-                    BY = by,
-                    BW = bw,
-                    BH = bh,
-                    ShowHealth = Config.ESP.HealthBar and boxValid,
-                    ShowHealthText = Config.ESP.ShowHealthPercent,
-                    HealthRatio = hpRatio,
-                    HealthColor = hpColor,
-                    ShowName = Config.ESP.ShowName and boxValid,
-                    NameText = getEntryDisplayName(entry, targetKey),
-                    ShowDist = Config.ESP.ShowDistance and (not isBehind) and (boxValid or rootOnScreen),
-                    DistText = string.format("%.0fm", worldDist),
-                    FeetX = feetX,
-                    FeetY = feetY,
-                    ShowTracer = showTracer,
-                    TracerFrom = tracerFrom,
-                    TracerTo = tracerTo,
-                    TracerColor = tracerColor,
-                    LineThickness = Config.ESP.LineThickness,
-                    ShowArrow = showArrow,
-                    ArrowPos = arrowPos,
-                    ArrowAngle = arrowAngle,
-                    ArrowColor = arrowColor,
-                })
+            entry.Visuals:Render({
+                ShowBox = Config.ESP.BoxESP and boxValid,
+                BoxStyle = Config.ESP.BoxStyle,
+                BoxThickness = Config.ESP.BoxThickness,
+                BoxColor = boxColor,
+                BX = bx,
+                BY = by,
+                BW = bw,
+                BH = bh,
+                ShowHealth = Config.ESP.HealthBar and boxValid,
+                ShowHealthText = Config.ESP.ShowHealthPercent,
+                HealthRatio = hpRatio,
+                HealthColor = hpColor,
+                ShowName = Config.ESP.ShowName and boxValid,
+                NameText = getEntryDisplayName(entry, targetKey),
+                ShowDist = Config.ESP.ShowDistance and (not isBehind) and (boxValid or rootOnScreen),
+                DistText = string.format("%.0fm", worldDist),
+                FeetX = feetX,
+                FeetY = feetY,
+                ShowTracer = showTracer,
+                TracerFrom = tracerFrom,
+                TracerTo = tracerTo,
+                TracerColor = tracerColor,
+                LineThickness = Config.ESP.LineThickness,
+                ShowArrow = showArrow,
+                ArrowPos = arrowPos,
+                ArrowAngle = arrowAngle,
+                ArrowColor = arrowColor,
+            })
 
-                if Config.ESP.HighlightESP then
-                    local hlAllowed = (not Config.ESP.HighlightVisibleOnly) or visState.isVisible
-                    if hlAllowed then
-                        table.insert(highlightCandidates, {
-                            Entry = entry,
-                            TargetKey = targetKey,
-                            Dist = worldDist,
-                            ActiveColor = visState.activeColor,
-                        })
-                    elseif entry.Highlight then
-                        entry.Highlight.Enabled = false
-                    end
+            if Config.ESP.HighlightESP then
+                local hlAllowed = (not Config.ESP.HighlightVisibleOnly) or visState.isVisible
+                if hlAllowed then
+                    table.insert(highlightCandidates, {
+                        Entry = entry,
+                        TargetKey = targetKey,
+                        Dist = worldDist,
+                        ActiveColor = visState.activeColor,
+                    })
                 elseif entry.Highlight then
                     entry.Highlight.Enabled = false
                 end
+            elseif entry.Highlight then
+                entry.Highlight.Enabled = false
             end
+        end)
+        if not okTarget then
+            pcall(function()
+                if entry and entry.Visuals then entry.Visuals:HideAll() end
+                if entry and entry.Highlight then entry.Highlight.Enabled = false end
+            end)
         end
     end
 
@@ -3206,10 +3386,13 @@ addConnection(UserInputService.InputEnded:Connect(function(input)
 end))
 
 local function isAimbotInputActive()
+    if not Config.Aimbot.Enabled then
+        return false
+    end
     if Config.Aimbot.ActivationMode == "Hold" then
         return State.IsHoldingAim
     end
-    return Config.Aimbot.Enabled
+    return true
 end
 
 local function findMatchingBonePosition(entry, mode, camera, screenCenter, maxAnchorPos)
@@ -3350,7 +3533,21 @@ local function getLocalPingSeconds()
     return 0
 end
 
-local function resolveTargetVelocity(entry, part, targetPos, dt)
+local function resolveTargetVelocity(entry, part, targetPos, dt, readOnly)
+    if readOnly then
+        if isFiniteVector3(entry.EstimatedVel) and entry.EstimatedVel.Magnitude > 0.05 then
+            return entry.EstimatedVel
+        end
+        local roPhys = Vector3.zero
+        pcall(function()
+            roPhys = part.AssemblyLinearVelocity
+        end)
+        if isFiniteVector3(roPhys) and roPhys.Magnitude <= 140 then
+            return Vector3.new(roPhys.X, math.clamp(roPhys.Y, -60, 60) * 0.45, roPhys.Z)
+        end
+        return Vector3.zero
+    end
+
     if entry.LastVelFrame == State.FrameIndex and entry.LastTrackedPart == part and isFiniteVector3(entry.EstimatedVel) then
         return entry.EstimatedVel
     end
@@ -3434,8 +3631,8 @@ local function evaluateAimCandidate(targetKey, camera, screenCenter)
     return true, entry, aimPart, screenDist, worldDist
 end
 
-local function computePredictedTargetPoint(entry, part, basePos, worldDist, dt)
-    local velocity = resolveTargetVelocity(entry, part, basePos, dt)
+local function computePredictedTargetPoint(entry, part, basePos, worldDist, dt, readOnly)
+    local velocity = resolveTargetVelocity(entry, part, basePos, dt, readOnly)
     local projLead = (Config.Aimbot.ProjectileSpeed > 0) and (worldDist / Config.Aimbot.ProjectileSpeed) or 0
     local leadTime
     if Config.Aimbot.AutoPredict then
@@ -3475,8 +3672,8 @@ local function updateAimbot(camera, screenCenter, dt)
     local chosenDist = 0
 
     if Config.Aimbot.StickyTarget and State.CurrentAimTarget then
-        local ok, entry, part, _, worldDist = evaluateAimCandidate(State.CurrentAimTarget, camera, screenCenter)
-        if ok and entry and part then
+        local okCall, ok, entry, part, _, worldDist = pcall(evaluateAimCandidate, State.CurrentAimTarget, camera, screenCenter)
+        if okCall and ok and entry and part then
             chosenEntry = entry
             chosenPart = part
             chosenDist = worldDist
@@ -3493,8 +3690,8 @@ local function updateAimbot(camera, screenCenter, dt)
         local bestWorldDist = 0
 
         for targetKey in pairs(Registry) do
-            local ok, entry, part, screenDist, worldDist = evaluateAimCandidate(targetKey, camera, screenCenter)
-            if ok and entry and part and screenDist < bestScreenDist then
+            local okCall, ok, entry, part, screenDist, worldDist = pcall(evaluateAimCandidate, targetKey, camera, screenCenter)
+            if okCall and ok and entry and part and screenDist < bestScreenDist then
                 bestScreenDist = screenDist
                 bestKey = targetKey
                 bestEntry = entry
@@ -4558,7 +4755,7 @@ local function findTriggerTarget(camera, screenCenter, dt)
 
                     if usePredSweep then
                         local worldDist = (checkPos - origin).Magnitude
-                        local predPos = computePredictedTargetPoint(entry, part, checkPos, worldDist, dt or (1 / 60))
+                        local predPos = computePredictedTargetPoint(entry, part, checkPos, worldDist, dt or (1 / 60), true)
                         local vpP, onP = camera:WorldToViewportPoint(predPos)
                         if vpP.Z > 0 and onP then
                             local pDist = (Vector2.new(vpP.X, vpP.Y) - screenCenter).Magnitude
@@ -4602,7 +4799,9 @@ local function updateTriggerBot(camera, screenCenter, now, dt)
     if not Config.TriggerBot.Enabled or not State.LocalAlive then
         State.TriggerTarget = nil
         State.TriggerAcquireTime = 0
-        releaseTriggerFire()
+        if State.TriggerHolding or State.TriggerVimTouchDown or State.TriggerToolRef ~= nil then
+            releaseTriggerFire()
+        end
         TriggerDot.Visible = false
         return
     end
@@ -4661,6 +4860,26 @@ end
 -- ============================================================================
 local RENDER_STEP_NAME = "TEAM_AKI_RenderStep"
 
+local function stepAimbotModule(camera, screenCenter, dt)
+    local ok = pcall(updateAimbot, camera, screenCenter, dt)
+    if not ok then
+        State.CurrentAimTarget = nil
+        State.CurrentAimPart = nil
+        State.CurrentAimPredictedPos = nil
+    end
+end
+
+local function stepEspModule(camera, viewportSize, screenCenter)
+    pcall(updateAllESP, camera, viewportSize, screenCenter)
+end
+
+local function stepTriggerModule(camera, screenCenter, now, dt)
+    local ok = pcall(updateTriggerBot, camera, screenCenter, now, dt)
+    if not ok then
+        pcall(releaseTriggerFire)
+    end
+end
+
 local function onRenderStepFrame(dt)
     if State.Unloaded then
         return
@@ -4683,79 +4902,85 @@ local function onRenderStepFrame(dt)
     end
 
     -- Detect LocalPlayer teleport (TP) and immediately re-sync all targets
-    local localRoot = State.LocalRootPart
-    if localRoot and localRoot.Parent then
-        local curLocalPos = localRoot.Position
-        if State.LastLocalPos and (curLocalPos - State.LastLocalPos).Magnitude >= 35 then
-            State.LastLocalPos = curLocalPos
-            State.CurrentAimTarget = nil
-            pcall(ReloadAllSystems, "LocalTeleportDetected", false)
-        else
-            State.LastLocalPos = curLocalPos
+    pcall(function()
+        local localRoot = State.LocalRootPart
+        if localRoot and localRoot.Parent then
+            local curLocalPos = localRoot.Position
+            if State.LastLocalPos and (curLocalPos - State.LastLocalPos).Magnitude >= 35 then
+                State.LastLocalPos = curLocalPos
+                State.CurrentAimTarget = nil
+                pcall(ReloadAllSystems, "LocalTeleportDetected", false)
+            else
+                State.LastLocalPos = curLocalPos
+            end
         end
-    end
+    end)
 
-    -- Fast per-frame player, respawn & teleport guarantee so zero spawned players are ever missed
+    -- Fast per-frame player, respawn & teleport guarantee (pcall-guarded per player)
     local missingInFrame = nil
-    for _, player in ipairs(Players:GetPlayers()) do
-        if player ~= LocalPlayer then
-            local entry = Registry[player]
-            if not entry then
-                registerPlayerEntry(player)
-                entry = Registry[player]
-            end
-            if entry then
-                local allowDeep = (entry.Character == nil) and ((now - entry.LastDeepScan) >= 0.4)
-                if allowDeep then
-                    entry.LastDeepScan = now
+    pcall(function()
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer then
+                local entry = Registry[player]
+                if not entry then
+                    registerPlayerEntry(player)
+                    entry = Registry[player]
                 end
-                local liveChar = resolveCharacterForPlayer(player, allowDeep)
-                if liveChar and liveChar.Parent then
-                    if entry.Character ~= liveChar then
-                        bindCharacterToEntry(entry, liveChar)
-                    elseif entry.NeedsRescan
-                        or (not entry.RootPart)
-                        or (not entry.RootPart.Parent)
-                        or (#entry.RigParts == 0 and (now - entry.LastScanTime) > 0.25)
-                    then
-                        entry.NeedsRescan = false
-                        cacheCharacterParts(entry, liveChar)
-                        attachRemoteHumanoidDeath(entry)
-                    elseif entry.RootPart and entry.RootPart.Parent then
-                        local curPos = entry.RootPart.Position
-                        if entry.LastKnownWorldPos and (curPos - entry.LastKnownWorldPos).Magnitude >= 35 then
-                            entry.LastKnownWorldPos = curPos
-                            entry.EstimatedVel = Vector3.zero
-                            entry.LastTrackedPos = nil
-                            entry.FrameVisualCache = nil
+                if entry then
+                    local allowDeep = (entry.Character == nil) and ((now - entry.LastDeepScan) >= 0.4)
+                    if allowDeep then
+                        entry.LastDeepScan = now
+                    end
+                    local okRes, liveChar = pcall(resolveCharacterForPlayer, player, allowDeep)
+                    if okRes and liveChar and liveChar.Parent then
+                        if entry.Character ~= liveChar then
+                            bindCharacterToEntry(entry, liveChar)
+                        elseif entry.NeedsRescan
+                            or (not entry.RootPart)
+                            or (not entry.RootPart.Parent)
+                            or (#entry.RigParts == 0 and (now - entry.LastScanTime) > 0.25)
+                        then
+                            entry.NeedsRescan = false
                             cacheCharacterParts(entry, liveChar)
-                            ScheduleReload("RemoteTeleport:" .. player.Name, false)
-                        else
-                            entry.LastKnownWorldPos = curPos
+                            attachRemoteHumanoidDeath(entry)
+                        elseif entry.RootPart and entry.RootPart.Parent then
+                            local curPos = entry.RootPart.Position
+                            if entry.LastKnownWorldPos and (curPos - entry.LastKnownWorldPos).Magnitude >= 35 then
+                                entry.LastKnownWorldPos = curPos
+                                entry.EstimatedVel = Vector3.zero
+                                entry.LastTrackedPos = nil
+                                entry.FrameVisualCache = nil
+                                cacheCharacterParts(entry, liveChar)
+                                ScheduleReload("RemoteTeleport:" .. player.Name, false)
+                            else
+                                entry.LastKnownWorldPos = curPos
+                            end
                         end
+                    else
+                        if entry.Character ~= nil then
+                            clearCharacterFromEntry(entry)
+                        end
+                        if not missingInFrame then
+                            missingInFrame = {}
+                        end
+                        table.insert(missingInFrame, player)
                     end
-                else
-                    if entry.Character ~= nil then
-                        clearCharacterFromEntry(entry)
-                    end
-                    if not missingInFrame then
-                        missingInFrame = {}
-                    end
-                    table.insert(missingInFrame, player)
                 end
             end
         end
-    end
+    end)
 
     if missingInFrame and (now - (State.LastWorkspaceDeepScan or 0)) >= 0.75 then
         State.LastWorkspaceDeepScan = now
-        local recovered = deepWorkspaceScanForMissingPlayers(missingInFrame)
-        for plr, liveChar in pairs(recovered) do
-            local entry = Registry[plr]
-            if entry and liveChar and liveChar.Parent then
-                bindCharacterToEntry(entry, liveChar)
+        pcall(function()
+            local recovered = deepWorkspaceScanForMissingPlayers(missingInFrame)
+            for plr, liveChar in pairs(recovered) do
+                local entry = Registry[plr]
+                if entry and liveChar and liveChar.Parent then
+                    bindCharacterToEntry(entry, liveChar)
+                end
             end
-        end
+        end)
     end
 
     if (now - (State.LastBotScan or 0)) >= 0.5 then
@@ -4766,42 +4991,47 @@ local function onRenderStepFrame(dt)
     local viewportSize = camera.ViewportSize
     local screenCenter = Vector2.new(viewportSize.X * 0.5, viewportSize.Y * 0.5)
 
-    local showFov = Config.Aimbot.ShowFOV
-    local useDrawingFov = shouldUseDrawing() and DrawingFOV ~= nil
+    pcall(function()
+        local showFov = Config.Aimbot.ShowFOV
+        local useDrawingFov = shouldUseDrawing() and DrawingFOV ~= nil
 
-    if DrawingFOV then
-        pcall(function()
-            DrawingFOV.Visible = showFov and useDrawingFov
-            if showFov and useDrawingFov then
-                local fovT, fovOp = VisualHelper.resolveDrawingThickness(Config.Aimbot.FOVThickness, Config.Aimbot.Enabled and 0.92 or 0.65)
-                DrawingFOV.Position = screenCenter
-                DrawingFOV.Radius = Config.Aimbot.FOVRadius
-                DrawingFOV.Thickness = fovT
-                DrawingFOV.Color = Config.Colors.FOV
-                DrawingFOV.Transparency = fovOp
-            end
-        end)
-    end
+        if DrawingFOV then
+            pcall(function()
+                DrawingFOV.Visible = showFov and useDrawingFov
+                if showFov and useDrawingFov then
+                    local fovT, fovOp = VisualHelper.resolveDrawingThickness(Config.Aimbot.FOVThickness, Config.Aimbot.Enabled and 0.92 or 0.65)
+                    DrawingFOV.Position = screenCenter
+                    DrawingFOV.Radius = Config.Aimbot.FOVRadius
+                    DrawingFOV.Thickness = fovT
+                    DrawingFOV.Color = Config.Colors.FOV
+                    DrawingFOV.Transparency = fovOp
+                end
+            end)
+        end
 
-    FOVRingFrame.Visible = showFov and (not useDrawingFov)
-    if FOVRingFrame.Visible then
-        local diameter = Config.Aimbot.FOVRadius * 2
-        local strokeT, strokeTrans = VisualHelper.resolveStrokeThickness(Config.Aimbot.FOVThickness, Config.Aimbot.Enabled and 0.14 or 0.44)
-        FOVRingFrame.Size = UDim2.fromOffset(diameter, diameter)
-        FOVStroke.Color = Config.Colors.FOV
-        FOVStroke.Thickness = strokeT
-        FOVStroke.Transparency = strokeTrans
-    end
+        FOVRingFrame.Visible = showFov and (not useDrawingFov)
+        if FOVRingFrame.Visible then
+            local diameter = Config.Aimbot.FOVRadius * 2
+            local strokeT, strokeTrans = VisualHelper.resolveStrokeThickness(Config.Aimbot.FOVThickness, Config.Aimbot.Enabled and 0.14 or 0.44)
+            FOVRingFrame.Size = UDim2.fromOffset(diameter, diameter)
+            FOVStroke.Color = Config.Colors.FOV
+            FOVStroke.Thickness = strokeT
+            FOVStroke.Transparency = strokeTrans
+        end
+    end)
 
     -- Keep LocalAlive synced immediately on respawn before 1.0s periodic reload
-    local liveLocalChar = LocalPlayer.Character
-    if liveLocalChar and liveLocalChar.Parent and State.LocalCharacter ~= liveLocalChar then
-        bindLocalCharacter(liveLocalChar)
-    end
+    pcall(function()
+        local liveLocalChar = LocalPlayer.Character
+        if liveLocalChar and liveLocalChar.Parent and State.LocalCharacter ~= liveLocalChar then
+            bindLocalCharacter(liveLocalChar)
+        end
+    end)
 
-    updateAimbot(camera, screenCenter, dt)
-    updateTriggerBot(camera, screenCenter, now, dt)
-    updateAllESP(camera, viewportSize, screenCenter)
+    -- 100% Decoupled & pcall-isolated module updates: no module can ever block or crash another
+    stepAimbotModule(camera, screenCenter, dt)
+    stepEspModule(camera, viewportSize, screenCenter)
+    stepTriggerModule(camera, screenCenter, now, dt)
 end
 
 local function isCharacterOrHudDescendant(inst)
@@ -7593,7 +7823,7 @@ do
     addSectionHeader(SettingsPage, settingsOrder, "Detection & Render Engine")
     settingsOrder = settingsOrder + 1
 
-    addSelector(SettingsPage, settingsOrder, "Team Check Mode", {"Auto", "Team Property", "TeamColor", "Off"}, function()
+    addSelector(SettingsPage, settingsOrder, "Team Check Mode", {"Auto", "Team Property", "TeamColor", "Custom Tags", "Off"}, function()
         return Config.Resolver.TeamCheckMode
     end, function(v)
         Config.Resolver.TeamCheckMode = v
