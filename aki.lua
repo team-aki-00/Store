@@ -238,6 +238,7 @@ local Config = {
         LineThickness = 1.5,            -- 0.1 .. 10.0 pixels
         Alert360 = true,
         Alert360VisibleOnly = false,
+        Alert360Thickness = 1.5,        -- 0.1 .. 10.0 pixels (dedicated 360 Alert thickness)
         AlertRingRadius = 155,
         HighlightESP = true,
         HighlightVisibleOnly = false,
@@ -437,7 +438,7 @@ function InputGuard.forceReleaseAll()
     State.DragSinkBound = false
 end
 
--- Per-game (PlaceId) configuration persistence with safe executor file fallback
+-- Deterministic per-game (GameId, falling back to PlaceId if GameId == 0) config persistence with zero duplicates
 local ConfigStore = {}
 ConfigStore.FOLDER = "TEAM_AKI_Configs"
 ConfigStore.StatusListeners = {}
@@ -449,9 +450,47 @@ function ConfigStore.hasFileApi()
         and HttpService ~= nil
 end
 
-function ConfigStore.getFilePath()
+function ConfigStore.getGameKey()
+    local gid = tonumber(game and game.GameId) or 0
+    if gid > 0 then
+        return "game_" .. tostring(math.floor(gid))
+    end
     local pid = tonumber(game and game.PlaceId) or 0
-    return string.format("%s/place_%d.json", ConfigStore.FOLDER, pid)
+    return "place_" .. tostring(math.floor(pid))
+end
+
+function ConfigStore.getDisplayId()
+    local gid = tonumber(game and game.GameId) or 0
+    if gid > 0 then
+        return string.format("Game %d", math.floor(gid))
+    end
+    local pid = tonumber(game and game.PlaceId) or 0
+    return string.format("Place %d", math.floor(pid))
+end
+
+function ConfigStore.getLegacyPlacePath()
+    local pid = tonumber(game and game.PlaceId) or 0
+    return string.format("%s/place_%d.json", ConfigStore.FOLDER, math.floor(pid))
+end
+
+function ConfigStore.getFilePath()
+    return string.format("%s/%s.json", ConfigStore.FOLDER, ConfigStore.getGameKey())
+end
+
+function ConfigStore.cleanupLegacyDuplicate()
+    local gid = tonumber(game and game.GameId) or 0
+    if gid <= 0 or type(delfile) ~= "function" then
+        return
+    end
+    local currentPath = ConfigStore.getFilePath()
+    local legacyPath = ConfigStore.getLegacyPlacePath()
+    if legacyPath ~= currentPath then
+        pcall(function()
+            if isfile(legacyPath) then
+                delfile(legacyPath)
+            end
+        end)
+    end
 end
 
 function ConfigStore.notifyStatus()
@@ -516,6 +555,7 @@ function ConfigStore.sanitizeConfig()
     Config.Aimbot.FOVThickness = math.clamp(math.round((Config.Aimbot.FOVThickness or 1.5) * 10) / 10, 0.1, 10.0)
     Config.ESP.BoxThickness = math.clamp(math.round((Config.ESP.BoxThickness or 1.5) * 10) / 10, 0.1, 10.0)
     Config.ESP.LineThickness = math.clamp(math.round((Config.ESP.LineThickness or 1.5) * 10) / 10, 0.1, 10.0)
+    Config.ESP.Alert360Thickness = math.clamp(math.round((Config.ESP.Alert360Thickness or 1.5) * 10) / 10, 0.1, 10.0)
     Config.TriggerBot.PointerScaleX = math.clamp(Config.TriggerBot.PointerScaleX or 0.84, 0.04, 0.96)
     Config.TriggerBot.PointerScaleY = math.clamp(Config.TriggerBot.PointerScaleY or 0.68, 0.06, 0.94)
     if Config.TriggerBot.Mode ~= "VirtualInputManager"
@@ -533,11 +573,14 @@ function ConfigStore.sanitizeConfig()
 end
 
 function ConfigStore.saveNow()
+    -- Cancel any pending debounced write so explicit saves never collide or duplicate
+    State.ConfigSaveToken = (State.ConfigSaveToken or 0) + 1
     if not ConfigStore.hasFileApi() then
         State.ConfigStatusText = "Memory Only (No File API)"
         ConfigStore.notifyStatus()
         return false
     end
+    local path = ConfigStore.getFilePath()
     local ok = pcall(function()
         if type(isfolder) == "function" and type(makefolder) == "function" then
             if not isfolder(ConfigStore.FOLDER) then
@@ -554,11 +597,11 @@ function ConfigStore.saveNow()
             UI = Config.UI,
         })
         local encoded = HttpService:JSONEncode(payload)
-        writefile(ConfigStore.getFilePath(), encoded)
+        writefile(path, encoded)
     end)
     if ok then
-        local pid = tonumber(game and game.PlaceId) or 0
-        State.ConfigStatusText = string.format("Saved (Place %d)", pid)
+        ConfigStore.cleanupLegacyDuplicate()
+        State.ConfigStatusText = string.format("Saved (%s)", ConfigStore.getDisplayId())
     else
         State.ConfigStatusText = "Save Skipped"
     end
@@ -586,8 +629,20 @@ function ConfigStore.loadNow()
     end
     local path = ConfigStore.getFilePath()
     local okExists, exists = pcall(isfile, path)
+    local migratedFromLegacy = false
     if not okExists or not exists then
-        State.ConfigStatusText = string.format("New Profile (Place %d)", tonumber(game and game.PlaceId) or 0)
+        local legacyPath = ConfigStore.getLegacyPlacePath()
+        if legacyPath ~= path then
+            local okLeg, legExists = pcall(isfile, legacyPath)
+            if okLeg and legExists then
+                path = legacyPath
+                exists = true
+                migratedFromLegacy = true
+            end
+        end
+    end
+    if not exists then
+        State.ConfigStatusText = string.format("New Profile (%s)", ConfigStore.getDisplayId())
         return false
     end
     local okRead, raw = pcall(readfile, path)
@@ -610,7 +665,21 @@ function ConfigStore.loadNow()
     ConfigStore.applyTable(Config.Colors, decoded.Colors)
     ConfigStore.applyTable(Config.UI, decoded.UI)
     ConfigStore.sanitizeConfig()
-    State.ConfigStatusText = string.format("Loaded (Place %d)", tonumber(game and game.PlaceId) or 0)
+    if migratedFromLegacy then
+        pcall(function()
+            writefile(ConfigStore.getFilePath(), HttpService:JSONEncode(ConfigStore.serializeValue({
+                Aimbot = Config.Aimbot,
+                TriggerBot = Config.TriggerBot,
+                ESP = Config.ESP,
+                Resolver = Config.Resolver,
+                Performance = Config.Performance,
+                Colors = Config.Colors,
+                UI = Config.UI,
+            })))
+        end)
+        ConfigStore.cleanupLegacyDuplicate()
+    end
+    State.ConfigStatusText = string.format("Loaded (%s)", ConfigStore.getDisplayId())
     return true
 end
 
@@ -915,6 +984,10 @@ local function createRegistryVisualBundle()
     arrowLeft.ZIndex = 4
     arrowLeft.Parent = arrowHolder
 
+    local arrowLeftCorner = Instance.new("UICorner")
+    arrowLeftCorner.CornerRadius = UDim.new(1, 0)
+    arrowLeftCorner.Parent = arrowLeft
+
     local arrowRight = Instance.new("Frame")
     arrowRight.BorderSizePixel = 0
     arrowRight.AnchorPoint = Vector2.new(0.5, 0.5)
@@ -923,6 +996,10 @@ local function createRegistryVisualBundle()
     arrowRight.Rotation = 45
     arrowRight.ZIndex = 4
     arrowRight.Parent = arrowHolder
+
+    local arrowRightCorner = Instance.new("UICorner")
+    arrowRightCorner.CornerRadius = UDim.new(1, 0)
+    arrowRightCorner.Parent = arrowRight
 
     local drawCache = nil
     local function ensureDrawingCache()
@@ -1178,12 +1255,15 @@ local function createRegistryVisualBundle()
                             local dir = Vector2.new(math.cos(state.ArrowAngle), math.sin(state.ArrowAngle))
                             local perp = Vector2.new(-dir.Y, dir.X)
                             local tip = state.ArrowPos
-                            local baseCenter = tip - dir * 14
-                            local at, aOp = VisualHelper.resolveDrawingThickness(math.min(state.LineThickness, 6), 0.96)
+                            local rawArrowT = math.clamp(state.Alert360Thickness or 1.5, 0.1, 10.0)
+                            local at, aOp = VisualHelper.resolveDrawingThickness(rawArrowT, 0.96)
+                            local arrowLen = 12 + math.clamp(rawArrowT - 1, 0, 9) * 0.65
+                            local arrowHalfW = 6.5 + math.clamp(rawArrowT - 1, 0, 9) * 0.35
+                            local baseCenter = tip - dir * arrowLen
                             d.Arrow.Visible = true
                             d.Arrow.PointA = tip
-                            d.Arrow.PointB = baseCenter + perp * 7
-                            d.Arrow.PointC = baseCenter - perp * 7
+                            d.Arrow.PointB = baseCenter + perp * arrowHalfW
+                            d.Arrow.PointC = baseCenter - perp * arrowHalfW
                             d.Arrow.Color = state.ArrowColor
                             d.Arrow.Thickness = at
                             d.Arrow.Transparency = aOp
@@ -1302,14 +1382,14 @@ local function createRegistryVisualBundle()
             end
 
             if state.ShowArrow then
-                local rawArrowT = math.min(state.LineThickness, 6)
+                local rawArrowT = math.clamp(state.Alert360Thickness or 1.5, 0.1, 10.0)
                 local arrowT, arrowTrans = VisualHelper.resolveFrameThickness(rawArrowT)
-                arrowT = math.max(arrowT, 1.5)
+                local wingLen = math.clamp(10 + math.max(rawArrowT - 1, 0) * 0.7, 10, 17)
                 arrowHolder.Visible = true
                 arrowHolder.Position = UDim2.fromOffset(state.ArrowPos.X, state.ArrowPos.Y)
                 arrowHolder.Rotation = math.deg(state.ArrowAngle) + 90
-                arrowLeft.Size = UDim2.fromOffset(11, arrowT)
-                arrowRight.Size = UDim2.fromOffset(11, arrowT)
+                arrowLeft.Size = UDim2.fromOffset(wingLen, arrowT)
+                arrowRight.Size = UDim2.fromOffset(wingLen, arrowT)
                 arrowLeft.BackgroundColor3 = state.ArrowColor
                 arrowRight.BackgroundColor3 = state.ArrowColor
                 arrowLeft.BackgroundTransparency = arrowTrans
@@ -1453,14 +1533,14 @@ end
 
 local function resolveCharacterForPlayer(player, allowDeepScan)
     local directChar = player.Character
-    if directChar and directChar.Parent and directChar:IsDescendantOf(Workspace) then
-        if hasInstanceParts(directChar) then
+    if directChar and directChar.Parent then
+        if directChar:IsDescendantOf(Workspace) and hasInstanceParts(directChar) then
             return directChar
         end
     end
 
     if not Config.Resolver.CustomContainerScan then
-        if directChar and directChar.Parent and directChar:IsDescendantOf(Workspace) then
+        if directChar and directChar.Parent then
             return directChar
         end
         return nil
@@ -1489,7 +1569,7 @@ local function resolveCharacterForPlayer(player, allowDeepScan)
                     if okSelf and aliveSelf then
                         return child
                     end
-                    if (child:IsA("Folder") or child:IsA("Model")) and #child:GetChildren() <= 200 then
+                    if (child:IsA("Folder") or child:IsA("Model")) and #child:GetChildren() <= 500 then
                         local nested = scanContainerForPlayer(child, player)
                         if nested then
                             return nested
@@ -1500,7 +1580,8 @@ local function resolveCharacterForPlayer(player, allowDeepScan)
         end
     end
 
-    if directChar and directChar.Parent and directChar:IsDescendantOf(Workspace) then
+    -- Preserve newly spawning character even before its limbs finish streaming into Workspace
+    if directChar and directChar.Parent then
         return directChar
     end
 
@@ -1899,7 +1980,24 @@ local function registerPlayerEntry(player)
     table.insert(entry.PlayerConns, player.CharacterAdded:Connect(function(char)
         if not State.Unloaded then
             bindCharacterToEntry(entry, char)
+            entry.NeedsRescan = true
             ScheduleReload("RemoteCharacterAdded:" .. player.Name, false)
+        end
+    end))
+
+    table.insert(entry.PlayerConns, player:GetPropertyChangedSignal("Character"):Connect(function()
+        if State.Unloaded then
+            return
+        end
+        local nextChar = player.Character
+        if nextChar and nextChar.Parent then
+            if entry.Character ~= nextChar then
+                bindCharacterToEntry(entry, nextChar)
+                entry.NeedsRescan = true
+                ScheduleReload("RemoteCharacterProp:" .. player.Name, false)
+            end
+        elseif not nextChar and entry.Character ~= nil then
+            clearCharacterFromEntry(entry)
         end
     end))
 
@@ -2262,46 +2360,48 @@ ReloadAllSystems = function(reason, hardReset)
         end
     end
 
-    -- Reconcile every active player in Players:GetPlayers()
+    -- Reconcile every active player in Players:GetPlayers() (pcall-guarded per player so none are skipped)
     local seen = {}
     local missingPlayers = {}
     for _, player in ipairs(Players:GetPlayers()) do
         if player ~= LocalPlayer then
             seen[player] = true
-            local entry = Registry[player]
-            if not entry then
-                registerPlayerEntry(player)
-                entry = Registry[player]
-            end
-            if entry then
-                if not entry.Visuals or not entry.Visuals:IsGuiAlive() then
-                    if entry.Visuals then
-                        entry.Visuals:Destroy()
-                    end
-                    local rebuilt = createRegistryVisualBundle()
-                    entry.Visuals = rebuilt
-                    entry.BoxLines = rebuilt.BoxLines
-                    entry.TracerLine = rebuilt.TracerLine
-                    entry.HealthBg = rebuilt.HealthBg
-                    entry.HealthFill = rebuilt.HealthFill
-                    entry.AlertArrow = rebuilt.AlertArrow
+            pcall(function()
+                local entry = Registry[player]
+                if not entry then
+                    registerPlayerEntry(player)
+                    entry = Registry[player]
                 end
+                if entry then
+                    if not entry.Visuals or not entry.Visuals:IsGuiAlive() then
+                        if entry.Visuals then
+                            entry.Visuals:Destroy()
+                        end
+                        local rebuilt = createRegistryVisualBundle()
+                        entry.Visuals = rebuilt
+                        entry.BoxLines = rebuilt.BoxLines
+                        entry.TracerLine = rebuilt.TracerLine
+                        entry.HealthBg = rebuilt.HealthBg
+                        entry.HealthFill = rebuilt.HealthFill
+                        entry.AlertArrow = rebuilt.AlertArrow
+                    end
 
-                local liveChar = resolveCharacterForPlayer(player, true)
-                if liveChar and liveChar.Parent then
-                    if entry.Character ~= liveChar then
-                        bindCharacterToEntry(entry, liveChar)
+                    local liveChar = resolveCharacterForPlayer(player, true)
+                    if liveChar and liveChar.Parent then
+                        if entry.Character ~= liveChar then
+                            bindCharacterToEntry(entry, liveChar)
+                        else
+                            cacheCharacterParts(entry, liveChar)
+                            attachRemoteHumanoidDeath(entry)
+                        end
                     else
-                        cacheCharacterParts(entry, liveChar)
-                        attachRemoteHumanoidDeath(entry)
+                        if entry.Character ~= nil then
+                            clearCharacterFromEntry(entry)
+                        end
+                        table.insert(missingPlayers, player)
                     end
-                else
-                    if entry.Character ~= nil then
-                        clearCharacterFromEntry(entry)
-                    end
-                    table.insert(missingPlayers, player)
                 end
-            end
+            end)
         end
     end
 
@@ -2362,18 +2462,25 @@ end
 addConnection(Players.PlayerAdded:Connect(function(player)
     if not State.Unloaded then
         State.LastTeamScan = -1
-        registerPlayerEntry(player)
+        pcall(registerPlayerEntry, player)
         ScheduleReload("PlayerAdded:" .. player.Name, false)
     end
 end))
 
 addConnection(Players.PlayerRemoving:Connect(function(player)
     State.LastTeamScan = -1
-    destroyPlayerEntry(player)
+    pcall(destroyPlayerEntry, player)
     if not State.Unloaded then
         ScheduleReload("PlayerRemoving:" .. player.Name, false)
     end
 end))
+
+-- Immediately register every player already connected at script injection time
+for _, existingPlayer in ipairs(Players:GetPlayers()) do
+    if existingPlayer ~= LocalPlayer then
+        pcall(registerPlayerEntry, existingPlayer)
+    end
+end
 
 addConnection(LocalPlayer:GetPropertyChangedSignal("Team"):Connect(function()
     State.LastTeamScan = -1
@@ -2405,7 +2512,7 @@ end))
 if LocalPlayer.Character then
     bindLocalCharacter(LocalPlayer.Character)
 end
-ReloadAllSystems("InitialBootstrap", true)
+ReloadAllSystems("InitialBootstrap", false)
 
 local function runPeriodicSafetySync()
     ReloadAllSystems("Periodic1sRenderSync", false)
@@ -2871,34 +2978,39 @@ local RayParams = RaycastParams.new()
 RayParams.FilterType = Enum.RaycastFilterType.Exclude
 RayParams.IgnoreWater = true
 
-local function raycastPartVisible(camera, targetCharacter, targetPart)
-    if not camera or not targetCharacter or not targetPart or not targetPart.Parent then
+local function raycastPointVisible(camera, targetCharacter, targetPos)
+    if not camera or not targetCharacter or not isFiniteVector3(targetPos) then
         return false
     end
 
     local origin = camera.CFrame.Position
-    local targetPos = targetPart.Position
+    if not isFiniteVector3(origin) then
+        return false
+    end
+
     local delta = targetPos - origin
     local totalDist = delta.Magnitude
-    if totalDist < 0.01 then
+    if totalDist < 0.05 then
         return true
     end
 
-    local filterList = {OverlayGui, HighlightContainer, camera}
+    local filterList = {OverlayGui, HighlightContainer, camera, targetCharacter}
     local localChar = State.LocalCharacter or LocalPlayer.Character
     if localChar then
         table.insert(filterList, localChar)
     end
 
+    RayParams.FilterType = Enum.RaycastFilterType.Exclude
     RayParams.IgnoreWater = Config.ESP.IgnoreGlassWater
     local currentOrigin = origin
     local dirUnit = delta.Unit
 
-    for _ = 1, 6 do
-        local remaining = (targetPos - currentOrigin).Magnitude
-        if remaining < 0.05 then
+    for _ = 1, 16 do
+        local toTarget = targetPos - currentOrigin
+        if toTarget:Dot(dirUnit) <= 0.02 then
             return true
         end
+        local remaining = toTarget.Magnitude
 
         RayParams.FilterDescendantsInstances = filterList
         local result = Workspace:Raycast(currentOrigin, dirUnit * remaining, RayParams)
@@ -2907,10 +3019,6 @@ local function raycastPartVisible(camera, targetCharacter, targetPart)
         end
 
         local hitPart = result.Instance
-        if hitPart:IsDescendantOf(targetCharacter) then
-            return true
-        end
-
         local parentName = hitPart.Parent and string.lower(hitPart.Parent.Name) or ""
         local isVfxOrDebris = string.find(parentName, "bullet", 1, true) ~= nil
             or string.find(parentName, "effect", 1, true) ~= nil
@@ -2918,19 +3026,33 @@ local function raycastPartVisible(camera, targetCharacter, targetPart)
             or string.find(parentName, "vfx", 1, true) ~= nil
             or string.find(parentName, "tracer", 1, true) ~= nil
             or string.find(parentName, "projectile", 1, true) ~= nil
+        local isOverlay = (OverlayGui and hitPart:IsDescendantOf(OverlayGui))
+            or (HighlightContainer and hitPart:IsDescendantOf(HighlightContainer))
+            or (string.find(hitPart.Name, "TEAM_AKI", 1, true) ~= nil)
         local isAccessory = hitPart:FindFirstAncestorOfClass("Accessory") ~= nil
+        local isInvisibleHitbox = (hitPart.Transparency >= 0.95)
+        local isNonCollidable = (not hitPart.CanCollide)
         local isNonBlockingGlass = Config.ESP.IgnoreGlassWater
-            and (hitPart.Transparency >= 0.45 or hitPart.Material == Enum.Material.Glass)
+            and hitPart.Material == Enum.Material.Glass
+            and hitPart.Transparency >= 0.35
 
-        if (not hitPart.CanCollide) or isAccessory or isVfxOrDebris or isNonBlockingGlass or hitPart.Transparency >= 0.92 then
+        if isOverlay or isNonCollidable or isInvisibleHitbox or isAccessory or isVfxOrDebris or isNonBlockingGlass then
             table.insert(filterList, hitPart)
-            currentOrigin = result.Position + dirUnit * 0.05
+            local stepDist = (result.Position - currentOrigin).Magnitude
+            currentOrigin = currentOrigin + dirUnit * math.min(stepDist + 0.002, remaining)
         else
             return false
         end
     end
 
     return false
+end
+
+local function raycastPartVisible(camera, targetCharacter, targetPart)
+    if not camera or not targetCharacter or not targetPart or not targetPart.Parent then
+        return false
+    end
+    return raycastPointVisible(camera, targetCharacter, targetPart.Position)
 end
 
 local function GetTargetVisualState(player, targetPart)
@@ -2950,13 +3072,14 @@ local function GetTargetVisualState(player, targetPart)
             isVis = raycastPartVisible(camera, entry.Character, targetPart)
         else
             local headPart = entry.Head
+            local rootPart = entry.RootPart
             local chestPart = entry.Torso
             if headPart and headPart.Parent and raycastPartVisible(camera, entry.Character, headPart) then
                 isVis = true
-            elseif chestPart and chestPart.Parent and chestPart ~= headPart and raycastPartVisible(camera, entry.Character, chestPart) then
+            elseif rootPart and rootPart.Parent and rootPart ~= headPart and raycastPartVisible(camera, entry.Character, rootPart) then
                 isVis = true
-            elseif entry.RootPart and entry.RootPart.Parent and entry.RootPart ~= headPart and entry.RootPart ~= chestPart then
-                isVis = raycastPartVisible(camera, entry.Character, entry.RootPart)
+            elseif chestPart and chestPart.Parent and chestPart ~= headPart and chestPart ~= rootPart then
+                isVis = raycastPartVisible(camera, entry.Character, chestPart)
             end
         end
     end
@@ -3302,6 +3425,7 @@ local function updateAllESP(camera, viewportSize, screenCenter)
                 TracerTo = tracerTo,
                 TracerColor = tracerColor,
                 LineThickness = Config.ESP.LineThickness,
+                Alert360Thickness = Config.ESP.Alert360Thickness,
                 ShowArrow = showArrow,
                 ArrowPos = arrowPos,
                 ArrowAngle = arrowAngle,
@@ -4667,11 +4791,12 @@ local function findTriggerTarget(camera, screenCenter, dt)
             )
             local isAccessory = hitPart:FindFirstAncestorOfClass("Accessory") ~= nil
             local isNonBlockingGlass = Config.ESP.IgnoreGlassWater
-                and (hitPart.Transparency >= 0.45 or hitPart.Material == Enum.Material.Glass)
-            if isCloseViewmodel or (not hitPart.CanCollide) or isAccessory or isNonBlockingGlass or hitPart.Transparency >= 0.92 then
+                and hitPart.Material == Enum.Material.Glass
+                and hitPart.Transparency >= 0.35
+            if isCloseViewmodel or (not hitPart.CanCollide) or isAccessory or isNonBlockingGlass or hitPart.Transparency >= 0.95 then
                 table.insert(filterList, hitPart)
-                remaining = remaining - (result.Position - currentOrigin).Magnitude - 0.05
-                currentOrigin = result.Position + dirUnit * 0.05
+                remaining = remaining - (result.Position - currentOrigin).Magnitude - 0.005
+                currentOrigin = result.Position + dirUnit * 0.005
             else
                 break
             end
@@ -4916,11 +5041,11 @@ local function onRenderStepFrame(dt)
         end
     end)
 
-    -- Fast per-frame player, respawn & teleport guarantee (pcall-guarded per player)
+    -- Fast per-frame player, respawn & teleport guarantee (pcall-guarded per player so one failure never skips others)
     local missingInFrame = nil
-    pcall(function()
-        for _, player in ipairs(Players:GetPlayers()) do
-            if player ~= LocalPlayer then
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            pcall(function()
                 local entry = Registry[player]
                 if not entry then
                     registerPlayerEntry(player)
@@ -4966,9 +5091,9 @@ local function onRenderStepFrame(dt)
                         table.insert(missingInFrame, player)
                     end
                 end
-            end
+            end)
         end
-    end)
+    end
 
     if missingInFrame and (now - (State.LastWorkspaceDeepScan or 0)) >= 0.75 then
         State.LastWorkspaceDeepScan = now
@@ -7514,7 +7639,16 @@ do
         applyThicknessImmediate()
     end)
 
-    addSectionHeader(ColorsPage, 5, "Channel Color Editor")
+    addSlider(ColorsPage, 5, "360° Alert Thickness", 0.1, 10.0, 0.1, function(v)
+        return string.format("%.1f px", v)
+    end, function()
+        return Config.ESP.Alert360Thickness
+    end, function(v)
+        Config.ESP.Alert360Thickness = v
+        applyThicknessImmediate()
+    end)
+
+    addSectionHeader(ColorsPage, 6, "Channel Color Editor")
 
     local colorChannelDefs = {
         { Key = "Visible", Label = "Visible" },
@@ -7525,7 +7659,7 @@ do
         { Key = "FOV", Label = "FOV Ring" },
     }
 
-    local channelCard = createCardRow(ColorsPage, 104, 6)
+    local channelCard = createCardRow(ColorsPage, 104, 7)
     local channelTitle = Instance.new("TextLabel")
     channelTitle.BackgroundTransparency = 1
     channelTitle.Position = UDim2.fromOffset(0, 0)
@@ -7646,7 +7780,7 @@ do
         ConfigStore.scheduleSave()
     end
 
-    syncRed = addSlider(ColorsPage, 7, "Red Channel", 0, 255, 1, function(v)
+    syncRed = addSlider(ColorsPage, 8, "Red Channel", 0, 255, 1, function(v)
         return string.format("%d", math.round(v))
     end, function()
         return math.round(Config.Colors[Config.UI.SelectedColorKey].R * 255)
@@ -7654,7 +7788,7 @@ do
         updateChannelRGB(math.round(v), nil, nil)
     end)
 
-    syncGreen = addSlider(ColorsPage, 8, "Green Channel", 0, 255, 1, function(v)
+    syncGreen = addSlider(ColorsPage, 9, "Green Channel", 0, 255, 1, function(v)
         return string.format("%d", math.round(v))
     end, function()
         return math.round(Config.Colors[Config.UI.SelectedColorKey].G * 255)
@@ -7662,7 +7796,7 @@ do
         updateChannelRGB(nil, math.round(v), nil)
     end)
 
-    syncBlue = addSlider(ColorsPage, 9, "Blue Channel", 0, 255, 1, function(v)
+    syncBlue = addSlider(ColorsPage, 10, "Blue Channel", 0, 255, 1, function(v)
         return string.format("%d", math.round(v))
     end, function()
         return math.round(Config.Colors[Config.UI.SelectedColorKey].B * 255)
@@ -7670,7 +7804,7 @@ do
         updateChannelRGB(nil, nil, math.round(v))
     end)
 
-    local swatchesCard = createCardRow(ColorsPage, 68, 10)
+    local swatchesCard = createCardRow(ColorsPage, 68, 11)
     local swatchTitle = Instance.new("TextLabel")
     swatchTitle.BackgroundTransparency = 1
     swatchTitle.Position = UDim2.fromOffset(0, 0)
@@ -7756,7 +7890,7 @@ do
     addSectionHeader(SettingsPage, settingsOrder, "Auto-Save Config (Per Game)")
     settingsOrder = settingsOrder + 1
 
-    addToggle(SettingsPage, settingsOrder, "Auto-Save & Auto-Load Profile", "Saves settings & confirmed Trigger calls per game PlaceId", function()
+    addToggle(SettingsPage, settingsOrder, "Auto-Save & Auto-Load Profile", "Saves one clean profile per game (GameId / PlaceId fallback)", function()
         return Config.UI.AutoSaveConfig
     end, function(v)
         Config.UI.AutoSaveConfig = v
