@@ -346,41 +346,88 @@ local function notifyColorUpdated()
     end
 end
 
--- Camera-safe touch drag sink: blocks Roblox camera swipe while dragging floating pills, panel header, or unlocked pointer
+-- Direct-touch drag ownership guard (uses native GuiObject.Active = true instead of global Touch camera sinking)
 local InputGuard = {}
 InputGuard.ACTION_NAME = "TEAM_AKI_DragCameraSink"
+InputGuard.ActiveOwner = nil
+InputGuard.ActiveInput = nil
 
-function InputGuard.acquireDragSink()
-    State.ActiveDragCount = (State.ActiveDragCount or 0) + 1
-    if not State.DragSinkBound and ContextActionService then
-        local ok = pcall(function()
-            ContextActionService:BindActionAtPriority(
-                InputGuard.ACTION_NAME,
-                function()
-                    return Enum.ContextActionResult.Sink
-                end,
-                false,
-                3000,
-                Enum.UserInputType.Touch
-            )
-        end)
-        if ok then
-            State.DragSinkBound = true
-        end
-    end
+function InputGuard.isActiveState(userInputState)
+    return userInputState == Enum.UserInputState.Begin or userInputState == Enum.UserInputState.Change
 end
 
-function InputGuard.releaseDragSink()
-    State.ActiveDragCount = math.max((State.ActiveDragCount or 0) - 1, 0)
-    if State.ActiveDragCount == 0 and State.DragSinkBound and ContextActionService then
-        pcall(function()
-            ContextActionService:UnbindAction(InputGuard.ACTION_NAME)
+function InputGuard.isPointInGui(gui, pos, pad)
+    if not gui or not pos or not gui.Visible or not gui.Parent then
+        return false
+    end
+    local absPos = gui.AbsolutePosition
+    local absSize = gui.AbsoluteSize
+    if absSize.X <= 0 or absSize.Y <= 0 then
+        return false
+    end
+    local margin = pad or 0
+    return pos.X >= (absPos.X - margin)
+        and pos.X <= (absPos.X + absSize.X + margin)
+        and pos.Y >= (absPos.Y - margin)
+        and pos.Y <= (absPos.Y + absSize.Y + margin)
+end
+
+function InputGuard.beginDrag(owner, input)
+    if not owner or not input then
+        return false
+    end
+    if input.UserInputState ~= Enum.UserInputState.Begin then
+        return false
+    end
+    if InputGuard.ActiveOwner and InputGuard.ActiveOwner ~= owner then
+        local existing = InputGuard.ActiveInput
+        local okVis, ownerVisible = pcall(function()
+            return InputGuard.ActiveOwner.Visible and InputGuard.ActiveOwner.Parent ~= nil
         end)
-        State.DragSinkBound = false
+        local alive = existing and InputGuard.isActiveState(existing.UserInputState) and (okVis and ownerVisible)
+        if alive then
+            return false
+        end
+        InputGuard.ActiveOwner = nil
+        InputGuard.ActiveInput = nil
+    end
+    InputGuard.ActiveOwner = owner
+    InputGuard.ActiveInput = input
+    State.ActiveDragCount = 1
+    return true
+end
+
+function InputGuard.isOwner(owner, input)
+    if InputGuard.ActiveOwner ~= owner or not InputGuard.ActiveInput then
+        return false
+    end
+    if not InputGuard.isActiveState(InputGuard.ActiveInput.UserInputState) then
+        InputGuard.ActiveOwner = nil
+        InputGuard.ActiveInput = nil
+        State.ActiveDragCount = 0
+        return false
+    end
+    if input == InputGuard.ActiveInput then
+        return InputGuard.isActiveState(input.UserInputState)
+    end
+    if InputGuard.ActiveInput.UserInputType == Enum.UserInputType.MouseButton1
+        and input and input.UserInputType == Enum.UserInputType.MouseMovement then
+        return true
+    end
+    return false
+end
+
+function InputGuard.endDrag(owner)
+    if owner == nil or InputGuard.ActiveOwner == owner then
+        InputGuard.ActiveOwner = nil
+        InputGuard.ActiveInput = nil
+        State.ActiveDragCount = 0
     end
 end
 
 function InputGuard.forceReleaseAll()
+    InputGuard.ActiveOwner = nil
+    InputGuard.ActiveInput = nil
     State.ActiveDragCount = 0
     if State.DragSinkBound and ContextActionService then
         pcall(function()
@@ -5105,17 +5152,19 @@ State.MainGui = MainGui
 local UI = {}
 UI.syncVimPointer = function() end
 UI.refreshTriggerControls = function() end
+UI.clampPanelToViewport = function() end
 
 local Palette = {
-    GlassBase = Color3.fromRGB(10, 12, 19),
-    CardElevated = Color3.fromRGB(16, 20, 31),
-    SurfaceSoft = Color3.fromRGB(24, 30, 45),
-    GlassEdge = Color3.fromRGB(115, 175, 255),
-    PrimaryAccent = Color3.fromRGB(88, 156, 255),
+    GlassBase = Color3.fromRGB(12, 16, 26),
+    CardElevated = Color3.fromRGB(22, 30, 48),
+    SurfaceSoft = Color3.fromRGB(38, 50, 78),
+    GlassEdge = Color3.fromRGB(165, 212, 255),
+    GlassSpecular = Color3.fromRGB(235, 246, 255),
+    PrimaryAccent = Color3.fromRGB(88, 164, 255),
     ActiveGlow = Color3.fromRGB(56, 232, 198),
-    TextHeader = Color3.fromRGB(244, 247, 255),
-    TextSilver = Color3.fromRGB(164, 176, 202),
-    ToggleOff = Color3.fromRGB(39, 49, 69),
+    TextHeader = Color3.fromRGB(246, 249, 255),
+    TextSilver = Color3.fromRGB(184, 196, 222),
+    ToggleOff = Color3.fromRGB(52, 66, 94),
     Danger = Color3.fromRGB(244, 63, 94),
     Amber = Color3.fromRGB(251, 146, 60),
 }
@@ -5127,21 +5176,52 @@ local function tween(obj, duration, props)
     return tw
 end
 
-local function applyGlassStroke(target, thickness, transparency)
+local function applyGlassStroke(target, thickness, transparency, color)
     local stroke = Instance.new("UIStroke")
     stroke.Thickness = thickness or 1.15
-    stroke.Transparency = transparency or 0.70
-    stroke.Color = Palette.GlassEdge
+    stroke.Transparency = transparency or 0.58
+    stroke.Color = color or Palette.GlassEdge
+    stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
     stroke.Parent = target
 
     local edgeGrad = Instance.new("UIGradient")
-    edgeGrad.Rotation = 45
+    edgeGrad.Rotation = 42
     edgeGrad.Transparency = NumberSequence.new({
         NumberSequenceKeypoint.new(0, 0.0),
-        NumberSequenceKeypoint.new(0.45, 0.45),
-        NumberSequenceKeypoint.new(1, 0.86),
+        NumberSequenceKeypoint.new(0.42, 0.42),
+        NumberSequenceKeypoint.new(1, 0.80),
     })
     edgeGrad.Parent = stroke
+
+    return stroke
+end
+
+function UI.applyFrostedSurface(target, cornerRadius, bgColor, bgTransparency, strokeTransparency, addInnerSheen)
+    target.BackgroundColor3 = bgColor or Palette.CardElevated
+    target.BackgroundTransparency = bgTransparency or 0.58
+    target.BorderSizePixel = 0
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = (cornerRadius == -1) and UDim.new(1, 0) or UDim.new(0, cornerRadius or 14)
+    corner.Parent = target
+
+    local stroke = applyGlassStroke(target, 1.1, strokeTransparency or 0.62, Palette.GlassEdge)
+
+    if addInnerSheen ~= false then
+        local sheen = Instance.new("UIGradient")
+        sheen.Rotation = 135
+        sheen.Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 255, 255)),
+            ColorSequenceKeypoint.new(0.55, Color3.fromRGB(214, 228, 255)),
+            ColorSequenceKeypoint.new(1, Color3.fromRGB(186, 212, 250)),
+        })
+        sheen.Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 0.0),
+            NumberSequenceKeypoint.new(0.5, 0.18),
+            NumberSequenceKeypoint.new(1, 0.06),
+        })
+        sheen.Parent = target
+    end
 
     return stroke
 end
@@ -5150,16 +5230,17 @@ local RootScale = Instance.new("UIScale")
 RootScale.Parent = MainGui
 
 local BASE_CARD_W = 508
-local BASE_CARD_H = 448
+local BASE_CARD_H = 458
 
 local CardShadow = Instance.new("Frame")
 CardShadow.Name = "CardShadow"
 CardShadow.AnchorPoint = Vector2.new(0.5, 0.5)
-CardShadow.Position = UDim2.new(0.5, 0, 0.5, 8)
-CardShadow.Size = UDim2.fromOffset(BASE_CARD_W + 24, BASE_CARD_H + 24)
-CardShadow.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
-CardShadow.BackgroundTransparency = 0.52
+CardShadow.Position = UDim2.new(0.5, 0, 0.5, 10)
+CardShadow.Size = UDim2.fromOffset(BASE_CARD_W + 26, BASE_CARD_H + 26)
+CardShadow.BackgroundColor3 = Color3.fromRGB(3, 6, 14)
+CardShadow.BackgroundTransparency = 0.68
 CardShadow.BorderSizePixel = 0
+CardShadow.Active = false
 CardShadow.Visible = false
 CardShadow.ZIndex = 1
 CardShadow.Parent = MainGui
@@ -5170,9 +5251,11 @@ MainCard.AnchorPoint = Vector2.new(0.5, 0.5)
 MainCard.Position = UDim2.fromScale(0.5, 0.5)
 MainCard.Size = UDim2.fromOffset(BASE_CARD_W, BASE_CARD_H)
 MainCard.BackgroundColor3 = Palette.GlassBase
-MainCard.BackgroundTransparency = 0.16
+MainCard.BackgroundTransparency = 0.38
 MainCard.BorderSizePixel = 0
 MainCard.ClipsDescendants = true
+MainCard.Active = true
+MainCard.Draggable = false
 MainCard.Visible = false
 MainCard.ZIndex = 2
 MainCard.Parent = MainGui
@@ -5186,37 +5269,57 @@ do
     mainAspect.Parent = MainCard
 
     local shadowAspect = Instance.new("UIAspectRatioConstraint")
-    shadowAspect.AspectRatio = (BASE_CARD_W + 24) / (BASE_CARD_H + 24)
+    shadowAspect.AspectRatio = (BASE_CARD_W + 26) / (BASE_CARD_H + 26)
     shadowAspect.AspectType = Enum.AspectType.ScaleWithParentSize
     shadowAspect.DominantAxis = Enum.DominantAxis.Width
     shadowAspect.Parent = CardShadow
 
     local shadowCorner = Instance.new("UICorner")
-    shadowCorner.CornerRadius = UDim.new(0, 28)
+    shadowCorner.CornerRadius = UDim.new(0, 30)
     shadowCorner.Parent = CardShadow
 
     local mainCorner = Instance.new("UICorner")
-    mainCorner.CornerRadius = UDim.new(0, 20)
+    mainCorner.CornerRadius = UDim.new(0, 24)
     mainCorner.Parent = MainCard
 
-    applyGlassStroke(MainCard, 1.35, 0.64)
+    applyGlassStroke(MainCard, 1.4, 0.46, Palette.GlassEdge)
 
     local glassGradient = Instance.new("UIGradient")
     glassGradient.Color = ColorSequence.new({
-        ColorSequenceKeypoint.new(0, Color3.fromRGB(23, 30, 48)),
-        ColorSequenceKeypoint.new(0.52, Color3.fromRGB(10, 13, 21)),
-        ColorSequenceKeypoint.new(1, Color3.fromRGB(16, 23, 37)),
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(30, 44, 72)),
+        ColorSequenceKeypoint.new(0.5, Color3.fromRGB(13, 18, 30)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(20, 32, 54)),
+    })
+    glassGradient.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 0.04),
+        NumberSequenceKeypoint.new(0.52, 0.18),
+        NumberSequenceKeypoint.new(1, 0.08),
     })
     glassGradient.Rotation = 135
     glassGradient.Parent = MainCard
+
+    local innerRim = Instance.new("Frame")
+    innerRim.Name = "InnerGlassRim"
+    innerRim.AnchorPoint = Vector2.new(0.5, 0.5)
+    innerRim.Position = UDim2.fromScale(0.5, 0.5)
+    innerRim.Size = UDim2.new(1, -2, 1, -2)
+    innerRim.BackgroundTransparency = 1
+    innerRim.BorderSizePixel = 0
+    innerRim.ZIndex = 2
+    innerRim.Parent = MainCard
+
+    local innerRimCorner = Instance.new("UICorner")
+    innerRimCorner.CornerRadius = UDim.new(0, 23)
+    innerRimCorner.Parent = innerRim
+    applyGlassStroke(innerRim, 1, 0.76, Palette.GlassSpecular)
 
     local frostedOverlay = Instance.new("Frame")
     frostedOverlay.Name = "FrostedOverlay"
     frostedOverlay.AnchorPoint = Vector2.new(0.5, 0)
     frostedOverlay.Position = UDim2.new(0.5, 0, 0, -56)
-    frostedOverlay.Size = UDim2.new(0.88, 0, 0, 112)
-    frostedOverlay.BackgroundColor3 = Palette.PrimaryAccent
-    frostedOverlay.BackgroundTransparency = 0.89
+    frostedOverlay.Size = UDim2.new(0.90, 0, 0, 114)
+    frostedOverlay.BackgroundColor3 = Color3.fromRGB(185, 224, 255)
+    frostedOverlay.BackgroundTransparency = 0.88
     frostedOverlay.BorderSizePixel = 0
     frostedOverlay.ZIndex = 2
     frostedOverlay.Parent = MainCard
@@ -5228,10 +5331,10 @@ do
     local bottomSheen = Instance.new("Frame")
     bottomSheen.Name = "BottomSheen"
     bottomSheen.AnchorPoint = Vector2.new(0.5, 1)
-    bottomSheen.Position = UDim2.new(0.5, 0, 1, 46)
-    bottomSheen.Size = UDim2.new(0.76, 0, 0, 90)
+    bottomSheen.Position = UDim2.new(0.5, 0, 1, 48)
+    bottomSheen.Size = UDim2.new(0.78, 0, 0, 92)
     bottomSheen.BackgroundColor3 = Palette.ActiveGlow
-    bottomSheen.BackgroundTransparency = 0.93
+    bottomSheen.BackgroundTransparency = 0.91
     bottomSheen.BorderSizePixel = 0
     bottomSheen.ZIndex = 2
     bottomSheen.Parent = MainCard
@@ -5242,6 +5345,25 @@ do
 end
 
 do
+    local function clampPanelToViewport()
+        local cam = Workspace.CurrentCamera
+        if not cam then
+            return
+        end
+        local scale = math.max(RootScale.Scale, 0.5)
+        local vp = cam.ViewportSize / scale
+        local halfW = BASE_CARD_W * 0.5
+        local halfH = BASE_CARD_H * 0.5
+        local maxX = math.max((vp.X * 0.5) - halfW + 40, 20)
+        local maxY = math.max((vp.Y * 0.5) - halfH + 40, 20)
+        local pos = MainCard.Position
+        local cx = math.clamp(pos.X.Offset, -maxX, maxX)
+        local cy = math.clamp(pos.Y.Offset, -maxY, maxY)
+        MainCard.Position = UDim2.new(0.5, cx, 0.5, cy)
+        CardShadow.Position = UDim2.new(0.5, cx, 0.5, cy + 10)
+    end
+    UI.clampPanelToViewport = clampPanelToViewport
+
     local function updateResponsiveLayout()
         local cam = Workspace.CurrentCamera
         if not cam then
@@ -5255,6 +5377,7 @@ do
         if UI.LoaderScale then
             UI.LoaderScale.Scale = scale
         end
+        clampPanelToViewport()
         pcall(UI.syncVimPointer)
     end
 
@@ -5300,36 +5423,53 @@ function UI.runStartupLoader(onComplete)
     loaderCard.Name = "LoaderCard"
     loaderCard.AnchorPoint = Vector2.new(0.5, 0.5)
     loaderCard.Position = UDim2.fromScale(0.5, 0.5)
-    loaderCard.Size = UDim2.fromOffset(328, 152)
+    loaderCard.Size = UDim2.fromOffset(336, 158)
     loaderCard.BackgroundColor3 = Palette.GlassBase
-    loaderCard.BackgroundTransparency = 0.14
+    loaderCard.BackgroundTransparency = 0.30
     loaderCard.BorderSizePixel = 0
     loaderCard.ClipsDescendants = true
     loaderCard.Parent = loaderGui
 
     local loaderAspect = Instance.new("UIAspectRatioConstraint")
-    loaderAspect.AspectRatio = 328 / 152
+    loaderAspect.AspectRatio = 336 / 158
     loaderAspect.AspectType = Enum.AspectType.ScaleWithParentSize
     loaderAspect.Parent = loaderCard
 
     local lc = Instance.new("UICorner")
-    lc.CornerRadius = UDim.new(0, 18)
+    lc.CornerRadius = UDim.new(0, 22)
     lc.Parent = loaderCard
-    applyGlassStroke(loaderCard, 1.35, 0.55)
+    applyGlassStroke(loaderCard, 1.35, 0.44, Palette.GlassEdge)
 
     local grad = Instance.new("UIGradient")
     grad.Color = ColorSequence.new({
-        ColorSequenceKeypoint.new(0, Color3.fromRGB(22, 31, 52)),
-        ColorSequenceKeypoint.new(0.6, Color3.fromRGB(11, 14, 23)),
-        ColorSequenceKeypoint.new(1, Color3.fromRGB(16, 24, 38)),
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(32, 46, 74)),
+        ColorSequenceKeypoint.new(0.55, Color3.fromRGB(14, 19, 32)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(22, 34, 56)),
+    })
+    grad.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 0.05),
+        NumberSequenceKeypoint.new(0.5, 0.16),
+        NumberSequenceKeypoint.new(1, 0.08),
     })
     grad.Rotation = 135
     grad.Parent = loaderCard
 
+    local loaderRim = Instance.new("Frame")
+    loaderRim.AnchorPoint = Vector2.new(0.5, 0.5)
+    loaderRim.Position = UDim2.fromScale(0.5, 0.5)
+    loaderRim.Size = UDim2.new(1, -2, 1, -2)
+    loaderRim.BackgroundTransparency = 1
+    loaderRim.BorderSizePixel = 0
+    loaderRim.Parent = loaderCard
+    local lrc = Instance.new("UICorner")
+    lrc.CornerRadius = UDim.new(0, 21)
+    lrc.Parent = loaderRim
+    applyGlassStroke(loaderRim, 1, 0.78, Palette.GlassSpecular)
+
     local badge = Instance.new("TextLabel")
     badge.BackgroundTransparency = 1
-    badge.Position = UDim2.fromOffset(20, 20)
-    badge.Size = UDim2.new(1, -40, 0, 26)
+    badge.Position = UDim2.fromOffset(22, 22)
+    badge.Size = UDim2.new(1, -44, 0, 26)
     badge.Font = Enum.Font.GothamBold
     badge.Text = "TEAM AKI"
     badge.TextSize = 20
@@ -5339,8 +5479,8 @@ function UI.runStartupLoader(onComplete)
 
     local sub = Instance.new("TextLabel")
     sub.BackgroundTransparency = 1
-    sub.Position = UDim2.fromOffset(20, 48)
-    sub.Size = UDim2.new(1, -40, 0, 16)
+    sub.Position = UDim2.fromOffset(22, 50)
+    sub.Size = UDim2.new(1, -44, 0, 16)
     sub.Font = Enum.Font.GothamMedium
     sub.Text = "Mobile Liquid-Glass Tactical Suite"
     sub.TextSize = 11.5
@@ -5350,8 +5490,8 @@ function UI.runStartupLoader(onComplete)
 
     local statusLbl = Instance.new("TextLabel")
     statusLbl.BackgroundTransparency = 1
-    statusLbl.Position = UDim2.fromOffset(20, 82)
-    statusLbl.Size = UDim2.new(1, -86, 0, 16)
+    statusLbl.Position = UDim2.fromOffset(22, 86)
+    statusLbl.Size = UDim2.new(1, -92, 0, 16)
     statusLbl.Font = Enum.Font.Gotham
     statusLbl.Text = "Loading per-game profile..."
     statusLbl.TextSize = 11
@@ -5363,7 +5503,7 @@ function UI.runStartupLoader(onComplete)
     local pctLbl = Instance.new("TextLabel")
     pctLbl.BackgroundTransparency = 1
     pctLbl.AnchorPoint = Vector2.new(1, 0)
-    pctLbl.Position = UDim2.new(1, -20, 0, 82)
+    pctLbl.Position = UDim2.new(1, -22, 0, 86)
     pctLbl.Size = UDim2.fromOffset(56, 16)
     pctLbl.Font = Enum.Font.Code
     pctLbl.Text = "0%"
@@ -5374,15 +5514,17 @@ function UI.runStartupLoader(onComplete)
 
     local track = Instance.new("Frame")
     track.AnchorPoint = Vector2.new(0.5, 0)
-    track.Position = UDim2.new(0.5, 0, 0, 108)
-    track.Size = UDim2.new(1, -40, 0, 8)
+    track.Position = UDim2.new(0.5, 0, 0, 114)
+    track.Size = UDim2.new(1, -44, 0, 9)
     track.BackgroundColor3 = Palette.ToggleOff
+    track.BackgroundTransparency = 0.40
     track.BorderSizePixel = 0
     track.Parent = loaderCard
 
     local tc = Instance.new("UICorner")
     tc.CornerRadius = UDim.new(1, 0)
     tc.Parent = track
+    applyGlassStroke(track, 1, 0.74, Palette.GlassEdge)
 
     local fill = Instance.new("Frame")
     fill.Size = UDim2.fromScale(0.04, 1)
@@ -5420,8 +5562,8 @@ function UI.runStartupLoader(onComplete)
             return
         end
         tween(loaderCard, 0.20, {
-            Size = UDim2.fromOffset(304, 138),
-            BackgroundTransparency = 0.88,
+            Size = UDim2.fromOffset(312, 144),
+            BackgroundTransparency = 0.92,
         })
         task.wait(0.22)
         pcall(function()
@@ -5438,38 +5580,45 @@ end
 do
     local headerBar = Instance.new("Frame")
     headerBar.Name = "HeaderBar"
-    headerBar.Size = UDim2.new(1, 0, 0, 56)
-    headerBar.BackgroundColor3 = Palette.CardElevated
-    headerBar.BackgroundTransparency = 0.16
-    headerBar.BorderSizePixel = 0
+    headerBar.AnchorPoint = Vector2.new(0.5, 0)
+    headerBar.Position = UDim2.new(0.5, 0, 0, 10)
+    headerBar.Size = UDim2.new(1, -24, 0, 52)
+    headerBar.Active = true
+    headerBar.Draggable = false
     headerBar.ZIndex = 3
     headerBar.Parent = MainCard
+    UI.applyFrostedSurface(headerBar, 16, Palette.CardElevated, 0.52, 0.56)
 
     local headerDivider = Instance.new("Frame")
-    headerDivider.Size = UDim2.new(1, 0, 0, 1)
-    headerDivider.Position = UDim2.new(0, 0, 1, -1)
-    headerDivider.BackgroundColor3 = Palette.GlassEdge
-    headerDivider.BackgroundTransparency = 0.74
+    headerDivider.AnchorPoint = Vector2.new(0.5, 1)
+    headerDivider.Size = UDim2.new(1, -28, 0, 1)
+    headerDivider.Position = UDim2.new(0.5, 0, 1, -1)
+    headerDivider.BackgroundColor3 = Palette.GlassSpecular
+    headerDivider.BackgroundTransparency = 0.82
     headerDivider.BorderSizePixel = 0
     headerDivider.Parent = headerBar
 
+    local dividerCorner = Instance.new("UICorner")
+    dividerCorner.CornerRadius = UDim.new(1, 0)
+    dividerCorner.Parent = headerDivider
+
     local brandBadge = Instance.new("Frame")
     brandBadge.AnchorPoint = Vector2.new(0, 0.5)
-    brandBadge.Position = UDim2.new(0, 16, 0.5, 0)
-    brandBadge.Size = UDim2.fromOffset(92, 28)
+    brandBadge.Position = UDim2.new(0, 12, 0.5, 0)
+    brandBadge.Size = UDim2.fromOffset(94, 30)
     brandBadge.BackgroundColor3 = Palette.PrimaryAccent
-    brandBadge.BackgroundTransparency = 0.82
+    brandBadge.BackgroundTransparency = 0.68
     brandBadge.BorderSizePixel = 0
     brandBadge.ZIndex = 4
     brandBadge.Parent = headerBar
 
     local brandCorner = Instance.new("UICorner")
-    brandCorner.CornerRadius = UDim.new(0, 8)
+    brandCorner.CornerRadius = UDim.new(0, 10)
     brandCorner.Parent = brandBadge
 
     local brandStroke = Instance.new("UIStroke")
-    brandStroke.Thickness = 1
-    brandStroke.Transparency = 0.36
+    brandStroke.Thickness = 1.1
+    brandStroke.Transparency = 0.34
     brandStroke.Color = Palette.ActiveGlow
     brandStroke.Parent = brandBadge
 
@@ -5490,8 +5639,8 @@ do
     subtitleLabel.Name = "BrandSubtitle"
     subtitleLabel.BackgroundTransparency = 1
     subtitleLabel.AnchorPoint = Vector2.new(0, 0.5)
-    subtitleLabel.Position = UDim2.new(0, 118, 0.5, 0)
-    subtitleLabel.Size = UDim2.new(1, -210, 0, 18)
+    subtitleLabel.Position = UDim2.new(0, 114, 0.5, 0)
+    subtitleLabel.Size = UDim2.new(1, -200, 0, 18)
     subtitleLabel.Font = Enum.Font.GothamMedium
     subtitleLabel.Text = "Liquid-Glass Tactical Suite"
     subtitleLabel.TextSize = 11.5
@@ -5504,8 +5653,8 @@ do
     local headerActions = Instance.new("Frame")
     headerActions.BackgroundTransparency = 1
     headerActions.AnchorPoint = Vector2.new(1, 0.5)
-    headerActions.Position = UDim2.new(1, -14, 0.5, 0)
-    headerActions.Size = UDim2.fromOffset(72, 30)
+    headerActions.Position = UDim2.new(1, -10, 0.5, 0)
+    headerActions.Size = UDim2.fromOffset(74, 32)
     headerActions.ZIndex = 4
     headerActions.Parent = headerBar
 
@@ -5516,76 +5665,112 @@ do
     headerActionsLayout.Padding = UDim.new(0, 8)
     headerActionsLayout.Parent = headerActions
 
-    local function createHeaderButton(symbol, bg)
+    local function createHeaderButton(symbol, bg, trans)
         local btn = Instance.new("TextButton")
-        btn.Size = UDim2.fromOffset(30, 30)
+        btn.Size = UDim2.fromOffset(32, 32)
         btn.BackgroundColor3 = bg
-        btn.BackgroundTransparency = 0.22
+        btn.BackgroundTransparency = trans or 0.40
         btn.Font = Enum.Font.GothamBold
         btn.Text = symbol
         btn.TextSize = 15
         btn.TextColor3 = Palette.TextHeader
         btn.AutoButtonColor = false
+        btn.BorderSizePixel = 0
         btn.ZIndex = 5
         btn.Parent = headerActions
 
         local c = Instance.new("UICorner")
-        c.CornerRadius = UDim.new(0, 8)
+        c.CornerRadius = UDim.new(0, 10)
         c.Parent = btn
 
-        applyGlassStroke(btn, 1, 0.68)
+        applyGlassStroke(btn, 1, 0.56, Palette.GlassEdge)
         return btn
     end
 
-    UI.MinimizeBtn = createHeaderButton("-", Palette.SurfaceSoft)
-    UI.UnloadHeaderBtn = createHeaderButton("×", Palette.Danger)
+    UI.MinimizeBtn = createHeaderButton("-", Palette.SurfaceSoft, 0.42)
+    UI.UnloadHeaderBtn = createHeaderButton("×", Palette.Danger, 0.34)
 
     local activeInput = nil
     local dragStart = nil
     local startPos = nil
-    local headerSinkAcquired = false
+
+    local function clearHeaderDrag()
+        activeInput = nil
+        dragStart = nil
+        startPos = nil
+        InputGuard.endDrag(headerBar)
+    end
 
     headerBar.InputBegan:Connect(function(input)
-        if not activeInput and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+        if activeInput or not MainCard.Visible then
+            return
+        end
+        if input.UserInputState ~= Enum.UserInputState.Begin then
+            return
+        end
+        if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then
+            return
+        end
+        if not InputGuard.isPointInGui(headerBar, input.Position, 4) then
+            return
+        end
+        if InputGuard.isPointInGui(UI.MinimizeBtn, input.Position, 2) or InputGuard.isPointInGui(UI.UnloadHeaderBtn, input.Position, 2) then
+            return
+        end
+        if InputGuard.beginDrag(headerBar, input) then
             activeInput = input
             dragStart = input.Position
             startPos = MainCard.Position
-            if input.UserInputType == Enum.UserInputType.Touch and not headerSinkAcquired then
-                headerSinkAcquired = true
-                InputGuard.acquireDragSink()
-            end
         end
     end)
 
     addConnection(UserInputService.InputChanged:Connect(function(input)
-        if activeInput and dragStart and startPos then
-            if input == activeInput or (activeInput.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseMovement) then
-                local scale = math.max(RootScale.Scale, 0.5)
-                local delta = (input.Position - dragStart) / scale
-                local nextPos = UDim2.new(
-                    startPos.X.Scale,
-                    startPos.X.Offset + delta.X,
-                    startPos.Y.Scale,
-                    startPos.Y.Offset + delta.Y
-                )
-                MainCard.Position = nextPos
-                CardShadow.Position = UDim2.new(
-                    nextPos.X.Scale,
-                    nextPos.X.Offset,
-                    nextPos.Y.Scale,
-                    nextPos.Y.Offset + 8
-                )
-            end
+        if not activeInput or not dragStart or not startPos then
+            return
         end
+        if not MainCard.Visible then
+            clearHeaderDrag()
+            return
+        end
+        if not InputGuard.isOwner(headerBar, input) then
+            if not InputGuard.isActiveState(activeInput.UserInputState) then
+                clearHeaderDrag()
+            end
+            return
+        end
+        local scale = math.max(RootScale.Scale, 0.5)
+        local delta = (input.Position - dragStart) / scale
+        local nextPos = UDim2.new(
+            startPos.X.Scale,
+            startPos.X.Offset + delta.X,
+            startPos.Y.Scale,
+            startPos.Y.Offset + delta.Y
+        )
+        MainCard.Position = nextPos
+        CardShadow.Position = UDim2.new(
+            nextPos.X.Scale,
+            nextPos.X.Offset,
+            nextPos.Y.Scale,
+            nextPos.Y.Offset + 10
+        )
+        UI.clampPanelToViewport()
     end))
 
     addConnection(UserInputService.InputEnded:Connect(function(input)
-        if input == activeInput then
-            activeInput = nil
-            if headerSinkAcquired then
-                headerSinkAcquired = false
-                InputGuard.releaseDragSink()
-            end
+        if activeInput and (input == activeInput or not InputGuard.isActiveState(activeInput.UserInputState)) then
+            clearHeaderDrag()
+        end
+    end))
+
+    addConnection(UserInputService.TouchEnded:Connect(function(input)
+        if activeInput and (input == activeInput or not InputGuard.isActiveState(activeInput.UserInputState)) then
+            clearHeaderDrag()
+        end
+    end))
+
+    addConnection(MainCard:GetPropertyChangedSignal("Visible"):Connect(function()
+        if not MainCard.Visible and activeInput then
+            clearHeaderDrag()
         end
     end))
 end
@@ -5597,19 +5782,11 @@ do
     local tabBar = Instance.new("Frame")
     tabBar.Name = "TabBar"
     tabBar.AnchorPoint = Vector2.new(0.5, 0)
-    tabBar.Position = UDim2.new(0.5, 0, 0, 66)
-    tabBar.Size = UDim2.new(1, -28, 0, 38)
-    tabBar.BackgroundColor3 = Palette.CardElevated
-    tabBar.BackgroundTransparency = 0.16
-    tabBar.BorderSizePixel = 0
+    tabBar.Position = UDim2.new(0.5, 0, 0, 70)
+    tabBar.Size = UDim2.new(1, -24, 0, 40)
     tabBar.ZIndex = 3
     tabBar.Parent = MainCard
-
-    local tabBarCorner = Instance.new("UICorner")
-    tabBarCorner.CornerRadius = UDim.new(0, 11)
-    tabBarCorner.Parent = tabBar
-
-    applyGlassStroke(tabBar, 1, 0.68)
+    UI.applyFrostedSurface(tabBar, 14, Palette.CardElevated, 0.56, 0.58)
 
     local tabPadding = Instance.new("UIPadding")
     tabPadding.PaddingLeft = UDim.new(0, 4)
@@ -5631,8 +5808,8 @@ do
     local contentHolder = Instance.new("Frame")
     contentHolder.Name = "ContentHolder"
     contentHolder.AnchorPoint = Vector2.new(0.5, 0)
-    contentHolder.Position = UDim2.new(0.5, 0, 0, 114)
-    contentHolder.Size = UDim2.new(1, -28, 1, -126)
+    contentHolder.Position = UDim2.new(0.5, 0, 0, 118)
+    contentHolder.Size = UDim2.new(1, -24, 1, -130)
     contentHolder.BackgroundTransparency = 1
     contentHolder.ZIndex = 3
     contentHolder.Parent = MainCard
@@ -5658,12 +5835,12 @@ do
         local list = Instance.new("UIListLayout")
         list.SortOrder = Enum.SortOrder.LayoutOrder
         list.HorizontalAlignment = Enum.HorizontalAlignment.Center
-        list.Padding = UDim.new(0, 8)
+        list.Padding = UDim.new(0, 10)
         list.Parent = page
 
         local pad = Instance.new("UIPadding")
-        pad.PaddingTop = UDim.new(0, 2)
-        pad.PaddingBottom = UDim.new(0, 12)
+        pad.PaddingTop = UDim.new(0, 3)
+        pad.PaddingBottom = UDim.new(0, 14)
         pad.PaddingLeft = UDim.new(0, 2)
         pad.PaddingRight = UDim.new(0, 8)
         pad.Parent = page
@@ -5671,6 +5848,8 @@ do
         TabPages[name] = page
         return page
     end
+
+    local tabStrokes = {}
 
     local function switchTab(tabName)
         Config.UI.ActiveTab = tabName
@@ -5681,9 +5860,14 @@ do
             local isActive = (name == tabName)
             tween(btn, 0.18, {
                 BackgroundColor3 = isActive and Palette.PrimaryAccent or Palette.CardElevated,
-                BackgroundTransparency = isActive and 0.18 or 1,
+                BackgroundTransparency = isActive and 0.32 or 1,
                 TextColor3 = isActive and Palette.TextHeader or Palette.TextSilver,
             })
+            if tabStrokes[name] then
+                tween(tabStrokes[name], 0.18, {
+                    Transparency = isActive and 0.36 or 1,
+                })
+            end
         end
         ConfigStore.scheduleSave()
     end
@@ -5691,24 +5875,27 @@ do
     for idx, tabName in ipairs(tabOrder) do
         createTabPage(tabName)
 
+        local isActive = (tabName == Config.UI.ActiveTab)
         local btn = Instance.new("TextButton")
         btn.Name = tabName .. "Tab"
         btn.LayoutOrder = idx
         btn.Font = Enum.Font.GothamMedium
         btn.Text = tabName
-        btn.TextSize = 10.5
+        btn.TextSize = 11
         btn.TextTruncate = Enum.TextTruncate.AtEnd
         btn.AutoButtonColor = false
         btn.BorderSizePixel = 0
-        btn.BackgroundColor3 = (tabName == Config.UI.ActiveTab) and Palette.PrimaryAccent or Palette.CardElevated
-        btn.BackgroundTransparency = (tabName == Config.UI.ActiveTab) and 0.18 or 1
-        btn.TextColor3 = (tabName == Config.UI.ActiveTab) and Palette.TextHeader or Palette.TextSilver
+        btn.BackgroundColor3 = isActive and Palette.PrimaryAccent or Palette.CardElevated
+        btn.BackgroundTransparency = isActive and 0.32 or 1
+        btn.TextColor3 = isActive and Palette.TextHeader or Palette.TextSilver
         btn.ZIndex = 4
         btn.Parent = tabBar
 
         local corner = Instance.new("UICorner")
-        corner.CornerRadius = UDim.new(0, 8)
+        corner.CornerRadius = UDim.new(0, 10)
         corner.Parent = btn
+
+        tabStrokes[tabName] = applyGlassStroke(btn, 1, isActive and 0.36 or 1, Palette.GlassSpecular)
 
         btn.Activated:Connect(function()
             switchTab(tabName)
@@ -5771,6 +5958,9 @@ local function bindSafeTap(btn, scrollParent, callback)
     local hadValidPress = false
 
     btn.InputBegan:Connect(function(input)
+        if input.UserInputState ~= Enum.UserInputState.Begin then
+            return
+        end
         if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
             hadValidPress = true
             trackedInput = input
@@ -5784,6 +5974,10 @@ local function bindSafeTap(btn, scrollParent, callback)
         if not trackedInput or not startPos then
             return
         end
+        if not InputGuard.isActiveState(trackedInput.UserInputState) then
+            trackedInput = nil
+            return
+        end
         if input == trackedInput or (trackedInput.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseMovement) then
             local dist = (Vector2.new(input.Position.X, input.Position.Y) - Vector2.new(startPos.X, startPos.Y)).Magnitude
             if dist > maxMove then
@@ -5792,7 +5986,7 @@ local function bindSafeTap(btn, scrollParent, callback)
         end
     end))
 
-    addConnection(UserInputService.InputEnded:Connect(function(input)
+    local function finishTrackedTap(input)
         if input == trackedInput then
             local dist = startPos and (Vector2.new(input.Position.X, input.Position.Y) - Vector2.new(startPos.X, startPos.Y)).Magnitude or 0
             if dist > maxMove then
@@ -5800,7 +5994,10 @@ local function bindSafeTap(btn, scrollParent, callback)
             end
             trackedInput = nil
         end
-    end))
+    end
+
+    addConnection(UserInputService.InputEnded:Connect(finishTrackedTap))
+    addConnection(UserInputService.TouchEnded:Connect(finishTrackedTap))
 
     btn.Activated:Connect(function()
         local canvasDelta = isScrollingFrame and math.abs(scrollParent.CanvasPosition.Y - startCanvasY) or 0
@@ -5819,36 +6016,29 @@ local function createCardRow(parent, height, order)
     local card = Instance.new("Frame")
     card.LayoutOrder = order
     card.Size = UDim2.new(1, 0, 0, height)
-    card.BackgroundColor3 = Palette.CardElevated
-    card.BackgroundTransparency = 0.16
-    card.BorderSizePixel = 0
     card.ZIndex = 4
     card.Parent = parent
 
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 12)
-    corner.Parent = card
-
-    applyGlassStroke(card, 1, 0.72)
+    UI.applyFrostedSurface(card, 14, Palette.CardElevated, 0.62, 0.60, true)
 
     local pad = Instance.new("UIPadding")
     pad.PaddingLeft = UDim.new(0, 14)
     pad.PaddingRight = UDim.new(0, 14)
-    pad.PaddingTop = UDim.new(0, 8)
-    pad.PaddingBottom = UDim.new(0, 8)
+    pad.PaddingTop = UDim.new(0, 9)
+    pad.PaddingBottom = UDim.new(0, 9)
     pad.Parent = card
 
     return card
 end
 
 local function addToggle(parent, order, title, subtitle, getter, setter)
-    local row = createCardRow(parent, subtitle and 56 or 46, order)
+    local row = createCardRow(parent, subtitle and 58 or 48, order)
 
     local label = Instance.new("TextLabel")
     label.BackgroundTransparency = 1
     label.AnchorPoint = Vector2.new(0, 0.5)
     label.Position = UDim2.new(0, 0, subtitle and 0.30 or 0.5, 0)
-    label.Size = UDim2.new(1, -56, 0, 18)
+    label.Size = UDim2.new(1, -60, 0, 18)
     label.Font = Enum.Font.GothamMedium
     label.Text = title
     label.TextSize = 13
@@ -5863,7 +6053,7 @@ local function addToggle(parent, order, title, subtitle, getter, setter)
         sub.BackgroundTransparency = 1
         sub.AnchorPoint = Vector2.new(0, 0.5)
         sub.Position = UDim2.new(0, 0, 0.74, 0)
-        sub.Size = UDim2.new(1, -56, 0, 15)
+        sub.Size = UDim2.new(1, -60, 0, 15)
         sub.Font = Enum.Font.Gotham
         sub.Text = subtitle
         sub.TextSize = 11
@@ -5877,7 +6067,7 @@ local function addToggle(parent, order, title, subtitle, getter, setter)
     local switchBtn = Instance.new("TextButton")
     switchBtn.AnchorPoint = Vector2.new(1, 0.5)
     switchBtn.Position = UDim2.new(1, 0, 0.5, 0)
-    switchBtn.Size = UDim2.fromOffset(44, 24)
+    switchBtn.Size = UDim2.fromOffset(48, 26)
     switchBtn.Text = ""
     switchBtn.AutoButtonColor = false
     switchBtn.BorderSizePixel = 0
@@ -5888,9 +6078,11 @@ local function addToggle(parent, order, title, subtitle, getter, setter)
     swCorner.CornerRadius = UDim.new(1, 0)
     swCorner.Parent = switchBtn
 
+    local swStroke = applyGlassStroke(switchBtn, 1, 0.55, Palette.GlassEdge)
+
     local knob = Instance.new("Frame")
     knob.AnchorPoint = Vector2.new(0, 0.5)
-    knob.Size = UDim2.fromOffset(18, 18)
+    knob.Size = UDim2.fromOffset(20, 20)
     knob.BackgroundColor3 = Palette.TextHeader
     knob.BorderSizePixel = 0
     knob.ZIndex = 6
@@ -5903,13 +6095,21 @@ local function addToggle(parent, order, title, subtitle, getter, setter)
     local function sync(instant)
         local on = getter()
         local targetTrack = on and Palette.ActiveGlow or Palette.ToggleOff
-        local targetKnobPos = on and UDim2.new(1, -21, 0.5, 0) or UDim2.new(0, 3, 0.5, 0)
+        local targetTrans = on and 0.14 or 0.38
+        local targetKnobPos = on and UDim2.new(1, -23, 0.5, 0) or UDim2.new(0, 3, 0.5, 0)
+        local targetStrokeColor = on and Palette.ActiveGlow or Palette.GlassEdge
         if instant then
             switchBtn.BackgroundColor3 = targetTrack
+            switchBtn.BackgroundTransparency = targetTrans
             knob.Position = targetKnobPos
+            swStroke.Color = targetStrokeColor
         else
-            tween(switchBtn, 0.16, {BackgroundColor3 = targetTrack})
+            tween(switchBtn, 0.16, {
+                BackgroundColor3 = targetTrack,
+                BackgroundTransparency = targetTrans,
+            })
             tween(knob, 0.16, {Position = targetKnobPos})
+            tween(swStroke, 0.16, {Color = targetStrokeColor})
         end
     end
 
@@ -5926,12 +6126,12 @@ local function addToggle(parent, order, title, subtitle, getter, setter)
 end
 
 local function addSlider(parent, order, title, minVal, maxVal, step, formatFn, getter, setter)
-    local row = createCardRow(parent, 60, order)
+    local row = createCardRow(parent, 68, order)
 
     local label = Instance.new("TextLabel")
     label.BackgroundTransparency = 1
-    label.Position = UDim2.fromOffset(0, 0)
-    label.Size = UDim2.new(1, -124, 0, 18)
+    label.Position = UDim2.fromOffset(0, 1)
+    label.Size = UDim2.new(1, -130, 0, 20)
     label.Font = Enum.Font.GothamMedium
     label.Text = title
     label.TextSize = 13
@@ -5943,26 +6143,28 @@ local function addSlider(parent, order, title, minVal, maxVal, step, formatFn, g
 
     local minusBtn = Instance.new("TextButton")
     minusBtn.AnchorPoint = Vector2.new(1, 0)
-    minusBtn.Position = UDim2.new(1, -94, 0, 0)
-    minusBtn.Size = UDim2.fromOffset(22, 18)
+    minusBtn.Position = UDim2.new(1, -98, 0, 0)
+    minusBtn.Size = UDim2.fromOffset(26, 22)
     minusBtn.BackgroundColor3 = Palette.SurfaceSoft
+    minusBtn.BackgroundTransparency = 0.42
     minusBtn.Font = Enum.Font.GothamBold
     minusBtn.Text = "-"
-    minusBtn.TextSize = 13
+    minusBtn.TextSize = 14
     minusBtn.TextColor3 = Palette.TextHeader
     minusBtn.AutoButtonColor = false
     minusBtn.BorderSizePixel = 0
     minusBtn.ZIndex = 6
     minusBtn.Parent = row
     local mc = Instance.new("UICorner")
-    mc.CornerRadius = UDim.new(0, 5)
+    mc.CornerRadius = UDim.new(0, 8)
     mc.Parent = minusBtn
+    applyGlassStroke(minusBtn, 1, 0.62, Palette.GlassEdge)
 
     local valueLabel = Instance.new("TextLabel")
     valueLabel.BackgroundTransparency = 1
     valueLabel.AnchorPoint = Vector2.new(1, 0)
-    valueLabel.Position = UDim2.new(1, -26, 0, 0)
-    valueLabel.Size = UDim2.fromOffset(64, 18)
+    valueLabel.Position = UDim2.new(1, -30, 0, 1)
+    valueLabel.Size = UDim2.fromOffset(64, 20)
     valueLabel.Font = Enum.Font.Code
     valueLabel.TextSize = 11.5
     valueLabel.TextColor3 = Palette.ActiveGlow
@@ -5973,19 +6175,21 @@ local function addSlider(parent, order, title, minVal, maxVal, step, formatFn, g
     local plusBtn = Instance.new("TextButton")
     plusBtn.AnchorPoint = Vector2.new(1, 0)
     plusBtn.Position = UDim2.new(1, 0, 0, 0)
-    plusBtn.Size = UDim2.fromOffset(22, 18)
+    plusBtn.Size = UDim2.fromOffset(26, 22)
     plusBtn.BackgroundColor3 = Palette.SurfaceSoft
+    plusBtn.BackgroundTransparency = 0.42
     plusBtn.Font = Enum.Font.GothamBold
     plusBtn.Text = "+"
-    plusBtn.TextSize = 13
+    plusBtn.TextSize = 14
     plusBtn.TextColor3 = Palette.TextHeader
     plusBtn.AutoButtonColor = false
     plusBtn.BorderSizePixel = 0
     plusBtn.ZIndex = 6
     plusBtn.Parent = row
     local pc = Instance.new("UICorner")
-    pc.CornerRadius = UDim.new(0, 5)
+    pc.CornerRadius = UDim.new(0, 8)
     pc.Parent = plusBtn
+    applyGlassStroke(plusBtn, 1, 0.62, Palette.GlassEdge)
 
     local trackHitbox = Instance.new("TextButton")
     trackHitbox.BackgroundTransparency = 1
@@ -5993,15 +6197,16 @@ local function addSlider(parent, order, title, minVal, maxVal, step, formatFn, g
     trackHitbox.AutoButtonColor = false
     trackHitbox.AnchorPoint = Vector2.new(0.5, 1)
     trackHitbox.Position = UDim2.new(0.5, 0, 1, 2)
-    trackHitbox.Size = UDim2.new(1, 0, 0, 24)
+    trackHitbox.Size = UDim2.new(1, 0, 0, 28)
     trackHitbox.ZIndex = 6
     trackHitbox.Parent = row
 
     local track = Instance.new("Frame")
     track.AnchorPoint = Vector2.new(0.5, 0.5)
     track.Position = UDim2.fromScale(0.5, 0.5)
-    track.Size = UDim2.new(1, 0, 0, 6)
+    track.Size = UDim2.new(1, 0, 0, 7)
     track.BackgroundColor3 = Palette.ToggleOff
+    track.BackgroundTransparency = 0.40
     track.BorderSizePixel = 0
     track.ZIndex = 5
     track.Parent = trackHitbox
@@ -6009,6 +6214,7 @@ local function addSlider(parent, order, title, minVal, maxVal, step, formatFn, g
     local trackCorner = Instance.new("UICorner")
     trackCorner.CornerRadius = UDim.new(1, 0)
     trackCorner.Parent = track
+    applyGlassStroke(track, 1, 0.72, Palette.GlassEdge)
 
     local fill = Instance.new("Frame")
     fill.Size = UDim2.fromScale(0.5, 1)
@@ -6021,10 +6227,17 @@ local function addSlider(parent, order, title, minVal, maxVal, step, formatFn, g
     fillCorner.CornerRadius = UDim.new(1, 0)
     fillCorner.Parent = fill
 
+    local fillGrad = Instance.new("UIGradient")
+    fillGrad.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Palette.PrimaryAccent),
+        ColorSequenceKeypoint.new(1, Palette.ActiveGlow),
+    })
+    fillGrad.Parent = fill
+
     local thumb = Instance.new("Frame")
     thumb.AnchorPoint = Vector2.new(0.5, 0.5)
     thumb.Position = UDim2.fromScale(0.5, 0.5)
-    thumb.Size = UDim2.fromOffset(14, 14)
+    thumb.Size = UDim2.fromOffset(16, 16)
     thumb.BackgroundColor3 = Palette.TextHeader
     thumb.BorderSizePixel = 0
     thumb.ZIndex = 7
@@ -6033,6 +6246,7 @@ local function addSlider(parent, order, title, minVal, maxVal, step, formatFn, g
     local thumbCorner = Instance.new("UICorner")
     thumbCorner.CornerRadius = UDim.new(1, 0)
     thumbCorner.Parent = thumb
+    applyGlassStroke(thumb, 1.2, 0.34, Palette.PrimaryAccent)
 
     local function sync()
         local val = math.clamp(getter(), minVal, maxVal)
@@ -6067,6 +6281,15 @@ local function addSlider(parent, order, title, minVal, maxVal, step, formatFn, g
     local startCanvasY = 0
     local dragging = false
 
+    local function clearSliderDrag()
+        pendingInput = nil
+        dragStartPos = nil
+        dragging = false
+        if isScrollableParent then
+            parent.ScrollingEnabled = true
+        end
+    end
+
     local function updateFromInput(posX)
         local absPos = track.AbsolutePosition.X
         local absSize = math.max(track.AbsoluteSize.X, 1)
@@ -6075,7 +6298,7 @@ local function addSlider(parent, order, title, minVal, maxVal, step, formatFn, g
     end
 
     trackHitbox.InputBegan:Connect(function(input)
-        if not pendingInput and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+        if not pendingInput and input.UserInputState == Enum.UserInputState.Begin and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
             pendingInput = input
             dragStartPos = input.Position
             startCanvasY = isScrollableParent and parent.CanvasPosition.Y or 0
@@ -6094,6 +6317,10 @@ local function addSlider(parent, order, title, minVal, maxVal, step, formatFn, g
         if not pendingInput or not dragStartPos then
             return
         end
+        if not InputGuard.isActiveState(pendingInput.UserInputState) then
+            clearSliderDrag()
+            return
+        end
         if input == pendingInput or (pendingInput.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseMovement) then
             local dx = math.abs(input.Position.X - dragStartPos.X)
             local dy = math.abs(input.Position.Y - dragStartPos.Y)
@@ -6101,12 +6328,7 @@ local function addSlider(parent, order, title, minVal, maxVal, step, formatFn, g
 
             if not dragging then
                 if canvasDelta > 4 or (dy > 7 and dy > dx) then
-                    pendingInput = nil
-                    dragStartPos = nil
-                    dragging = false
-                    if isScrollableParent then
-                        parent.ScrollingEnabled = true
-                    end
+                    clearSliderDrag()
                     return
                 elseif dx > 7 and dx >= dy then
                     dragging = true
@@ -6121,28 +6343,26 @@ local function addSlider(parent, order, title, minVal, maxVal, step, formatFn, g
         end
     end))
 
-    addConnection(UserInputService.InputEnded:Connect(function(input)
-        if input == pendingInput then
+    local function finishSliderInput(input)
+        if pendingInput and (input == pendingInput or not InputGuard.isActiveState(pendingInput.UserInputState)) then
             local dx = dragStartPos and math.abs(input.Position.X - dragStartPos.X) or 0
             local dy = dragStartPos and math.abs(input.Position.Y - dragStartPos.Y) or 0
             local canvasDelta = isScrollableParent and math.abs(parent.CanvasPosition.Y - startCanvasY) or 0
             if (not dragging) and dx <= 7 and dy <= 7 and canvasDelta <= 4 then
                 updateFromInput(input.Position.X)
             end
-            pendingInput = nil
-            dragStartPos = nil
-            dragging = false
-            if isScrollableParent then
-                parent.ScrollingEnabled = true
-            end
+            clearSliderDrag()
         end
-    end))
+    end
+
+    addConnection(UserInputService.InputEnded:Connect(finishSliderInput))
+    addConnection(UserInputService.TouchEnded:Connect(finishSliderInput))
 
     return sync
 end
 
 local function addSelector(parent, order, title, options, getter, setter, reloadOnSelect)
-    local row = createCardRow(parent, 66, order)
+    local row = createCardRow(parent, 72, order)
 
     local label = Instance.new("TextLabel")
     label.BackgroundTransparency = 1
@@ -6160,19 +6380,20 @@ local function addSelector(parent, order, title, options, getter, setter, reload
     local bar = Instance.new("Frame")
     bar.AnchorPoint = Vector2.new(0.5, 1)
     bar.Position = UDim2.new(0.5, 0, 1, 0)
-    bar.Size = UDim2.new(1, 0, 0, 26)
-    bar.BackgroundColor3 = Palette.GlassBase
-    bar.BackgroundTransparency = 0.22
-    bar.BorderSizePixel = 0
+    bar.Size = UDim2.new(1, 0, 0, 30)
     bar.ZIndex = 5
     bar.Parent = row
+    UI.applyFrostedSurface(bar, 10, Palette.GlassBase, 0.56, 0.66, false)
 
-    local barCorner = Instance.new("UICorner")
-    barCorner.CornerRadius = UDim.new(0, 8)
-    barCorner.Parent = bar
+    local barPad = Instance.new("UIPadding")
+    barPad.PaddingLeft = UDim.new(0, 3)
+    barPad.PaddingRight = UDim.new(0, 3)
+    barPad.PaddingTop = UDim.new(0, 3)
+    barPad.PaddingBottom = UDim.new(0, 3)
+    barPad.Parent = bar
 
     local grid = Instance.new("UIGridLayout")
-    grid.CellSize = UDim2.new(1 / #options, -4, 1, -4)
+    grid.CellSize = UDim2.new(1 / #options, -4, 1, 0)
     grid.CellPadding = UDim2.fromOffset(4, 0)
     grid.HorizontalAlignment = Enum.HorizontalAlignment.Center
     grid.VerticalAlignment = Enum.VerticalAlignment.Center
@@ -6180,6 +6401,7 @@ local function addSelector(parent, order, title, options, getter, setter, reload
     grid.Parent = bar
 
     local btns = {}
+    local btnStrokes = {}
 
     local function sync()
         local active = getter()
@@ -6187,9 +6409,14 @@ local function addSelector(parent, order, title, options, getter, setter, reload
             local sel = (opt == active)
             tween(b, 0.14, {
                 BackgroundColor3 = sel and Palette.PrimaryAccent or Palette.GlassBase,
-                BackgroundTransparency = sel and 0.15 or 1,
+                BackgroundTransparency = sel and 0.28 or 1,
                 TextColor3 = sel and Palette.TextHeader or Palette.TextSilver,
             })
+            if btnStrokes[opt] then
+                tween(btnStrokes[opt], 0.14, {
+                    Transparency = sel and 0.42 or 1,
+                })
+            end
         end
     end
 
@@ -6198,7 +6425,7 @@ local function addSelector(parent, order, title, options, getter, setter, reload
         b.LayoutOrder = i
         b.Text = opt
         b.Font = Enum.Font.GothamMedium
-        b.TextSize = 10
+        b.TextSize = 10.5
         b.TextTruncate = Enum.TextTruncate.AtEnd
         b.AutoButtonColor = false
         b.BorderSizePixel = 0
@@ -6206,8 +6433,10 @@ local function addSelector(parent, order, title, options, getter, setter, reload
         b.Parent = bar
 
         local bc = Instance.new("UICorner")
-        bc.CornerRadius = UDim.new(0, 6)
+        bc.CornerRadius = UDim.new(0, 8)
         bc.Parent = b
+
+        btnStrokes[opt] = applyGlassStroke(b, 1, 1, Palette.GlassSpecular)
 
         bindSafeTap(b, parent, function()
             setter(opt)
@@ -6223,7 +6452,7 @@ local function addSelector(parent, order, title, options, getter, setter, reload
 end
 
 local function addRadioGroup(parent, order, title, options, getter, setter, reloadOnSelect)
-    local rowHeight = 38 + (#options * 46)
+    local rowHeight = 42 + (#options * 50)
     local card = createCardRow(parent, rowHeight, order)
 
     local heading = Instance.new("TextLabel")
@@ -6258,11 +6487,11 @@ local function addRadioGroup(parent, order, title, options, getter, setter, relo
         for val, w in pairs(optionWidgets) do
             local sel = (val == activeVal)
             tween(w.Btn, 0.14, {
-                BackgroundColor3 = sel and Color3.fromRGB(22, 34, 54) or Palette.GlassBase,
-                BackgroundTransparency = sel and 0.12 or 0.34,
+                BackgroundColor3 = sel and Color3.fromRGB(28, 46, 74) or Palette.GlassBase,
+                BackgroundTransparency = sel and 0.36 or 0.60,
             })
             w.Stroke.Color = sel and Palette.ActiveGlow or Palette.GlassEdge
-            w.Stroke.Transparency = sel and 0.25 or 0.78
+            w.Stroke.Transparency = sel and 0.24 or 0.68
             w.OuterStroke.Color = sel and Palette.ActiveGlow or Palette.TextSilver
             w.Dot.Visible = sel
             w.Title.TextColor3 = sel and Palette.TextHeader or Palette.TextSilver
@@ -6272,9 +6501,9 @@ local function addRadioGroup(parent, order, title, options, getter, setter, relo
     for idx, opt in ipairs(options) do
         local optBtn = Instance.new("TextButton")
         optBtn.LayoutOrder = idx
-        optBtn.Size = UDim2.new(1, 0, 0, 40)
+        optBtn.Size = UDim2.new(1, 0, 0, 44)
         optBtn.BackgroundColor3 = Palette.GlassBase
-        optBtn.BackgroundTransparency = 0.34
+        optBtn.BackgroundTransparency = 0.60
         optBtn.Text = ""
         optBtn.AutoButtonColor = false
         optBtn.BorderSizePixel = 0
@@ -6282,19 +6511,15 @@ local function addRadioGroup(parent, order, title, options, getter, setter, relo
         optBtn.Parent = listHolder
 
         local oc = Instance.new("UICorner")
-        oc.CornerRadius = UDim.new(0, 9)
+        oc.CornerRadius = UDim.new(0, 12)
         oc.Parent = optBtn
 
-        local oStroke = Instance.new("UIStroke")
-        oStroke.Thickness = 1
-        oStroke.Transparency = 0.78
-        oStroke.Color = Palette.GlassEdge
-        oStroke.Parent = optBtn
+        local oStroke = applyGlassStroke(optBtn, 1, 0.68, Palette.GlassEdge)
 
         local radioOuter = Instance.new("Frame")
         radioOuter.AnchorPoint = Vector2.new(0, 0.5)
-        radioOuter.Position = UDim2.new(0, 10, 0.5, 0)
-        radioOuter.Size = UDim2.fromOffset(16, 16)
+        radioOuter.Position = UDim2.new(0, 12, 0.5, 0)
+        radioOuter.Size = UDim2.fromOffset(18, 18)
         radioOuter.BackgroundTransparency = 1
         radioOuter.ZIndex = 7
         radioOuter.Parent = optBtn
@@ -6312,7 +6537,7 @@ local function addRadioGroup(parent, order, title, options, getter, setter, relo
         radioDot.Name = "RadioDot"
         radioDot.AnchorPoint = Vector2.new(0.5, 0.5)
         radioDot.Position = UDim2.fromScale(0.5, 0.5)
-        radioDot.Size = UDim2.fromOffset(8, 8)
+        radioDot.Size = UDim2.fromOffset(9, 9)
         radioDot.BackgroundColor3 = Palette.ActiveGlow
         radioDot.BorderSizePixel = 0
         radioDot.Visible = false
@@ -6325,8 +6550,8 @@ local function addRadioGroup(parent, order, title, options, getter, setter, relo
 
         local optTitle = Instance.new("TextLabel")
         optTitle.BackgroundTransparency = 1
-        optTitle.Position = UDim2.new(0, 34, 0, 4)
-        optTitle.Size = UDim2.new(1, -42, 0, 16)
+        optTitle.Position = UDim2.new(0, 38, 0, 5)
+        optTitle.Size = UDim2.new(1, -46, 0, 17)
         optTitle.Font = Enum.Font.GothamBold
         optTitle.Text = opt.Title or opt.Value
         optTitle.TextSize = 12
@@ -6338,8 +6563,8 @@ local function addRadioGroup(parent, order, title, options, getter, setter, relo
 
         local optSub = Instance.new("TextLabel")
         optSub.BackgroundTransparency = 1
-        optSub.Position = UDim2.new(0, 34, 0, 21)
-        optSub.Size = UDim2.new(1, -42, 0, 14)
+        optSub.Position = UDim2.new(0, 38, 0, 23)
+        optSub.Size = UDim2.new(1, -46, 0, 14)
         optSub.Font = Enum.Font.Gotham
         optSub.Text = opt.Subtitle or ""
         optSub.TextSize = 10.5
@@ -6371,7 +6596,7 @@ end
 local function addSectionHeader(parent, order, title)
     local holder = Instance.new("Frame")
     holder.LayoutOrder = order
-    holder.Size = UDim2.new(1, 0, 0, 22)
+    holder.Size = UDim2.new(1, 0, 0, 24)
     holder.BackgroundTransparency = 1
     holder.ZIndex = 4
     holder.Parent = parent
@@ -6407,10 +6632,14 @@ local function addSectionHeader(parent, order, title)
     rule.Position = UDim2.new(0, 2, 1, 0)
     rule.Size = UDim2.new(1, -4, 0, 1)
     rule.BackgroundColor3 = Palette.GlassEdge
-    rule.BackgroundTransparency = 0.84
+    rule.BackgroundTransparency = 0.80
     rule.BorderSizePixel = 0
     rule.ZIndex = 4
     rule.Parent = holder
+
+    local ruleCorner = Instance.new("UICorner")
+    ruleCorner.CornerRadius = UDim.new(1, 0)
+    ruleCorner.Parent = rule
 end
 
 -- ============================================================================
@@ -6584,21 +6813,28 @@ do
         modeHeader.Parent = modeCard
 
         local modeBadge = Instance.new("TextLabel")
-        modeBadge.BackgroundTransparency = 1
         modeBadge.AnchorPoint = Vector2.new(1, 0)
-        modeBadge.Position = UDim2.new(1, 0, 0, 0)
-        modeBadge.Size = UDim2.fromOffset(90, 18)
+        modeBadge.Position = UDim2.new(1, 0, 0, -1)
+        modeBadge.Size = UDim2.fromOffset(92, 20)
+        modeBadge.BackgroundColor3 = Palette.GlassBase
+        modeBadge.BackgroundTransparency = 0.56
+        modeBadge.BorderSizePixel = 0
         modeBadge.Font = Enum.Font.Code
         modeBadge.Text = "VIM"
-        modeBadge.TextSize = 11
+        modeBadge.TextSize = 10.5
         modeBadge.TextColor3 = Palette.ActiveGlow
-        modeBadge.TextXAlignment = Enum.TextXAlignment.Right
+        modeBadge.TextXAlignment = Enum.TextXAlignment.Center
         modeBadge.ZIndex = 5
         modeBadge.Parent = modeCard
 
+        local badgeCorner = Instance.new("UICorner")
+        badgeCorner.CornerRadius = UDim.new(1, 0)
+        badgeCorner.Parent = modeBadge
+        applyGlassStroke(modeBadge, 1, 0.62, Palette.ActiveGlow)
+
         local statusLine = Instance.new("TextLabel")
         statusLine.BackgroundTransparency = 1
-        statusLine.Position = UDim2.fromOffset(0, 21)
+        statusLine.Position = UDim2.fromOffset(0, 23)
         statusLine.Size = UDim2.new(1, 0, 0, 16)
         statusLine.Font = Enum.Font.Gotham
         statusLine.Text = "Pointer locked"
@@ -6612,58 +6848,60 @@ do
         -- Subview A: VIM Lock / Unlock Pointer Controls
         local vimPane = Instance.new("Frame")
         vimPane.BackgroundTransparency = 1
-        vimPane.Position = UDim2.fromOffset(0, 44)
-        vimPane.Size = UDim2.new(1, 0, 1, -44)
+        vimPane.Position = UDim2.fromOffset(0, 46)
+        vimPane.Size = UDim2.new(1, 0, 1, -46)
         vimPane.ZIndex = 5
         vimPane.Parent = modeCard
 
         local lockBtn = Instance.new("TextButton")
         lockBtn.Position = UDim2.fromOffset(0, 2)
-        lockBtn.Size = UDim2.new(0.68, -4, 0, 32)
+        lockBtn.Size = UDim2.new(0.68, -4, 0, 34)
         lockBtn.Font = Enum.Font.GothamBold
         lockBtn.Text = "Pointer Locked (Touch Pass-Through)"
         lockBtn.TextSize = 11
         lockBtn.TextColor3 = Palette.TextHeader
         lockBtn.BackgroundColor3 = Palette.ActiveGlow
-        lockBtn.BackgroundTransparency = 0.72
+        lockBtn.BackgroundTransparency = 0.62
         lockBtn.AutoButtonColor = false
         lockBtn.BorderSizePixel = 0
         lockBtn.ZIndex = 6
         lockBtn.Parent = vimPane
         local lbc = Instance.new("UICorner")
-        lbc.CornerRadius = UDim.new(0, 8)
+        lbc.CornerRadius = UDim.new(0, 10)
         lbc.Parent = lockBtn
-        local lbStroke = applyGlassStroke(lockBtn, 1, 0.35)
+        local lbStroke = applyGlassStroke(lockBtn, 1, 0.35, Palette.ActiveGlow)
 
         local centerBtn = Instance.new("TextButton")
         centerBtn.AnchorPoint = Vector2.new(1, 0)
         centerBtn.Position = UDim2.new(1, 0, 0, 2)
-        centerBtn.Size = UDim2.new(0.32, -4, 0, 32)
+        centerBtn.Size = UDim2.new(0.32, -4, 0, 34)
         centerBtn.Font = Enum.Font.GothamMedium
         centerBtn.Text = "Reset Pos"
         centerBtn.TextSize = 11
         centerBtn.TextColor3 = Palette.TextHeader
         centerBtn.BackgroundColor3 = Palette.SurfaceSoft
+        centerBtn.BackgroundTransparency = 0.44
         centerBtn.AutoButtonColor = false
         centerBtn.BorderSizePixel = 0
         centerBtn.ZIndex = 6
         centerBtn.Parent = vimPane
         local cbc = Instance.new("UICorner")
-        cbc.CornerRadius = UDim.new(0, 8)
+        cbc.CornerRadius = UDim.new(0, 10)
         cbc.Parent = centerBtn
+        applyGlassStroke(centerBtn, 1, 0.58, Palette.GlassEdge)
 
         -- Subview B: firesignal / Tool:Activate() Action + Candidate Picker
         local callPane = Instance.new("Frame")
         callPane.BackgroundTransparency = 1
-        callPane.Position = UDim2.fromOffset(0, 42)
-        callPane.Size = UDim2.new(1, 0, 1, -42)
+        callPane.Position = UDim2.fromOffset(0, 44)
+        callPane.Size = UDim2.new(1, 0, 1, -44)
         callPane.Visible = false
         callPane.ZIndex = 5
         callPane.Parent = modeCard
 
         local actionRow = Instance.new("Frame")
         actionRow.BackgroundTransparency = 1
-        actionRow.Size = UDim2.new(1, 0, 0, 28)
+        actionRow.Size = UDim2.new(1, 0, 0, 32)
         actionRow.ZIndex = 5
         actionRow.Parent = callPane
 
@@ -6686,19 +6924,20 @@ do
             b.ZIndex = 6
             b.Parent = actionRow
             local c = Instance.new("UICorner")
-            c.CornerRadius = UDim.new(0, 7)
+            c.CornerRadius = UDim.new(0, 10)
             c.Parent = b
+            applyGlassStroke(b, 1, 0.58, Palette.GlassEdge)
             return b
         end
 
-        local brokenBtn = makeSmallAction("Call Not Working", Palette.Danger, 0.25)
-        local rescanBtn = makeSmallAction("Rescan", Palette.PrimaryAccent, 0.30)
-        local resetBrokenBtn = makeSmallAction("Reset Broken", Palette.SurfaceSoft, 0.10)
+        local brokenBtn = makeSmallAction("Call Not Working", Palette.Danger, 0.36)
+        local rescanBtn = makeSmallAction("Rescan", Palette.PrimaryAccent, 0.38)
+        local resetBrokenBtn = makeSmallAction("Reset Broken", Palette.SurfaceSoft, 0.44)
 
         local candList = Instance.new("Frame")
         candList.BackgroundTransparency = 1
-        candList.Position = UDim2.fromOffset(0, 34)
-        candList.Size = UDim2.new(1, 0, 1, -34)
+        candList.Position = UDim2.fromOffset(0, 38)
+        candList.Size = UDim2.new(1, 0, 1, -38)
         candList.ZIndex = 5
         candList.Parent = callPane
 
@@ -6708,13 +6947,14 @@ do
         candLayout.Parent = candList
 
         local candButtons = {}
+        local candStrokes = {}
         local candKeys = {}
         for i = 1, 4 do
             local cb = Instance.new("TextButton")
             cb.LayoutOrder = i
-            cb.Size = UDim2.new(1, 0, 0, 22)
+            cb.Size = UDim2.new(1, 0, 0, 26)
             cb.BackgroundColor3 = Palette.GlassBase
-            cb.BackgroundTransparency = 0.28
+            cb.BackgroundTransparency = 0.56
             cb.Font = Enum.Font.Code
             cb.Text = ""
             cb.TextSize = 10.5
@@ -6727,11 +6967,12 @@ do
             cb.ZIndex = 6
             cb.Parent = candList
             local cbc2 = Instance.new("UICorner")
-            cbc2.CornerRadius = UDim.new(0, 6)
+            cbc2.CornerRadius = UDim.new(0, 9)
             cbc2.Parent = cb
+            candStrokes[i] = applyGlassStroke(cb, 1, 0.72, Palette.GlassEdge)
             local cpad = Instance.new("UIPadding")
-            cpad.PaddingLeft = UDim.new(0, 8)
-            cpad.PaddingRight = UDim.new(0, 8)
+            cpad.PaddingLeft = UDim.new(0, 10)
+            cpad.PaddingRight = UDim.new(0, 10)
             cpad.Parent = cb
 
             bindSafeTap(cb, TriggerPage, function()
@@ -6748,7 +6989,7 @@ do
             if mode == "VirtualInputManager" then
                 vimPane.Visible = true
                 callPane.Visible = false
-                modeCard.Size = UDim2.new(1, 0, 0, 92)
+                modeCard.Size = UDim2.new(1, 0, 0, 102)
                 modeHeader.Text = "VIM Floating Pointer Controls"
                 modeBadge.Text = VirtualInputManager and "VIM READY" or "NO VIM"
                 local locked = Config.TriggerBot.PointerLocked
@@ -6757,7 +6998,7 @@ do
                     or "Unlocked — drag floating pointer reticle onto fire button"
                 lockBtn.Text = locked and "Unlock Pointer Position" or "Lock Pointer Position"
                 lockBtn.BackgroundColor3 = locked and Palette.ActiveGlow or Palette.Amber
-                lockBtn.BackgroundTransparency = locked and 0.74 or 0.35
+                lockBtn.BackgroundTransparency = locked and 0.62 or 0.42
                 lbStroke.Color = locked and Palette.ActiveGlow or Palette.Amber
             else
                 vimPane.Visible = false
@@ -6766,7 +7007,7 @@ do
                 local cands = isFire and TriggerEngine.FireSignalCandidates or TriggerEngine.ToolCandidates
                 local activeIdx = isFire and TriggerEngine.ActiveFireIdx or TriggerEngine.ActiveToolIdx
                 local shownCount = math.min(#cands, 4)
-                modeCard.Size = UDim2.new(1, 0, 0, 92 + (shownCount * 26))
+                modeCard.Size = UDim2.new(1, 0, 0, 102 + (shownCount * 30))
                 modeHeader.Text = isFire and "firesignal Discovery & Recovery" or "Tool:Activate() Discovery & Recovery"
                 modeBadge.Text = string.format("%d FOUND", #cands)
                 statusLine.Text = isFire and TriggerEngine.FireSignalStatus or TriggerEngine.ToolCallStatus
@@ -6779,9 +7020,13 @@ do
                         local isActive = (i == activeIdx)
                         local tag = cand.Confirmed and " [SAVED]" or ""
                         btn.Text = string.format("%s#%d %s%s", isActive and "> " or "  ", i, cand.Label, tag)
-                        btn.BackgroundColor3 = isActive and Color3.fromRGB(22, 42, 62) or Palette.GlassBase
-                        btn.BackgroundTransparency = isActive and 0.14 or 0.30
+                        btn.BackgroundColor3 = isActive and Color3.fromRGB(26, 48, 72) or Palette.GlassBase
+                        btn.BackgroundTransparency = isActive and 0.34 or 0.56
                         btn.TextColor3 = isActive and Palette.ActiveGlow or Palette.TextSilver
+                        if candStrokes[i] then
+                            candStrokes[i].Color = isActive and Palette.ActiveGlow or Palette.GlassEdge
+                            candStrokes[i].Transparency = isActive and 0.30 or 0.72
+                        end
                         btn.Visible = true
                     else
                         candKeys[i] = nil
@@ -7050,11 +7295,11 @@ do
         { Key = "FOV", Label = "FOV Ring" },
     }
 
-    local channelCard = createCardRow(ColorsPage, 98, 6)
+    local channelCard = createCardRow(ColorsPage, 104, 6)
     local channelTitle = Instance.new("TextLabel")
     channelTitle.BackgroundTransparency = 1
     channelTitle.Position = UDim2.fromOffset(0, 0)
-    channelTitle.Size = UDim2.new(1, -60, 0, 18)
+    channelTitle.Size = UDim2.new(1, -60, 0, 20)
     channelTitle.Font = Enum.Font.GothamMedium
     channelTitle.Text = "Active Color Channel"
     channelTitle.TextSize = 13
@@ -7066,34 +7311,28 @@ do
     local liveSwatch = Instance.new("Frame")
     liveSwatch.AnchorPoint = Vector2.new(1, 0)
     liveSwatch.Position = UDim2.new(1, 0, 0, 0)
-    liveSwatch.Size = UDim2.fromOffset(44, 18)
+    liveSwatch.Size = UDim2.fromOffset(48, 20)
     liveSwatch.BorderSizePixel = 0
     liveSwatch.ZIndex = 5
     liveSwatch.Parent = channelCard
 
     local swatchCorner = Instance.new("UICorner")
-    swatchCorner.CornerRadius = UDim.new(0, 6)
+    swatchCorner.CornerRadius = UDim.new(0, 8)
     swatchCorner.Parent = liveSwatch
 
     local swatchStroke = Instance.new("UIStroke")
-    swatchStroke.Thickness = 1
-    swatchStroke.Transparency = 0.4
+    swatchStroke.Thickness = 1.1
+    swatchStroke.Transparency = 0.36
     swatchStroke.Color = Palette.TextHeader
     swatchStroke.Parent = liveSwatch
 
     local channelBar = Instance.new("Frame")
     channelBar.AnchorPoint = Vector2.new(0.5, 1)
     channelBar.Position = UDim2.new(0.5, 0, 1, 0)
-    channelBar.Size = UDim2.new(1, 0, 0, 54)
-    channelBar.BackgroundColor3 = Palette.GlassBase
-    channelBar.BackgroundTransparency = 0.22
-    channelBar.BorderSizePixel = 0
+    channelBar.Size = UDim2.new(1, 0, 0, 58)
     channelBar.ZIndex = 5
     channelBar.Parent = channelCard
-
-    local channelBarCorner = Instance.new("UICorner")
-    channelBarCorner.CornerRadius = UDim.new(0, 8)
-    channelBarCorner.Parent = channelBar
+    UI.applyFrostedSurface(channelBar, 10, Palette.GlassBase, 0.56, 0.66, false)
 
     local channelPad = Instance.new("UIPadding")
     channelPad.PaddingLeft = UDim.new(0, 4)
@@ -7103,7 +7342,7 @@ do
     channelPad.Parent = channelBar
 
     local channelGrid = Instance.new("UIGridLayout")
-    channelGrid.CellSize = UDim2.new(0.333, -4, 0, 21)
+    channelGrid.CellSize = UDim2.new(0.333, -4, 0, 23)
     channelGrid.CellPadding = UDim2.fromOffset(4, 4)
     channelGrid.HorizontalAlignment = Enum.HorizontalAlignment.Center
     channelGrid.VerticalAlignment = Enum.VerticalAlignment.Center
@@ -7111,6 +7350,7 @@ do
     channelGrid.Parent = channelBar
 
     local channelBtns = {}
+    local channelStrokes = {}
     local syncRed = nil
     local syncGreen = nil
     local syncBlue = nil
@@ -7122,9 +7362,14 @@ do
             local active = (key == Config.UI.SelectedColorKey)
             tween(btn, 0.14, {
                 BackgroundColor3 = active and Palette.PrimaryAccent or Palette.GlassBase,
-                BackgroundTransparency = active and 0.15 or 1,
+                BackgroundTransparency = active and 0.28 or 1,
                 TextColor3 = active and Palette.TextHeader or Palette.TextSilver,
             })
+            if channelStrokes[key] then
+                tween(channelStrokes[key], 0.14, {
+                    Transparency = active and 0.42 or 1,
+                })
+            end
         end
         if syncRed then syncRed() end
         if syncGreen then syncGreen() end
@@ -7137,7 +7382,7 @@ do
         b.LayoutOrder = idx
         b.Text = def.Label
         b.Font = Enum.Font.GothamMedium
-        b.TextSize = 10
+        b.TextSize = 10.5
         b.TextTruncate = Enum.TextTruncate.AtEnd
         b.AutoButtonColor = false
         b.BorderSizePixel = 0
@@ -7145,8 +7390,10 @@ do
         b.Parent = channelBar
 
         local bc = Instance.new("UICorner")
-        bc.CornerRadius = UDim.new(0, 6)
+        bc.CornerRadius = UDim.new(0, 8)
         bc.Parent = b
+
+        channelStrokes[def.Key] = applyGlassStroke(b, 1, 1, Palette.GlassSpecular)
 
         bindSafeTap(b, ColorsPage, function()
             Config.UI.SelectedColorKey = def.Key
@@ -7290,14 +7537,14 @@ do
     settingsOrder = settingsOrder + 1
 
     do
-        local profileCard = createCardRow(SettingsPage, 46, settingsOrder)
+        local profileCard = createCardRow(SettingsPage, 52, settingsOrder)
         settingsOrder = settingsOrder + 1
 
         local profileLbl = Instance.new("TextLabel")
         profileLbl.BackgroundTransparency = 1
         profileLbl.AnchorPoint = Vector2.new(0, 0.5)
         profileLbl.Position = UDim2.new(0, 0, 0.5, 0)
-        profileLbl.Size = UDim2.new(1, -102, 0, 18)
+        profileLbl.Size = UDim2.new(1, -108, 0, 18)
         profileLbl.Font = Enum.Font.Code
         profileLbl.Text = State.ConfigStatusText or "Defaults"
         profileLbl.TextSize = 11
@@ -7310,20 +7557,21 @@ do
         local saveNowBtn = Instance.new("TextButton")
         saveNowBtn.AnchorPoint = Vector2.new(1, 0.5)
         saveNowBtn.Position = UDim2.new(1, 0, 0.5, 0)
-        saveNowBtn.Size = UDim2.fromOffset(92, 28)
+        saveNowBtn.Size = UDim2.fromOffset(96, 32)
         saveNowBtn.Text = "Save Now"
         saveNowBtn.Font = Enum.Font.GothamBold
         saveNowBtn.TextSize = 11
         saveNowBtn.TextColor3 = Palette.TextHeader
         saveNowBtn.BackgroundColor3 = Palette.PrimaryAccent
-        saveNowBtn.BackgroundTransparency = 0.25
+        saveNowBtn.BackgroundTransparency = 0.36
         saveNowBtn.AutoButtonColor = false
         saveNowBtn.BorderSizePixel = 0
         saveNowBtn.ZIndex = 6
         saveNowBtn.Parent = profileCard
         local snc = Instance.new("UICorner")
-        snc.CornerRadius = UDim.new(0, 7)
+        snc.CornerRadius = UDim.new(0, 9)
         snc.Parent = saveNowBtn
+        applyGlassStroke(saveNowBtn, 1, 0.48, Palette.GlassEdge)
 
         table.insert(ConfigStore.StatusListeners, function(txt)
             if profileLbl and profileLbl.Parent then
@@ -7415,7 +7663,7 @@ do
     addSectionHeader(SettingsPage, settingsOrder, "System Actions")
     settingsOrder = settingsOrder + 1
 
-    local actionCard = createCardRow(SettingsPage, 54, settingsOrder)
+    local actionCard = createCardRow(SettingsPage, 56, settingsOrder)
     local actionGrid = Instance.new("UIGridLayout")
     actionGrid.CellSize = UDim2.new(0.333, -6, 1, 0)
     actionGrid.CellPadding = UDim2.fromOffset(8, 0)
@@ -7429,14 +7677,15 @@ do
     ForceReloadBtn.TextSize = 11.5
     ForceReloadBtn.TextColor3 = Palette.TextHeader
     ForceReloadBtn.BackgroundColor3 = Palette.PrimaryAccent
-    ForceReloadBtn.BackgroundTransparency = 0.25
+    ForceReloadBtn.BackgroundTransparency = 0.38
     ForceReloadBtn.AutoButtonColor = false
     ForceReloadBtn.BorderSizePixel = 0
     ForceReloadBtn.ZIndex = 6
     ForceReloadBtn.Parent = actionCard
     local frc = Instance.new("UICorner")
-    frc.CornerRadius = UDim.new(0, 8)
+    frc.CornerRadius = UDim.new(0, 10)
     frc.Parent = ForceReloadBtn
+    applyGlassStroke(ForceReloadBtn, 1, 0.52, Palette.GlassEdge)
 
     ResetBtn = Instance.new("TextButton")
     ResetBtn.Text = "Reset Defaults"
@@ -7444,13 +7693,15 @@ do
     ResetBtn.TextSize = 11.5
     ResetBtn.TextColor3 = Palette.TextHeader
     ResetBtn.BackgroundColor3 = Palette.SurfaceSoft
+    ResetBtn.BackgroundTransparency = 0.44
     ResetBtn.AutoButtonColor = false
     ResetBtn.BorderSizePixel = 0
     ResetBtn.ZIndex = 6
     ResetBtn.Parent = actionCard
     local rc = Instance.new("UICorner")
-    rc.CornerRadius = UDim.new(0, 8)
+    rc.CornerRadius = UDim.new(0, 10)
     rc.Parent = ResetBtn
+    applyGlassStroke(ResetBtn, 1, 0.58, Palette.GlassEdge)
 
     UnloadBtn = Instance.new("TextButton")
     UnloadBtn.Text = "Unload AKI"
@@ -7458,14 +7709,15 @@ do
     UnloadBtn.TextSize = 11.5
     UnloadBtn.TextColor3 = Palette.TextHeader
     UnloadBtn.BackgroundColor3 = Palette.Danger
-    UnloadBtn.BackgroundTransparency = 0.2
+    UnloadBtn.BackgroundTransparency = 0.34
     UnloadBtn.AutoButtonColor = false
     UnloadBtn.BorderSizePixel = 0
     UnloadBtn.ZIndex = 6
     UnloadBtn.Parent = actionCard
     local uc = Instance.new("UICorner")
-    uc.CornerRadius = UDim.new(0, 8)
+    uc.CornerRadius = UDim.new(0, 10)
     uc.Parent = UnloadBtn
+    applyGlassStroke(UnloadBtn, 1, 0.52, Palette.Danger)
 end
 end -- end populateAllTabs
 
@@ -7478,40 +7730,40 @@ local MobileToggle = Instance.new("TextButton")
 MobileToggle.Name = "TEAM_AKI_MobileToggle"
 MobileToggle.AnchorPoint = Vector2.new(0, 0.5)
 MobileToggle.Position = UDim2.new(0, 18, 0.25, 0)
-MobileToggle.Size = UDim2.fromOffset(114, 38)
-MobileToggle.BackgroundColor3 = Palette.GlassBase
-MobileToggle.BackgroundTransparency = 0.20
+MobileToggle.Size = UDim2.fromOffset(124, 40)
 MobileToggle.Font = Enum.Font.GothamBold
 MobileToggle.Text = "TEAM AKI"
 MobileToggle.TextSize = 13
 MobileToggle.TextColor3 = Palette.TextHeader
 MobileToggle.AutoButtonColor = false
-MobileToggle.BorderSizePixel = 0
+MobileToggle.Active = true
+MobileToggle.Draggable = false
 MobileToggle.Visible = false
 MobileToggle.ZIndex = 20
 MobileToggle.Parent = MainGui
 
-local ToggleStroke = applyGlassStroke(MobileToggle, 1.4, 0.35)
+local ToggleStroke = UI.applyFrostedSurface(MobileToggle, -1, Palette.GlassBase, 0.34, 0.36, true)
+ToggleStroke.Thickness = 1.4
 ToggleStroke.Color = Palette.ActiveGlow
 
 local MobileAimBtn = Instance.new("TextButton")
 MobileAimBtn.Name = "TEAM_AKI_MobileAim"
 MobileAimBtn.AnchorPoint = Vector2.new(0, 0.5)
-MobileAimBtn.Position = UDim2.new(0, 18, 0.25, 48)
-MobileAimBtn.Size = UDim2.fromOffset(132, 38)
-MobileAimBtn.BackgroundColor3 = Palette.GlassBase
-MobileAimBtn.BackgroundTransparency = 0.20
+MobileAimBtn.Position = UDim2.new(0, 18, 0.25, 50)
+MobileAimBtn.Size = UDim2.fromOffset(138, 40)
 MobileAimBtn.Font = Enum.Font.GothamBold
 MobileAimBtn.Text = "AIM LOCK: OFF"
 MobileAimBtn.TextSize = 12
 MobileAimBtn.TextColor3 = Palette.TextSilver
 MobileAimBtn.AutoButtonColor = false
-MobileAimBtn.BorderSizePixel = 0
+MobileAimBtn.Active = true
+MobileAimBtn.Draggable = false
 MobileAimBtn.Visible = false
 MobileAimBtn.ZIndex = 20
 MobileAimBtn.Parent = MainGui
 
-local AimBtnStroke = applyGlassStroke(MobileAimBtn, 1.4, 0.45)
+local AimBtnStroke = UI.applyFrostedSurface(MobileAimBtn, -1, Palette.GlassBase, 0.34, 0.44, true)
+AimBtnStroke.Thickness = 1.4
 
 local function refreshMobileAimStyle()
     local locked = Config.Aimbot.Enabled
@@ -7519,10 +7771,12 @@ local function refreshMobileAimStyle()
     MobileAimBtn.Text = locked and "AIM LOCK: ON" or "AIM LOCK: OFF"
     tween(MobileAimBtn, 0.15, {
         TextColor3 = locked and Palette.ActiveGlow or Palette.TextSilver,
-        BackgroundColor3 = locked and Color3.fromRGB(16, 32, 38) or Palette.GlassBase,
+        BackgroundColor3 = locked and Color3.fromRGB(16, 46, 52) or Palette.GlassBase,
+        BackgroundTransparency = locked and 0.28 or 0.34,
     })
     tween(AimBtnStroke, 0.15, {
         Color = locked and Palette.ActiveGlow or Palette.GlassEdge,
+        Transparency = locked and 0.24 or 0.44,
     })
 end
 
@@ -7536,29 +7790,21 @@ end
 local MobileTriggerBtn = Instance.new("TextButton")
 MobileTriggerBtn.Name = "TEAM_AKI_MobileTrigger"
 MobileTriggerBtn.AnchorPoint = Vector2.new(0, 0.5)
-MobileTriggerBtn.Position = UDim2.new(0, 18, 0.25, 96)
-MobileTriggerBtn.Size = UDim2.fromOffset(132, 38)
-MobileTriggerBtn.BackgroundColor3 = Palette.GlassBase
-MobileTriggerBtn.BackgroundTransparency = 0.20
+MobileTriggerBtn.Position = UDim2.new(0, 18, 0.25, 100)
+MobileTriggerBtn.Size = UDim2.fromOffset(138, 40)
 MobileTriggerBtn.Font = Enum.Font.GothamBold
 MobileTriggerBtn.Text = "TRIGGER: OFF"
 MobileTriggerBtn.TextSize = 12
 MobileTriggerBtn.TextColor3 = Palette.TextSilver
 MobileTriggerBtn.AutoButtonColor = false
-MobileTriggerBtn.BorderSizePixel = 0
+MobileTriggerBtn.Active = true
+MobileTriggerBtn.Draggable = false
 MobileTriggerBtn.Visible = false
 MobileTriggerBtn.ZIndex = 20
 MobileTriggerBtn.Parent = MainGui
 
-local TriggerBtnStroke = applyGlassStroke(MobileTriggerBtn, 1.4, 0.45)
-
-do
-    for _, pill in ipairs({MobileToggle, MobileAimBtn, MobileTriggerBtn}) do
-        local c = Instance.new("UICorner")
-        c.CornerRadius = UDim.new(1, 0)
-        c.Parent = pill
-    end
-end
+local TriggerBtnStroke = UI.applyFrostedSurface(MobileTriggerBtn, -1, Palette.GlassBase, 0.34, 0.44, true)
+TriggerBtnStroke.Thickness = 1.4
 
 local function refreshMobileTriggerStyle()
     local on = Config.TriggerBot.Enabled
@@ -7566,10 +7812,12 @@ local function refreshMobileTriggerStyle()
     MobileTriggerBtn.Text = on and "TRIGGER: ON" or "TRIGGER: OFF"
     tween(MobileTriggerBtn, 0.15, {
         TextColor3 = on and Palette.Amber or Palette.TextSilver,
-        BackgroundColor3 = on and Color3.fromRGB(36, 24, 16) or Palette.GlassBase,
+        BackgroundColor3 = on and Color3.fromRGB(48, 30, 18) or Palette.GlassBase,
+        BackgroundTransparency = on and 0.28 or 0.34,
     })
     tween(TriggerBtnStroke, 0.15, {
         Color = on and Palette.Amber or Palette.GlassEdge,
+        Transparency = on and 0.24 or 0.44,
     })
 end
 
@@ -7585,57 +7833,101 @@ local function makeDraggableButton(btn, onTap)
     local movedDist = 0
     local dragStart = nil
     local startPos = nil
-    local sinkAcquired = false
+
+    local function resetButtonDrag()
+        activeInput = nil
+        dragStart = nil
+        startPos = nil
+        InputGuard.endDrag(btn)
+    end
 
     btn.InputBegan:Connect(function(input)
-        if not activeInput and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+        if activeInput or not btn.Visible then
+            return
+        end
+        if input.UserInputState ~= Enum.UserInputState.Begin then
+            return
+        end
+        if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then
+            return
+        end
+        if not InputGuard.isPointInGui(btn, input.Position, 6) then
+            return
+        end
+        if InputGuard.beginDrag(btn, input) then
             activeInput = input
             movedDist = 0
             dragStart = input.Position
             startPos = btn.Position
-            if input.UserInputType == Enum.UserInputType.Touch and not sinkAcquired then
-                sinkAcquired = true
-                InputGuard.acquireDragSink()
-            end
         end
     end)
 
     addConnection(UserInputService.InputChanged:Connect(function(input)
-        if activeInput and dragStart and startPos then
-            if input == activeInput or (activeInput.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseMovement) then
-                local scale = math.max(RootScale.Scale, 0.5)
-                local delta = (input.Position - dragStart) / scale
-                movedDist = delta.Magnitude
-                if movedDist > 5 then
-                    local nextX = startPos.X.Offset + delta.X
-                    local nextY = startPos.Y.Offset + delta.Y
-                    local cam = Workspace.CurrentCamera
-                    if cam then
-                        local vp = cam.ViewportSize / scale
-                        nextX = math.clamp(nextX, -vp.X * 0.9, vp.X * 0.9)
-                        nextY = math.clamp(nextY, -vp.Y * 0.9, vp.Y * 0.9)
-                    end
-                    btn.Position = UDim2.new(
-                        startPos.X.Scale,
-                        nextX,
-                        startPos.Y.Scale,
-                        nextY
-                    )
+        if not activeInput or not dragStart or not startPos then
+            return
+        end
+        if not btn.Visible then
+            resetButtonDrag()
+            return
+        end
+        if not InputGuard.isOwner(btn, input) then
+            if not InputGuard.isActiveState(activeInput.UserInputState) then
+                resetButtonDrag()
+            end
+            return
+        end
+        local scale = math.max(RootScale.Scale, 0.5)
+        local delta = (input.Position - dragStart) / scale
+        if delta.Magnitude > movedDist then
+            movedDist = delta.Magnitude
+        end
+        if movedDist > 6 then
+            local nextX = startPos.X.Offset + delta.X
+            local nextY = startPos.Y.Offset + delta.Y
+            local cam = Workspace.CurrentCamera
+            if cam then
+                local vp = cam.ViewportSize / scale
+                local btnW = btn.Size.X.Offset
+                local btnH = btn.Size.Y.Offset
+                local minX = -(startPos.X.Scale * vp.X) + 6
+                local maxX = ((1 - startPos.X.Scale) * vp.X) - btnW - 6
+                local minY = -(startPos.Y.Scale * vp.Y) + (btnH * 0.5) + 6
+                local maxY = ((1 - startPos.Y.Scale) * vp.Y) - (btnH * 0.5) - 6
+                if maxX >= minX then
+                    nextX = math.clamp(nextX, minX, maxX)
+                end
+                if maxY >= minY then
+                    nextY = math.clamp(nextY, minY, maxY)
                 end
             end
+            btn.Position = UDim2.new(
+                startPos.X.Scale,
+                nextX,
+                startPos.Y.Scale,
+                nextY
+            )
         end
     end))
 
-    addConnection(UserInputService.InputEnded:Connect(function(input)
-        if input == activeInput then
-            activeInput = nil
-            if sinkAcquired then
-                sinkAcquired = false
-                InputGuard.releaseDragSink()
-            end
-            if movedDist <= 6 then
+    local function finishButtonInput(input)
+        if not activeInput then
+            return
+        end
+        if input == activeInput or not InputGuard.isActiveState(activeInput.UserInputState) then
+            local wasTap = (input == activeInput) and (movedDist <= 7) and btn.Visible
+            resetButtonDrag()
+            if wasTap then
                 onTap()
             end
+        end
+    end
+
+    addConnection(UserInputService.InputEnded:Connect(finishButtonInput))
+    addConnection(UserInputService.TouchEnded:Connect(finishButtonInput))
+
+    addConnection(btn:GetPropertyChangedSignal("Visible"):Connect(function()
+        if not btn.Visible and activeInput then
+            resetButtonDrag()
         end
     end))
 end
@@ -7645,12 +7937,13 @@ do
     local vimPointer = Instance.new("Frame")
     vimPointer.Name = "TEAM_AKI_VimPointer"
     vimPointer.AnchorPoint = Vector2.new(0.5, 0.5)
-    vimPointer.Size = UDim2.fromOffset(52, 52)
+    vimPointer.Size = UDim2.fromOffset(54, 54)
     vimPointer.Position = UDim2.fromScale(Config.TriggerBot.PointerScaleX, Config.TriggerBot.PointerScaleY)
     vimPointer.BackgroundColor3 = Palette.GlassBase
-    vimPointer.BackgroundTransparency = 0.72
+    vimPointer.BackgroundTransparency = 0.62
     vimPointer.BorderSizePixel = 0
     vimPointer.Active = false
+    vimPointer.Draggable = false
     vimPointer.Visible = false
     vimPointer.ZIndex = 12
     vimPointer.Parent = OverlayGui
@@ -7662,13 +7955,13 @@ do
     local vpStroke = Instance.new("UIStroke")
     vpStroke.Thickness = 2
     vpStroke.Color = Palette.ActiveGlow
-    vpStroke.Transparency = 0.2
+    vpStroke.Transparency = 0.22
     vpStroke.Parent = vimPointer
 
     local innerDot = Instance.new("Frame")
     innerDot.AnchorPoint = Vector2.new(0.5, 0.5)
     innerDot.Position = UDim2.fromScale(0.5, 0.5)
-    innerDot.Size = UDim2.fromOffset(8, 8)
+    innerDot.Size = UDim2.fromOffset(9, 9)
     innerDot.BackgroundColor3 = Palette.ActiveGlow
     innerDot.BorderSizePixel = 0
     innerDot.Active = false
@@ -7680,19 +7973,25 @@ do
     idc.Parent = innerDot
 
     local vpTag = Instance.new("TextLabel")
-    vpTag.BackgroundTransparency = 1
+    vpTag.BackgroundColor3 = Palette.GlassBase
+    vpTag.BackgroundTransparency = 0.44
+    vpTag.BorderSizePixel = 0
     vpTag.AnchorPoint = Vector2.new(0.5, 0)
-    vpTag.Position = UDim2.new(0.5, 0, 1, 2)
-    vpTag.Size = UDim2.fromOffset(82, 14)
+    vpTag.Position = UDim2.new(0.5, 0, 1, 4)
+    vpTag.Size = UDim2.fromOffset(88, 16)
     vpTag.Font = Enum.Font.GothamBold
     vpTag.Text = "VIM FIRE"
-    vpTag.TextSize = 10
+    vpTag.TextSize = 9.5
     vpTag.TextColor3 = Palette.ActiveGlow
-    vpTag.TextStrokeTransparency = 0.2
+    vpTag.TextStrokeTransparency = 0.35
     vpTag.TextStrokeColor3 = Color3.new(0, 0, 0)
     vpTag.Active = false
     vpTag.ZIndex = 13
     vpTag.Parent = vimPointer
+
+    local vpTagCorner = Instance.new("UICorner")
+    vpTagCorner.CornerRadius = UDim.new(1, 0)
+    vpTagCorner.Parent = vpTag
 
     UI.syncVimPointer = function()
         local isVim = (Config.TriggerBot.Mode == "VirtualInputManager")
@@ -7702,54 +8001,79 @@ do
         vimPointer.Position = UDim2.fromScale(Config.TriggerBot.PointerScaleX, Config.TriggerBot.PointerScaleY)
         -- Critical: Active = false passes all finger touches directly to the real game button underneath!
         vimPointer.Active = unlocked and isVim
-        vimPointer.BackgroundTransparency = unlocked and 0.32 or 0.78
+        vimPointer.BackgroundTransparency = unlocked and 0.38 or 0.72
         vpStroke.Color = unlocked and Palette.Amber or Palette.ActiveGlow
-        vpStroke.Transparency = unlocked and 0.10 or 0.35
+        vpStroke.Transparency = unlocked and 0.12 or 0.34
         innerDot.BackgroundColor3 = unlocked and Palette.Amber or Palette.ActiveGlow
         vpTag.Text = unlocked and "DRAG TO BTN" or "VIM LOCKED"
         vpTag.TextColor3 = unlocked and Palette.Amber or Palette.ActiveGlow
     end
 
     local dragInput = nil
-    local ptrSink = false
+
+    local function clearPointerDrag(shouldSave)
+        local hadDrag = (dragInput ~= nil)
+        dragInput = nil
+        InputGuard.endDrag(vimPointer)
+        if shouldSave and hadDrag then
+            pcall(UI.refreshTriggerControls)
+            ConfigStore.scheduleSave()
+        end
+    end
 
     vimPointer.InputBegan:Connect(function(input)
-        if Config.TriggerBot.PointerLocked then
+        if Config.TriggerBot.PointerLocked or not vimPointer.Visible or dragInput then
             return
         end
-        if not dragInput and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+        if input.UserInputState ~= Enum.UserInputState.Begin then
+            return
+        end
+        if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then
+            return
+        end
+        if not InputGuard.isPointInGui(vimPointer, input.Position, 8) then
+            return
+        end
+        if InputGuard.beginDrag(vimPointer, input) then
             dragInput = input
-            if input.UserInputType == Enum.UserInputType.Touch and not ptrSink then
-                ptrSink = true
-                InputGuard.acquireDragSink()
-            end
         end
     end)
 
     addConnection(UserInputService.InputChanged:Connect(function(input)
-        if not dragInput or Config.TriggerBot.PointerLocked then
+        if not dragInput then
             return
         end
-        if input == dragInput or (dragInput.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseMovement) then
-            local cam = State.Camera or Workspace.CurrentCamera
-            local vp = (cam and cam.ViewportSize) or Vector2.new(1280, 720)
-            if vp.X > 0 and vp.Y > 0 then
-                Config.TriggerBot.PointerScaleX = math.clamp(input.Position.X / vp.X, 0.04, 0.96)
-                Config.TriggerBot.PointerScaleY = math.clamp(input.Position.Y / vp.Y, 0.06, 0.94)
-                vimPointer.Position = UDim2.fromScale(Config.TriggerBot.PointerScaleX, Config.TriggerBot.PointerScaleY)
+        if Config.TriggerBot.PointerLocked or not vimPointer.Visible then
+            clearPointerDrag(false)
+            return
+        end
+        if not InputGuard.isOwner(vimPointer, input) then
+            if not InputGuard.isActiveState(dragInput.UserInputState) then
+                clearPointerDrag(true)
             end
+            return
+        end
+        local cam = State.Camera or Workspace.CurrentCamera
+        local vp = (cam and cam.ViewportSize) or Vector2.new(1280, 720)
+        if vp.X > 0 and vp.Y > 0 then
+            Config.TriggerBot.PointerScaleX = math.clamp(input.Position.X / vp.X, 0.04, 0.96)
+            Config.TriggerBot.PointerScaleY = math.clamp(input.Position.Y / vp.Y, 0.06, 0.94)
+            vimPointer.Position = UDim2.fromScale(Config.TriggerBot.PointerScaleX, Config.TriggerBot.PointerScaleY)
         end
     end))
 
-    addConnection(UserInputService.InputEnded:Connect(function(input)
-        if input == dragInput then
-            dragInput = nil
-            if ptrSink then
-                ptrSink = false
-                InputGuard.releaseDragSink()
-            end
-            pcall(UI.refreshTriggerControls)
-            ConfigStore.scheduleSave()
+    local function finishPointerInput(input)
+        if dragInput and (input == dragInput or not InputGuard.isActiveState(dragInput.UserInputState)) then
+            clearPointerDrag(true)
+        end
+    end
+
+    addConnection(UserInputService.InputEnded:Connect(finishPointerInput))
+    addConnection(UserInputService.TouchEnded:Connect(finishPointerInput))
+
+    addConnection(vimPointer:GetPropertyChangedSignal("Visible"):Connect(function()
+        if not vimPointer.Visible and dragInput then
+            clearPointerDrag(false)
         end
     end))
 end
@@ -7759,19 +8083,19 @@ local function setPanelVisible(visible)
     if visible then
         MainCard.Visible = true
         CardShadow.Visible = true
-        MainCard.Size = UDim2.fromOffset(BASE_CARD_W - 26, BASE_CARD_H - 26)
-        MainCard.BackgroundTransparency = 0.45
-        CardShadow.BackgroundTransparency = 0.85
-        tween(MainCard, 0.2, {
+        MainCard.Size = UDim2.fromOffset(BASE_CARD_W - 24, BASE_CARD_H - 24)
+        MainCard.BackgroundTransparency = 0.68
+        CardShadow.BackgroundTransparency = 0.88
+        tween(MainCard, 0.22, {
             Size = UDim2.fromOffset(BASE_CARD_W, BASE_CARD_H),
-            BackgroundTransparency = 0.16,
+            BackgroundTransparency = 0.38,
         })
-        tween(CardShadow, 0.2, {BackgroundTransparency = 0.52})
+        tween(CardShadow, 0.22, {BackgroundTransparency = 0.68})
         tween(ToggleStroke, 0.18, {Color = Palette.ActiveGlow})
     else
         local tw = tween(MainCard, 0.16, {
-            Size = UDim2.fromOffset(BASE_CARD_W - 26, BASE_CARD_H - 26),
-            BackgroundTransparency = 0.65,
+            Size = UDim2.fromOffset(BASE_CARD_W - 24, BASE_CARD_H - 24),
+            BackgroundTransparency = 0.86,
         })
         tween(CardShadow, 0.16, {BackgroundTransparency = 1})
         local completedConn
