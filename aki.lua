@@ -166,6 +166,9 @@ local function cleanupOrphanGuis()
     if pg then
         table.insert(targets, pg)
     end
+    if Workspace then
+        table.insert(targets, Workspace)
+    end
     local orphanNames = {
         TEAM_AKI_Overlay = true,
         TEAM_AKI_Hub = true,
@@ -260,6 +263,7 @@ local Config = {
         TeamCheck = true,
         VisibleCheck = false,
         IgnoreBots = false,
+        SyncIgnoreBots = false,
         ColorByVisibility = true,
         ShowName = true,
         ShowDistance = true,            -- Renders distance right beneath enemy feet
@@ -354,6 +358,7 @@ local State = {
     NoclipParts = {},
     OriginalWalkSpeed = nil,
     WalkSpeedClamped = false,
+    WalkSpeedClampStrikes = 0,
     LastSpeedWrite = 0,
     LastWrittenWalkSpeed = nil,
     OriginalJump = nil,
@@ -364,6 +369,7 @@ local State = {
     BHopMomentum = 0,
     ApplyingJumpImpulse = false,
     JumpButtonHeld = false,
+    JumpTouchInput = nil,
     OnHumanoidJumpChanged = nil,
     OnLocalCharacterBound = nil,
     OnSystemsReloaded = nil,
@@ -376,6 +382,8 @@ local State = {
     LastWorkspaceDeepScan = 0,
     LastBotScan = 0,
     LastDeepBotScan = 0,
+    ExternalHighlightCount = 0,
+    LastExternalHighlightScan = 0,
     LastTeamScan = -1,
     DetectedTeamScheme = "FFA",
     LastReloadReason = "Startup",
@@ -775,11 +783,8 @@ EspContainer.Name = "Layer_" .. STEALTH_UID
 EspContainer.Parent = OverlayGui
 
 local function getHighlightParent()
-    if type(gethui) == "function" then
-        local okHui, hui = pcall(gethui)
-        if okHui and typeof(hui) == "Instance" then
-            return hui
-        end
+    if Workspace then
+        return Workspace
     end
     local okCore = pcall(function()
         return CoreGui.Name
@@ -796,7 +801,9 @@ end
 
 local HighlightContainer = Instance.new("Folder")
 HighlightContainer.Name = "Hl_" .. STEALTH_UID
-protectGui(HighlightContainer)
+pcall(function()
+    HighlightContainer:SetAttribute("_rLayerTag", true)
+end)
 do
     local okHighlightParent = pcall(function()
         HighlightContainer.Parent = getHighlightParent()
@@ -2142,6 +2149,7 @@ local function bindCharacterToEntry(entry, character)
         if entry.Character == character and character.Parent and not State.Unloaded then
             if desc:IsA("BasePart") or desc:IsA("Humanoid") or desc:IsA("Bone") then
                 entry.NeedsRescan = true
+                entry.HighlightDirty = true
             end
         end
     end
@@ -2267,7 +2275,32 @@ end
 local BOT_CONTAINER_NAMES = {
     "Bots", "NPCs", "NPC", "Enemies", "Zombies", "Mobs", "Dummies",
     "Targets", "Units", "Living", "Entities", "Monsters", "AI",
+    "Guards", "Soldiers", "Bosses", "Creeps", "Bandits", "Raiders", "Practice", "Rigs",
 }
+
+function VisualHelper.hasBotRigStructure(model, fromBotFolder)
+    if not model then
+        return false
+    end
+    if model:FindFirstChildOfClass("Humanoid") ~= nil then
+        return true
+    end
+    if (model:GetAttribute("IsBot") == true) or (model:GetAttribute("IsNPC") == true) or (model:GetAttribute("Enemy") == true) then
+        return true
+    end
+    local hasAnimCtrl = model:FindFirstChildOfClass("AnimationController") ~= nil
+    local hasHead = model:FindFirstChild("Head") ~= nil
+    local hasBody = (model:FindFirstChild("HumanoidRootPart") ~= nil)
+        or (model:FindFirstChild("Torso") ~= nil)
+        or (model:FindFirstChild("UpperTorso") ~= nil)
+    if hasAnimCtrl and (hasHead or hasBody) then
+        return true
+    end
+    if fromBotFolder and hasHead and hasBody then
+        return true
+    end
+    return false
+end
 
 local function isModelBotAlive(model)
     if not model or not model.Parent or not model:IsDescendantOf(Workspace) then
@@ -2322,6 +2355,8 @@ local function registerBotEntry(botModel)
         HealthBg = bundle.HealthBg,
         HealthFill = bundle.HealthFill,
         Highlight = nil,
+        HighlightDirty = false,
+        LastHighlightRefresh = 0,
         AlertArrow = bundle.AlertArrow,
         Visuals = bundle,
         NeedsRescan = false,
@@ -2340,9 +2375,9 @@ local function registerBotEntry(botModel)
     bindCharacterToEntry(entry, botModel)
 end
 
-local MAX_TRACKED_BOTS = 36
+local MAX_TRACKED_BOTS = 64
 
-local function syncWorkspaceBots(playerCharSet)
+local function syncWorkspaceBots(playerCharSet, forceDeepScan)
     if State.Unloaded then
         return
     end
@@ -2377,6 +2412,15 @@ local function syncWorkspaceBots(playerCharSet)
         for _, key in ipairs(toDrop) do
             destroyPlayerEntry(key)
         end
+    elseif Config.ESP.IgnoreBots then
+        for _, entry in pairs(Registry) do
+            if entry.IsBot then
+                destroyHighlight(entry)
+                if entry.Visuals then
+                    entry.Visuals:HideAll()
+                end
+            end
+        end
     end
 
     local cam = State.Camera or Workspace.CurrentCamera
@@ -2385,14 +2429,14 @@ local function syncWorkspaceBots(playerCharSet)
     local candidateSeen = {}
     local playerList = Players:GetPlayers()
 
-    local function considerModel(model)
+    local function considerModel(model, fromBotFolder)
         if not model or candidateSeen[model] or charLookup[model] then
             return
         end
         if not (model:IsA("Model") or model:IsA("BasePart")) then
             return
         end
-        if model == Workspace.Terrain or model == cam then
+        if model == Workspace.Terrain or model == cam or model == HighlightContainer then
             return
         end
         local realOwner = model:IsA("Model") and Players:GetPlayerFromCharacter(model) or nil
@@ -2425,9 +2469,7 @@ local function syncWorkspaceBots(playerCharSet)
         if botsDisabledEverywhere then
             return
         end
-        local hasHum = model:FindFirstChildOfClass("Humanoid") ~= nil
-        local hasBotTag = (model:GetAttribute("IsBot") == true) or (model:GetAttribute("IsNPC") == true) or (model:GetAttribute("Enemy") == true)
-        if not hasHum and not hasBotTag then
+        if not VisualHelper.hasBotRigStructure(model, fromBotFolder) then
             return
         end
         if not isModelBotAlive(model) then
@@ -2439,46 +2481,64 @@ local function syncWorkspaceBots(playerCharSet)
         table.insert(candidates, { Model = model, Dist = dist })
     end
 
+    local function scanBotFolder(folder, depth)
+        if not folder or depth > 3 then
+            return
+        end
+        for _, child in ipairs(folder:GetChildren()) do
+            if child:IsA("Folder") and #child:GetChildren() <= 250 then
+                scanBotFolder(child, depth + 1)
+            else
+                considerModel(child, true)
+            end
+        end
+    end
+
     for _, folderName in ipairs(BOT_CONTAINER_NAMES) do
         local folder = Workspace:FindFirstChild(folderName)
         if folder then
-            for _, child in ipairs(folder:GetChildren()) do
-                considerModel(child)
-                if child:IsA("Folder") and #child:GetChildren() <= 200 then
-                    for _, nested in ipairs(child:GetChildren()) do
-                        considerModel(nested)
-                    end
-                end
-            end
+            scanBotFolder(folder, 1)
         end
     end
 
     for _, child in ipairs(Workspace:GetChildren()) do
         if child:IsA("Model") then
-            considerModel(child)
+            considerModel(child, false)
         end
     end
 
-    -- Periodic full Workspace Humanoid scan ensures bots & custom rigs inside any nested map folder load without aiming at them first
+    -- Periodic full Workspace Humanoid/Rig scan ensures bots inside any nested map folder load without aiming at them first
     local now = os.clock()
-    local shouldDeepBotScan = (not botsDisabledEverywhere) and (State.ReloadCount <= 2 or (now - (State.LastDeepBotScan or 0)) >= 3.5)
+    local shouldDeepBotScan = (not botsDisabledEverywhere) and (forceDeepScan == true or State.ReloadCount <= 2 or (now - (State.LastDeepBotScan or 0)) >= 2.0)
     if shouldDeepBotScan then
         State.LastDeepBotScan = now
+        local extHighlights = 0
         for _, desc in ipairs(Workspace:GetDescendants()) do
-            if desc:IsA("Humanoid") then
+            if desc:IsA("Highlight") then
+                if desc.Enabled and not desc:IsDescendantOf(HighlightContainer) then
+                    extHighlights = extHighlights + 1
+                end
+            elseif desc:IsA("Humanoid") then
                 local parentModel = desc.Parent
                 if parentModel and (parentModel:IsA("Model") or parentModel:IsA("BasePart")) then
-                    considerModel(parentModel)
+                    considerModel(parentModel, false)
+                end
+            elseif desc:IsA("AnimationController") then
+                local parentModel = desc.Parent
+                if parentModel and parentModel:IsA("Model") then
+                    considerModel(parentModel, false)
                 end
             elseif (desc:IsA("Model") or desc:IsA("BasePart")) and (desc:GetAttribute("IsBot") == true or desc:GetAttribute("IsNPC") == true or desc:GetAttribute("Enemy") == true) then
-                considerModel(desc)
+                considerModel(desc, false)
             end
         end
+        State.ExternalHighlightCount = extHighlights
+        State.LastExternalHighlightScan = now
     elseif not botsDisabledEverywhere then
         -- Keep already-registered bots fresh between full deep scans
         for key, entry in pairs(Registry) do
             if entry.IsBot and typeof(key) == "Instance" and key.Parent and isModelBotAlive(key) then
-                considerModel(key)
+                considerModel(key, true)
             end
         end
     end
@@ -2545,11 +2605,13 @@ local function clearLocalCharacterState()
     State.LastLocalPos = nil
     State.OriginalWalkSpeed = nil
     State.WalkSpeedClamped = false
+    State.WalkSpeedClampStrikes = 0
     State.LastSpeedWrite = 0
     State.LastWrittenWalkSpeed = nil
     State.OriginalJump = nil
     State.BHopMomentum = 0
     State.JumpButtonHeld = false
+    State.JumpTouchInput = nil
     State.LastGroundedTime = 0
     State.HookedJumpButton = nil
     clearTable(State.SavedNoclipParts)
@@ -2805,7 +2867,7 @@ ReloadAllSystems = function(reason, hardReset)
         destroyPlayerEntry(key)
     end
 
-    syncWorkspaceBots(playerCharSet)
+    syncWorkspaceBots(playerCharSet, hardReset == true)
     if type(State.OnSystemsReloaded) == "function" then
         pcall(State.OnSystemsReloaded)
     end
@@ -3647,16 +3709,80 @@ local function getHealthColor(ratio)
     end
 end
 
-local MAX_ACTIVE_HIGHLIGHTS = 20
+local MAX_ACTIVE_HIGHLIGHTS = 31
+
+function VisualHelper.resolveHighlightAdornee(entry)
+    local char = entry and entry.Character
+    if not char or not char.Parent then
+        return nil
+    end
+    if char:IsA("Model") or char:IsA("BasePart") then
+        return char
+    end
+    if entry.RootPart and entry.RootPart.Parent then
+        local modelAncestor = entry.RootPart:FindFirstAncestorOfClass("Model")
+        if modelAncestor and modelAncestor:IsDescendantOf(char) then
+            return modelAncestor
+        end
+        return entry.RootPart
+    end
+    return char:FindFirstChildWhichIsA("Model") or char:FindFirstChildWhichIsA("BasePart", true)
+end
+
+function VisualHelper.refreshExternalHighlightCount(now)
+    if (now - (State.LastExternalHighlightScan or 0)) < 2.2 then
+        return
+    end
+    State.LastExternalHighlightScan = now
+    local count = 0
+    if Workspace then
+        pcall(function()
+            for _, desc in ipairs(Workspace:GetDescendants()) do
+                if desc:IsA("Highlight") and desc.Enabled and not desc:IsDescendantOf(HighlightContainer) then
+                    count = count + 1
+                end
+            end
+        end)
+    end
+    if CoreGui then
+        pcall(function()
+            for _, desc in ipairs(CoreGui:GetDescendants()) do
+                if desc:IsA("Highlight") and desc.Enabled and not desc:IsDescendantOf(HighlightContainer) then
+                    count = count + 1
+                end
+            end
+        end)
+    end
+    State.ExternalHighlightCount = count
+end
 
 local function updateAllESP(camera, viewportSize, screenCenter)
+    local now = os.clock()
     local highlightCandidates = {}
+
+    if Config.ESP.Enabled and Config.ESP.HighlightESP then
+        if not HighlightContainer.Parent then
+            local okHL = pcall(function()
+                HighlightContainer.Parent = getHighlightParent()
+            end)
+            if not okHL or not HighlightContainer.Parent then
+                HighlightContainer.Parent = OverlayGui
+            end
+        end
+        VisualHelper.refreshExternalHighlightCount(now)
+    end
 
     for targetKey, entry in pairs(Registry) do
         local okTarget = pcall(function()
             if not Config.ESP.Enabled then
                 if entry.Visuals then entry.Visuals:HideAll() end
                 if entry.Highlight then entry.Highlight.Enabled = false end
+                return
+            end
+
+            if entry.IsBot and Config.ESP.IgnoreBots then
+                if entry.Visuals then entry.Visuals:HideAll() end
+                destroyHighlight(entry)
                 return
             end
 
@@ -3809,11 +3935,13 @@ local function updateAllESP(camera, viewportSize, screenCenter)
             })
 
             if Config.ESP.HighlightESP then
-                local hlAllowed = (not Config.ESP.HighlightVisibleOnly) or visState.isVisible
+                local hlAllowed = ((not Config.ESP.HighlightVisibleOnly) or visState.isVisible) and (not (entry.IsBot and Config.ESP.IgnoreBots))
                 if hlAllowed then
                     table.insert(highlightCandidates, {
                         Entry = entry,
                         TargetKey = targetKey,
+                        IsBot = (entry.IsBot == true),
+                        OnScreen = (not isBehind) and (rootOnScreen or boxValid),
                         Dist = worldDist,
                         ActiveColor = visState.activeColor,
                     })
@@ -3833,32 +3961,59 @@ local function updateAllESP(camera, viewportSize, screenCenter)
     end
 
     if Config.ESP.Enabled and Config.ESP.HighlightESP and #highlightCandidates > 0 then
+        local activeBudget = math.clamp(MAX_ACTIVE_HIGHLIGHTS - (State.ExternalHighlightCount or 0), 8, MAX_ACTIVE_HIGHLIGHTS)
         table.sort(highlightCandidates, function(a, b)
-            return a.Dist < b.Dist
+            if a.OnScreen ~= b.OnScreen then
+                return a.OnScreen
+            end
+            local aScore = a.Dist * (a.IsBot and 1.2 or 1.0)
+            local bScore = b.Dist * (b.IsBot and 1.2 or 1.0)
+            return aScore < bScore
         end)
 
         for idx, item in ipairs(highlightCandidates) do
             local entry = item.Entry
-            if idx <= MAX_ACTIVE_HIGHLIGHTS then
-                if not entry.Highlight or not entry.Highlight.Parent then
-                    local ok, hl = pcall(function()
-                        local instance = Instance.new("Highlight")
-                        instance.Name = "AKI_HL_" .. getEntryDisplayName(entry, item.TargetKey)
-                        instance.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-                        instance.Parent = HighlightContainer
-                        return instance
-                    end)
-                    if ok and hl then
-                        entry.Highlight = hl
+            if idx <= activeBudget then
+                local adornee = VisualHelper.resolveHighlightAdornee(entry)
+                if adornee then
+                    if not entry.Highlight or not entry.Highlight.Parent then
+                        local ok, hl = pcall(function()
+                            local instance = Instance.new("Highlight")
+                            instance.Name = "HlItem_" .. tostring(idx)
+                            instance.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+                            instance.FillColor = item.ActiveColor
+                            instance.OutlineColor = item.ActiveColor
+                            instance.FillTransparency = Config.ESP.HighlightFillTransparency
+                            instance.OutlineTransparency = Config.ESP.HighlightOutlineTransparency
+                            instance.Adornee = adornee
+                            instance.Enabled = true
+                            instance.Parent = HighlightContainer
+                            return instance
+                        end)
+                        if ok and hl then
+                            entry.Highlight = hl
+                            entry.HighlightDirty = false
+                            entry.LastHighlightRefresh = now
+                        end
                     end
-                end
-                if entry.Highlight then
-                    entry.Highlight.Adornee = entry.Character
-                    entry.Highlight.FillColor = item.ActiveColor
-                    entry.Highlight.OutlineColor = item.ActiveColor
-                    entry.Highlight.FillTransparency = Config.ESP.HighlightFillTransparency
-                    entry.Highlight.OutlineTransparency = Config.ESP.HighlightOutlineTransparency
-                    entry.Highlight.Enabled = true
+                    if entry.Highlight then
+                        local hl = entry.Highlight
+                        local needsRebind = (hl.Adornee ~= adornee) or (entry.HighlightDirty and (now - (entry.LastHighlightRefresh or 0)) >= 0.15)
+                        if needsRebind then
+                            hl.Adornee = nil
+                            hl.Adornee = adornee
+                            entry.HighlightDirty = false
+                            entry.LastHighlightRefresh = now
+                        end
+                        hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+                        hl.FillColor = item.ActiveColor
+                        hl.OutlineColor = item.ActiveColor
+                        hl.FillTransparency = Config.ESP.HighlightFillTransparency
+                        hl.OutlineTransparency = Config.ESP.HighlightOutlineTransparency
+                        hl.Enabled = true
+                    end
+                elseif entry.Highlight then
+                    entry.Highlight.Enabled = false
                 end
             else
                 destroyHighlight(entry)
@@ -5675,9 +5830,9 @@ local function onRenderStepFrame(dt)
         end)
     end
 
-    if (now - (State.LastBotScan or 0)) >= 1.25 then
+    if (now - (State.LastBotScan or 0)) >= 0.85 then
         State.LastBotScan = now
-        pcall(syncWorkspaceBots, nil)
+        pcall(syncWorkspaceBots, nil, false)
     end
 
     local viewportSize = camera.ViewportSize
@@ -6272,6 +6427,7 @@ end
 function UtilitiesEngine.applySpeedBoost(enabled)
     Config.Utilities.SpeedEnabled = (enabled == true)
     State.WalkSpeedClamped = false
+    State.WalkSpeedClampStrikes = 0
     State.LastWrittenWalkSpeed = nil
     local _, hum = UtilitiesEngine.getLocalMovementRefs()
     if not enabled then
@@ -6282,11 +6438,6 @@ function UtilitiesEngine.applySpeedBoost(enabled)
             end)
         end
         State.OriginalWalkSpeed = nil
-    elseif hum and hum.Parent and Config.Utilities.SpeedMethod == "CFrame" and State.OriginalWalkSpeed ~= nil then
-        local orig = State.OriginalWalkSpeed
-        pcall(function()
-            hum.WalkSpeed = orig
-        end)
     end
 end
 
@@ -6478,14 +6629,22 @@ function UtilitiesEngine.ensureTouchJumpHook()
             end
             if input.UserInputState == Enum.UserInputState.Begin and (input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1) then
                 State.JumpButtonHeld = true
+                State.JumpTouchInput = input
                 if Config.Utilities.InfiniteJump then
                     UtilitiesEngine.triggerAirJump(true)
                 end
             end
         end))
         table.insert(State.LocalConns, jumpBtn.InputEnded:Connect(function(input)
-            if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            if input == State.JumpTouchInput or input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
                 State.JumpButtonHeld = false
+                State.JumpTouchInput = nil
+            end
+        end))
+        table.insert(State.LocalConns, UserInputService.TouchEnded:Connect(function(input)
+            if State.JumpTouchInput and input == State.JumpTouchInput then
+                State.JumpButtonHeld = false
+                State.JumpTouchInput = nil
             end
         end))
     end
@@ -6534,8 +6693,8 @@ function UtilitiesEngine.stepMovement(dt)
     if Config.Utilities.JumpEnabled then
         UtilitiesEngine.syncJumpProperties(hum)
         local targetVelY = UtilitiesEngine.computeJumpVelocity(hum)
-        local nearTakeoff = (now - (State.LastGroundedTime or 0)) <= 0.12
-        if humState == Enum.HumanoidStateType.Jumping and nearTakeoff and isFiniteVector3(curVel) and curVel.Y > 2 and curVel.Y < (targetVelY * 0.85) and (now - (State.LastJumpBoostTime or 0)) >= 0.25 then
+        local nearTakeoff = (now - (State.LastGroundedTime or 0)) <= 0.05
+        if humState == Enum.HumanoidStateType.Jumping and nearTakeoff and isFiniteVector3(curVel) and curVel.Y > 2 and curVel.Y < (targetVelY * 0.65) and (now - (State.LastJumpBoostTime or 0)) >= 0.25 then
             State.LastJumpBoostTime = now
             root.AssemblyLinearVelocity = Vector3.new(curVel.X, targetVelY, curVel.Z)
             curVel = Vector3.new(curVel.X, targetVelY, curVel.Z)
@@ -6587,19 +6746,25 @@ function UtilitiesEngine.stepMovement(dt)
         local useWalkSpeedMethod = (method == "WalkSpeed") or (method == "Hybrid" and not State.WalkSpeedClamped)
 
         if useWalkSpeedMethod then
-            -- Detect if game anti-speed immediately snaps WalkSpeed down in Hybrid mode
             if method == "Hybrid"
                 and State.LastWrittenWalkSpeed ~= nil
-                and (now - (State.LastSpeedWrite or 0)) > 0.04
+                and math.abs(State.LastWrittenWalkSpeed - desiredSpeed) < 0.25
+                and (now - (State.LastSpeedWrite or 0)) > 0.05
                 and (now - (State.LastSpeedWrite or 0)) < 0.35
-                and hum.WalkSpeed < (State.LastWrittenWalkSpeed - 1.5)
+                and hum.WalkSpeed < (desiredSpeed - 1.5)
             then
-                State.WalkSpeedClamped = true
-                useWalkSpeedMethod = false
+                State.WalkSpeedClampStrikes = (State.WalkSpeedClampStrikes or 0) + 1
+                if State.WalkSpeedClampStrikes >= 5 then
+                    State.WalkSpeedClamped = true
+                    useWalkSpeedMethod = false
+                end
             elseif math.abs(hum.WalkSpeed - desiredSpeed) > 0.15 then
+                State.WalkSpeedClampStrikes = 0
                 hum.WalkSpeed = desiredSpeed
                 State.LastWrittenWalkSpeed = desiredSpeed
                 State.LastSpeedWrite = now
+            else
+                State.WalkSpeedClampStrikes = 0
             end
         end
 
@@ -6609,23 +6774,22 @@ function UtilitiesEngine.stepMovement(dt)
             local extraSpeed = desiredSpeed - activeWalk
             local needsFallbackMove = (not useWalkSpeedMethod) and extraSpeed > 0.25
 
-            if isAirborne then
-                -- Mid-air: ONLY steer horizontal X/Z AssemblyLinearVelocity while preserving live Y untouched (zero CFrame stutter)
-                if needsFallbackMove or Config.Utilities.BunnyHop then
-                    local liveVel = root.AssemblyLinearVelocity
-                    if isFiniteVector3(liveVel) then
-                        local horizCur = Vector3.new(liveVel.X, 0, liveVel.Z)
-                        local horizTarget = dirUnit * desiredSpeed
-                        local alpha = Config.Utilities.BunnyHop and 0.35 or 0.55
-                        local blended = horizCur:Lerp(horizTarget, alpha)
-                        root.AssemblyLinearVelocity = Vector3.new(blended.X, liveVel.Y, blended.Z)
-                    end
-                end
-            elseif needsFallbackMove and (now - (State.LastJumpTime or 0)) >= 0.06 then
-                -- Grounded CFrame fallback: strictly X/Z horizontal displacement, never modifying Y
+            -- Consistent pure horizontal X/Z CFrame step when CFrame mode / anti-speed fallback is active (zero Y touch, zero jump stutter)
+            if needsFallbackMove then
                 local safeDt = math.clamp(dt or (1 / 60), 0.001, 0.05)
                 local step = extraSpeed * safeDt
                 root.CFrame = root.CFrame + Vector3.new(dirUnit.X * step, 0, dirUnit.Z * step)
+            end
+
+            -- Dedicated BHop air-strafe preserves live vertical Y velocity verbatim
+            if Config.Utilities.BunnyHop and isAirborne then
+                local liveVel = root.AssemblyLinearVelocity
+                if isFiniteVector3(liveVel) then
+                    local horizCur = Vector3.new(liveVel.X, 0, liveVel.Z)
+                    local horizTarget = dirUnit * desiredSpeed
+                    local blended = horizCur:Lerp(horizTarget, 0.32)
+                    root.AssemblyLinearVelocity = Vector3.new(blended.X, liveVel.Y, blended.Z)
+                end
             end
         end
     end
@@ -6633,11 +6797,13 @@ end
 
 function UtilitiesEngine.syncAll(preserveClamp)
     local prevClamped = State.WalkSpeedClamped
+    local prevStrikes = State.WalkSpeedClampStrikes
     UtilitiesEngine.applyFullbright(Config.Utilities.Fullbright)
     UtilitiesEngine.applyNoclip(Config.Utilities.Noclip)
     UtilitiesEngine.applySpeedBoost(Config.Utilities.SpeedEnabled)
     if preserveClamp and Config.Utilities.SpeedEnabled then
         State.WalkSpeedClamped = prevClamped
+        State.WalkSpeedClampStrikes = prevStrikes
     end
     UtilitiesEngine.applyJumpHeight(Config.Utilities.JumpEnabled)
     UtilitiesEngine.applyBunnyHop(Config.Utilities.BunnyHop)
@@ -7533,9 +7699,19 @@ local function SyncDependentSettings(needsFullReload, reason, skipSave)
             if entry.Visuals then entry.Visuals:HideAll() end
             if entry.Highlight then entry.Highlight.Enabled = false end
         end
-    elseif not Config.ESP.HighlightESP then
-        for _, entry in pairs(Registry) do
-            if entry.Highlight then entry.Highlight.Enabled = false end
+    else
+        if not Config.ESP.HighlightESP then
+            for _, entry in pairs(Registry) do
+                if entry.Highlight then entry.Highlight.Enabled = false end
+            end
+        end
+        if Config.ESP.IgnoreBots then
+            for _, entry in pairs(Registry) do
+                if entry.IsBot then
+                    destroyHighlight(entry)
+                    if entry.Visuals then entry.Visuals:HideAll() end
+                end
+            end
         end
     end
     State.LastTeamScan = -1
@@ -8336,7 +8512,22 @@ do
         return Config.Aimbot.IgnoreBots
     end, function(v)
         Config.Aimbot.IgnoreBots = v
-        syncWorkspaceBots()
+        if Config.ESP.SyncIgnoreBots then
+            Config.TriggerBot.IgnoreBots = v
+            Config.ESP.IgnoreBots = v
+            for _, sync in ipairs(SyncCallbacks) do
+                pcall(sync)
+            end
+        end
+        if Config.ESP.IgnoreBots then
+            for _, entry in pairs(Registry) do
+                if entry.IsBot then
+                    destroyHighlight(entry)
+                    if entry.Visuals then entry.Visuals:HideAll() end
+                end
+            end
+        end
+        syncWorkspaceBots(nil, not v)
     end)
 
     addToggle(AimbotPage, 15, "Team Check", "Skips teammates (FFA-safe Auto mode)", function()
@@ -8723,7 +8914,22 @@ do
         return Config.TriggerBot.IgnoreBots
     end, function(v)
         Config.TriggerBot.IgnoreBots = v
-        syncWorkspaceBots()
+        if Config.ESP.SyncIgnoreBots then
+            Config.Aimbot.IgnoreBots = v
+            Config.ESP.IgnoreBots = v
+            for _, sync in ipairs(SyncCallbacks) do
+                pcall(sync)
+            end
+        end
+        if Config.ESP.IgnoreBots then
+            for _, entry in pairs(Registry) do
+                if entry.IsBot then
+                    destroyHighlight(entry)
+                    if entry.Visuals then entry.Visuals:HideAll() end
+                end
+            end
+        end
+        syncWorkspaceBots(nil, not v)
     end)
 
     addToggle(TriggerPage, 15, "Trigger Team Check", "Never shoots teammates (FFA-safe Auto mode)", function()
@@ -8767,10 +8973,13 @@ do
         Config.ESP.BoxStyle = v
     end, false)
 
-    addToggle(EspPage, 5, "Highlight ESP", "AlwaysOnTop silhouette reactive to visibility", function()
+    addToggle(EspPage, 5, "Highlight ESP", "AlwaysOnTop silhouette synced with Ignore Bots", function()
         return Config.ESP.HighlightESP
     end, function(v)
         Config.ESP.HighlightESP = v
+        if v and not Config.ESP.IgnoreBots then
+            syncWorkspaceBots(nil, true)
+        end
     end)
 
     addToggle(EspPage, 6, "Highlight Visible Only", "Hide highlight when enemy is behind walls", function()
@@ -8834,22 +9043,52 @@ do
         return Config.ESP.IgnoreBots
     end, function(v)
         Config.ESP.IgnoreBots = v
-        syncWorkspaceBots()
+        if Config.ESP.SyncIgnoreBots then
+            Config.Aimbot.IgnoreBots = v
+            Config.TriggerBot.IgnoreBots = v
+            for _, sync in ipairs(SyncCallbacks) do
+                pcall(sync)
+            end
+        end
+        if v then
+            for _, entry in pairs(Registry) do
+                if entry.IsBot then
+                    destroyHighlight(entry)
+                    if entry.Visuals then entry.Visuals:HideAll() end
+                end
+            end
+        end
+        syncWorkspaceBots(nil, not v)
     end)
 
-    addToggle(EspPage, 19, "ESP Team Check", "Hides ESP elements for teammates (FFA-safe)", function()
+    addToggle(EspPage, 19, "Sync Ignore Bots (All)", "Links Aimbot, Trigger & ESP/Highlight Ignore Bots", function()
+        return Config.ESP.SyncIgnoreBots
+    end, function(v)
+        Config.ESP.SyncIgnoreBots = v
+        if v then
+            local flag = Config.ESP.IgnoreBots
+            Config.Aimbot.IgnoreBots = flag
+            Config.TriggerBot.IgnoreBots = flag
+            for _, sync in ipairs(SyncCallbacks) do
+                pcall(sync)
+            end
+            syncWorkspaceBots(nil, not flag)
+        end
+    end)
+
+    addToggle(EspPage, 20, "ESP Team Check", "Hides ESP elements for teammates (FFA-safe)", function()
         return Config.ESP.TeamCheck
     end, function(v)
         Config.ESP.TeamCheck = v
     end)
 
-    addToggle(EspPage, 20, "Master Visible Filter", "Hides all ESP completely when behind walls", function()
+    addToggle(EspPage, 21, "Master Visible Filter", "Hides all ESP completely when behind walls", function()
         return Config.ESP.VisibleCheck
     end, function(v)
         Config.ESP.VisibleCheck = v
     end)
 
-    addToggle(EspPage, 21, "Color By Visibility", "Tints Box, Tracer & 360° Alert by line-of-sight", function()
+    addToggle(EspPage, 22, "Color By Visibility", "Tints Box, Tracer & 360° Alert by line-of-sight", function()
         return Config.ESP.ColorByVisibility
     end, function(v)
         Config.ESP.ColorByVisibility = v
