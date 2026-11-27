@@ -1746,6 +1746,64 @@ local function isCandidateModelForPlayer(model, player)
     return true, isAlive
 end
 
+function VisualHelper.isLocalTargetOrOwned(candidate, entry)
+    if candidate == LocalPlayer then
+        return true
+    end
+    if entry and (entry.Player == LocalPlayer or entry.Key == LocalPlayer) then
+        return true
+    end
+
+    local lc1 = State.LocalCharacter
+    local lc2 = LocalPlayer and LocalPlayer.Character
+    local cam = State.Camera or Workspace.CurrentCamera
+
+    local function checkObj(obj)
+        if obj == nil then
+            return false
+        end
+        if obj == LocalPlayer then
+            return true
+        end
+        if typeof(obj) ~= "Instance" then
+            return false
+        end
+        if obj == lc1 or obj == lc2 or obj == cam or obj:IsDescendantOf(LocalPlayer) then
+            return true
+        end
+        if lc1 and obj:IsDescendantOf(lc1) then
+            return true
+        end
+        if lc2 and obj:IsDescendantOf(lc2) then
+            return true
+        end
+        if cam and obj:IsDescendantOf(cam) then
+            return true
+        end
+        if obj:IsA("Model") then
+            local owner = Players:GetPlayerFromCharacter(obj)
+            if owner == LocalPlayer then
+                return true
+            end
+        end
+        if obj:IsA("Model") or obj:IsA("BasePart") then
+            local okMatch = isCandidateModelForPlayer(obj, LocalPlayer)
+            if okMatch then
+                return true
+            end
+        end
+        return false
+    end
+
+    if checkObj(candidate) then
+        return true
+    end
+    if entry and entry.Character and checkObj(entry.Character) then
+        return true
+    end
+    return false
+end
+
 local function scanContainerForPlayer(container, player)
     if not container then
         return nil
@@ -1776,6 +1834,9 @@ local function scanContainerForPlayer(container, player)
 end
 
 local function resolveCharacterForPlayer(player, allowDeepScan)
+    if not player or player == LocalPlayer then
+        return nil
+    end
     local directChar = player.Character
     if directChar and directChar.Parent then
         if directChar:IsDescendantOf(Workspace) and hasInstanceParts(directChar) then
@@ -2033,7 +2094,7 @@ local function deepWorkspaceScanForMissingPlayers(missingPlayers)
     end
 
     for _, desc in ipairs(Workspace:GetDescendants()) do
-        if (desc:IsA("Model") or desc:IsA("BasePart")) and desc ~= State.LocalCharacter then
+        if (desc:IsA("Model") or desc:IsA("BasePart")) and not VisualHelper.isLocalTargetOrOwned(desc) then
             local directOwner = desc:IsA("Model") and Players:GetPlayerFromCharacter(desc) or nil
             if directOwner and remaining[directOwner] and hasInstanceParts(desc) then
                 foundMap[directOwner] = desc
@@ -2134,7 +2195,7 @@ end
 
 local function bindCharacterToEntry(entry, character)
     clearCharacterFromEntry(entry)
-    if not character or State.Unloaded then
+    if not character or State.Unloaded or entry.Player == LocalPlayer or VisualHelper.isLocalTargetOrOwned(character, entry) then
         return
     end
 
@@ -2194,7 +2255,7 @@ local function destroyPlayerEntry(targetKey)
 end
 
 local function registerPlayerEntry(player)
-    if player == LocalPlayer or Registry[player] or State.Unloaded then
+    if not player or player == LocalPlayer or Registry[player] or State.Unloaded then
         return
     end
 
@@ -2332,7 +2393,7 @@ local function isModelBotAlive(model)
 end
 
 local function registerBotEntry(botModel)
-    if not botModel or Registry[botModel] or State.Unloaded then
+    if not botModel or Registry[botModel] or State.Unloaded or VisualHelper.isLocalTargetOrOwned(botModel) then
         return
     end
     local bundle = createRegistryVisualBundle()
@@ -2429,8 +2490,18 @@ local function syncWorkspaceBots(playerCharSet, forceDeepScan)
     local candidateSeen = {}
     local playerList = Players:GetPlayers()
 
+    local localPurge = {}
+    for key, entry in pairs(Registry) do
+        if VisualHelper.isLocalTargetOrOwned(key, entry) then
+            table.insert(localPurge, key)
+        end
+    end
+    for _, key in ipairs(localPurge) do
+        destroyPlayerEntry(key)
+    end
+
     local function considerModel(model, fromBotFolder)
-        if not model or candidateSeen[model] or charLookup[model] then
+        if not model or candidateSeen[model] or charLookup[model] or VisualHelper.isLocalTargetOrOwned(model) then
             return
         end
         if not (model:IsA("Model") or model:IsA("BasePart")) then
@@ -2450,6 +2521,10 @@ local function syncWorkspaceBots(playerCharSet, forceDeepScan)
                     bindCharacterToEntry(pEntry, model)
                 end
             end
+            charLookup[model] = true
+            return
+        end
+        if isCandidateModelForPlayer(model, LocalPlayer) then
             charLookup[model] = true
             return
         end
@@ -2640,6 +2715,15 @@ local function bindLocalCharacter(character)
 
     State.LocalCharacter = character
     State.Camera = Workspace.CurrentCamera
+    local purgeLocal = {}
+    for key, entry in pairs(Registry) do
+        if VisualHelper.isLocalTargetOrOwned(key, entry) then
+            table.insert(purgeLocal, key)
+        end
+    end
+    for _, key in ipairs(purgeLocal) do
+        destroyPlayerEntry(key)
+    end
     State.LocalHumanoid = character:FindFirstChildOfClass("Humanoid")
     State.LocalRootPart = character:FindFirstChild("HumanoidRootPart")
         or character.PrimaryPart
@@ -2851,7 +2935,9 @@ ReloadAllSystems = function(reason, hardReset)
         playerCharSet[LocalPlayer.Character] = true
     end
     for key, entry in pairs(Registry) do
-        if entry.IsBot then
+        if key == LocalPlayer or VisualHelper.isLocalTargetOrOwned(key, entry) then
+            table.insert(toRemove, key)
+        elseif entry.IsBot then
             if entry.Character then
                 playerCharSet[entry.Character] = false
             end
@@ -2889,6 +2975,9 @@ ScheduleReload = function(reason, hardReset)
 end
 
 addConnection(Players.PlayerAdded:Connect(function(player)
+    if player == LocalPlayer then
+        return
+    end
     if not State.Unloaded then
         State.LastTeamScan = -1
         pcall(registerPlayerEntry, player)
@@ -3448,9 +3537,11 @@ local function raycastPointVisible(camera, targetCharacter, targetPos)
     end
 
     local filterList = {OverlayGui, HighlightContainer, camera, targetCharacter}
-    local localChar = State.LocalCharacter or LocalPlayer.Character
-    if localChar then
-        table.insert(filterList, localChar)
+    if State.LocalCharacter then
+        table.insert(filterList, State.LocalCharacter)
+    end
+    if LocalPlayer.Character and LocalPlayer.Character ~= State.LocalCharacter then
+        table.insert(filterList, LocalPlayer.Character)
     end
 
     RayParams.FilterType = Enum.RaycastFilterType.Exclude
@@ -3540,6 +3631,9 @@ local function IsValidTarget(targetKey, opts)
     end
 
     local entry = Registry[targetKey]
+    if VisualHelper.isLocalTargetOrOwned(targetKey, entry) then
+        return false, entry, nil, math.huge
+    end
     if not isEntryAlive(entry) then
         return false, entry, nil, math.huge
     end
@@ -3774,6 +3868,12 @@ local function updateAllESP(camera, viewportSize, screenCenter)
 
     for targetKey, entry in pairs(Registry) do
         local okTarget = pcall(function()
+            if targetKey == LocalPlayer or VisualHelper.isLocalTargetOrOwned(targetKey, entry) then
+                if entry and entry.Visuals then entry.Visuals:HideAll() end
+                if entry then destroyHighlight(entry) end
+                return
+            end
+
             if not Config.ESP.Enabled then
                 if entry.Visuals then entry.Visuals:HideAll() end
                 if entry.Highlight then entry.Highlight.Enabled = false end
@@ -4286,8 +4386,11 @@ local function resolveTargetVelocity(entry, part, targetPos, dt, readOnly)
 end
 
 local function evaluateAimCandidate(targetKey, camera, screenCenter)
+    if not targetKey or targetKey == LocalPlayer then
+        return false, nil, nil, math.huge, math.huge
+    end
     local entry = Registry[targetKey]
-    if not entry then
+    if not entry or VisualHelper.isLocalTargetOrOwned(targetKey, entry) then
         return false, nil, nil, math.huge, math.huge
     end
 
@@ -4331,9 +4434,11 @@ function VisualHelper.raycastSolidMovementPath(origin, offsetVec, targetCharacte
     if targetCharacter then
         table.insert(filterList, targetCharacter)
     end
-    local localChar = State.LocalCharacter or LocalPlayer.Character
-    if localChar then
-        table.insert(filterList, localChar)
+    if State.LocalCharacter then
+        table.insert(filterList, State.LocalCharacter)
+    end
+    if LocalPlayer.Character and LocalPlayer.Character ~= State.LocalCharacter then
+        table.insert(filterList, LocalPlayer.Character)
     end
     local cam = State.Camera or Workspace.CurrentCamera
     if cam then
@@ -4506,14 +4611,16 @@ local function updateAimbot(camera, screenCenter, dt)
         local bestPart = nil
         local bestWorldDist = 0
 
-        for targetKey in pairs(Registry) do
-            local okCall, ok, entry, part, screenDist, worldDist = pcall(evaluateAimCandidate, targetKey, camera, screenCenter)
-            if okCall and ok and entry and part and screenDist < bestScreenDist then
-                bestScreenDist = screenDist
-                bestKey = targetKey
-                bestEntry = entry
-                bestPart = part
-                bestWorldDist = worldDist
+        for targetKey, entry in pairs(Registry) do
+            if targetKey ~= LocalPlayer and not VisualHelper.isLocalTargetOrOwned(targetKey, entry) then
+                local okCall, ok, candEntry, part, screenDist, worldDist = pcall(evaluateAimCandidate, targetKey, camera, screenCenter)
+                if okCall and ok and candEntry and part and screenDist < bestScreenDist then
+                    bestScreenDist = screenDist
+                    bestKey = targetKey
+                    bestEntry = candEntry
+                    bestPart = part
+                    bestWorldDist = worldDist
+                end
             end
         end
 
@@ -5379,22 +5486,26 @@ local function partMatchesTriggerFilter(part, entry)
 end
 
 local function findEntryForHitPart(hitPart)
-    if not hitPart then
+    if not hitPart or VisualHelper.isLocalTargetOrOwned(hitPart) then
         return nil, nil
     end
     for player, entry in pairs(Registry) do
-        if entry.Character and hitPart:IsDescendantOf(entry.Character) then
-            return player, entry
+        if player ~= LocalPlayer and not VisualHelper.isLocalTargetOrOwned(player, entry) then
+            if entry.Character and hitPart:IsDescendantOf(entry.Character) then
+                return player, entry
+            end
         end
     end
 
-    local localChar = State.LocalCharacter or LocalPlayer.Character
     local cur = hitPart.Parent
     for _ = 1, 8 do
         if not cur or cur == Workspace or cur == game then
             break
         end
-        if cur ~= localChar and cur:IsA("Model") then
+        if VisualHelper.isLocalTargetOrOwned(cur) then
+            return nil, nil
+        end
+        if cur:IsA("Model") then
             local plr = Players:GetPlayerFromCharacter(cur)
             if not plr then
                 for _, p in ipairs(Players:GetPlayers()) do
@@ -5436,9 +5547,11 @@ local function findTriggerTarget(camera, screenCenter, dt)
     local dirUnit = centerRay.Direction.Unit
 
     local filterList = {OverlayGui, HighlightContainer, camera}
-    local localChar = State.LocalCharacter or LocalPlayer.Character
-    if localChar then
-        table.insert(filterList, localChar)
+    if State.LocalCharacter then
+        table.insert(filterList, State.LocalCharacter)
+    end
+    if LocalPlayer.Character and LocalPlayer.Character ~= State.LocalCharacter then
+        table.insert(filterList, LocalPlayer.Character)
     end
 
     RayParams.FilterType = Enum.RaycastFilterType.Exclude
@@ -5547,14 +5660,15 @@ local function findTriggerTarget(camera, screenCenter, dt)
         local bestScreenDist = sweepTol + 0.001
 
         for targetKey, entry in pairs(Registry) do
-            local checkParts
-            if Config.TriggerBot.TargetFilter == "Head Only" then
-                checkParts = {entry.Head}
-            elseif Config.TriggerBot.TargetFilter == "Head & Chest" then
-                checkParts = {entry.Head, entry.Torso, entry.RootPart}
-            else
-                checkParts = (#entry.RigParts > 0) and entry.RigParts or {entry.Head, entry.Torso, entry.RootPart}
-            end
+            if targetKey ~= LocalPlayer and not VisualHelper.isLocalTargetOrOwned(targetKey, entry) then
+                local checkParts
+                if Config.TriggerBot.TargetFilter == "Head Only" then
+                    checkParts = {entry.Head}
+                elseif Config.TriggerBot.TargetFilter == "Head & Chest" then
+                    checkParts = {entry.Head, entry.Torso, entry.RootPart}
+                else
+                    checkParts = (#entry.RigParts > 0) and entry.RigParts or {entry.Head, entry.Torso, entry.RootPart}
+                end
 
             for _, part in ipairs(checkParts) do
                 if part and part.Parent and isFiniteVector3(part.Position) then
@@ -5616,6 +5730,7 @@ local function findTriggerTarget(camera, screenCenter, dt)
                         end
                     end
                 end
+            end
             end
         end
 
