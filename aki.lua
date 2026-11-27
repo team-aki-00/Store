@@ -257,6 +257,14 @@ local Config = {
         TeamCheckMode = "Auto",         -- "Auto" (FFA-aware) | "Team Property" | "TeamColor" | "Off"
         CustomContainerScan = true,
     },
+    Utilities = {
+        SpeedEnabled = false,
+        WalkSpeed = 24,
+        SpeedMethod = "Hybrid",         -- "Hybrid" | "WalkSpeed" | "CFrame"
+        Noclip = false,
+        InfiniteJump = false,
+        Fullbright = false,
+    },
     Performance = {
         PotatoGraphics = false,         -- Aggressive FPS booster (lowers quality, shadows, effects, textures)
     },
@@ -285,6 +293,7 @@ local DefaultConfig = {
     TriggerBot = shallowClone(Config.TriggerBot),
     ESP = shallowClone(Config.ESP),
     Resolver = shallowClone(Config.Resolver),
+    Utilities = shallowClone(Config.Utilities),
     Performance = shallowClone(Config.Performance),
     Colors = shallowClone(Config.Colors),
     UI = shallowClone(Config.UI),
@@ -320,6 +329,11 @@ local State = {
     ColorListeners = {},
     SavedGraphics = nil,
     PotatoDescConn = nil,
+    SavedFullbright = nil,
+    FullbrightConn = nil,
+    ApplyingFullbright = false,
+    SavedNoclipParts = {},
+    OriginalWalkSpeed = nil,
     FrameIndex = 0,
     LastRenderTick = 0,
     ReloadCount = 0,
@@ -558,6 +572,25 @@ function ConfigStore.sanitizeConfig()
     Config.ESP.Alert360Thickness = math.clamp(math.round((Config.ESP.Alert360Thickness or 1.5) * 10) / 10, 0.1, 10.0)
     Config.TriggerBot.PointerScaleX = math.clamp(Config.TriggerBot.PointerScaleX or 0.84, 0.04, 0.96)
     Config.TriggerBot.PointerScaleY = math.clamp(Config.TriggerBot.PointerScaleY or 0.68, 0.06, 0.94)
+    Config.Utilities.WalkSpeed = math.clamp(math.round(tonumber(Config.Utilities.WalkSpeed) or 24), 16, 150)
+    if Config.Utilities.SpeedMethod ~= "Hybrid"
+        and Config.Utilities.SpeedMethod ~= "WalkSpeed"
+        and Config.Utilities.SpeedMethod ~= "CFrame"
+    then
+        Config.Utilities.SpeedMethod = "Hybrid"
+    end
+    if Config.Aimbot.TargetPart == "Nearest Visible" then
+        Config.Aimbot.TargetPart = "Closest"
+    end
+    if Config.UI.ActiveTab ~= "Aimbot"
+        and Config.UI.ActiveTab ~= "Trigger"
+        and Config.UI.ActiveTab ~= "ESP"
+        and Config.UI.ActiveTab ~= "Utilities"
+        and Config.UI.ActiveTab ~= "Colors"
+        and Config.UI.ActiveTab ~= "Settings"
+    then
+        Config.UI.ActiveTab = "Aimbot"
+    end
     if Config.TriggerBot.Mode ~= "VirtualInputManager"
         and Config.TriggerBot.Mode ~= "firesignal"
         and Config.TriggerBot.Mode ~= "Tool:Activate()"
@@ -592,6 +625,7 @@ function ConfigStore.saveNow()
             TriggerBot = Config.TriggerBot,
             ESP = Config.ESP,
             Resolver = Config.Resolver,
+            Utilities = Config.Utilities,
             Performance = Config.Performance,
             Colors = Config.Colors,
             UI = Config.UI,
@@ -661,6 +695,7 @@ function ConfigStore.loadNow()
     ConfigStore.applyTable(Config.TriggerBot, decoded.TriggerBot)
     ConfigStore.applyTable(Config.ESP, decoded.ESP)
     ConfigStore.applyTable(Config.Resolver, decoded.Resolver)
+    ConfigStore.applyTable(Config.Utilities, decoded.Utilities)
     ConfigStore.applyTable(Config.Performance, decoded.Performance)
     ConfigStore.applyTable(Config.Colors, decoded.Colors)
     ConfigStore.applyTable(Config.UI, decoded.UI)
@@ -672,6 +707,7 @@ function ConfigStore.loadNow()
                 TriggerBot = Config.TriggerBot,
                 ESP = Config.ESP,
                 Resolver = Config.Resolver,
+                Utilities = Config.Utilities,
                 Performance = Config.Performance,
                 Colors = Config.Colors,
                 UI = Config.UI,
@@ -808,6 +844,61 @@ function VisualHelper.resolveDrawingThickness(rawT, baseOpacity)
         op = math.clamp(op * (0.42 + t * 0.58), 0.35, op)
     end
     return phys, op
+end
+
+function VisualHelper.readHealthNumeric(inst, keys)
+    if not inst then
+        return nil
+    end
+    for _, key in ipairs(keys) do
+        local okAttr, attr = pcall(function()
+            return inst:GetAttribute(key)
+        end)
+        if okAttr and type(attr) == "number" and isFiniteNumber(attr) then
+            return attr
+        end
+    end
+    for _, key in ipairs(keys) do
+        local child = inst:FindFirstChild(key)
+        if child and (child:IsA("NumberValue") or child:IsA("IntValue")) then
+            local val = child.Value
+            if isFiniteNumber(val) then
+                return val
+            end
+        end
+    end
+    return nil
+end
+
+function VisualHelper.readCustomHealth(entry)
+    local containers = {}
+    local function pushContainer(c)
+        if not c then return end
+        table.insert(containers, c)
+        for _, subName in ipairs({"Stats", "Values", "Status", "Data", "HealthValues", "leaderstats", "Attributes"}) do
+            local sub = c:FindFirstChild(subName)
+            if sub then
+                table.insert(containers, sub)
+            end
+        end
+    end
+    pushContainer(entry.Character)
+    pushContainer(entry.Humanoid)
+    pushContainer(entry.Player)
+
+    local hpKeys = {"CurrentHealth", "CurrHealth", "CurHealth", "CurrentHP", "Health", "HP"}
+    local maxKeys = {"MaxHealth", "MaxHP", "Max_Health"}
+    local shieldKeys = {"Shield", "Shields", "Armor", "Overshield"}
+    local maxShieldKeys = {"MaxShield", "MaxShields", "MaxArmor"}
+
+    local hp, maxHp, shield, maxShield = nil, nil, nil, nil
+    for _, c in ipairs(containers) do
+        if hp == nil then hp = VisualHelper.readHealthNumeric(c, hpKeys) end
+        if maxHp == nil then maxHp = VisualHelper.readHealthNumeric(c, maxKeys) end
+        if shield == nil then shield = VisualHelper.readHealthNumeric(c, shieldKeys) end
+        if maxShield == nil then maxShield = VisualHelper.readHealthNumeric(c, maxShieldKeys) end
+    end
+    return hp, maxHp, shield, maxShield
 end
 
 -- FOV Circle (ScreenGui + optional Drawing synced cleanly)
@@ -1205,7 +1296,10 @@ local function createRegistryVisualBundle()
                         if d.HpText then
                             if state.ShowHealthText and state.BH >= 14 then
                                 d.HpText.Visible = true
-                                d.HpText.Text = string.format("%d%%", math.round(state.HealthRatio * 100))
+                                local pct = math.round(state.HealthRatio * 100)
+                                d.HpText.Text = (state.ShieldAmount and state.ShieldAmount >= 1)
+                                    and string.format("%d%%+%d", pct, math.round(state.ShieldAmount))
+                                    or string.format("%d%%", pct)
                                 d.HpText.Color = state.HealthColor
                                 d.HpText.Position = Vector2.new(barX - 30, math.clamp(barY + (barH - fillH) - 6, barY - 2, barY + barH - 10))
                             else
@@ -1338,7 +1432,10 @@ local function createRegistryVisualBundle()
 
                 if state.ShowHealthText and state.BH >= 14 then
                     hpTextLabel.Visible = true
-                    hpTextLabel.Text = string.format("%d%%", math.round(state.HealthRatio * 100))
+                    local pct = math.round(state.HealthRatio * 100)
+                    hpTextLabel.Text = (state.ShieldAmount and state.ShieldAmount >= 1)
+                        and string.format("%d%%+%d", pct, math.round(state.ShieldAmount))
+                        or string.format("%d%%", pct)
                     hpTextLabel.TextColor3 = state.HealthColor
                     hpTextLabel.Position = UDim2.fromOffset(state.BX - 9, math.clamp(state.BY + barH * (1 - state.HealthRatio), state.BY, state.BY + barH))
                 else
@@ -2146,6 +2243,12 @@ local function syncWorkspaceBots(playerCharSet)
         if Players:GetPlayerFromCharacter(model) ~= nil then
             return
         end
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if isCandidateModelForPlayer(model, plr) then
+                charLookup[model] = true
+                return
+            end
+        end
         local hasHum = model:FindFirstChildOfClass("Humanoid") ~= nil
         local hasBotTag = (model:GetAttribute("IsBot") == true) or (model:GetAttribute("IsNPC") == true) or (model:GetAttribute("Enemy") == true)
         if not hasHum and not hasBotTag then
@@ -2231,6 +2334,8 @@ local function clearLocalCharacterState()
     State.LocalRootPart = nil
     State.LocalAlive = false
     State.LastLocalPos = nil
+    State.OriginalWalkSpeed = nil
+    clearTable(State.SavedNoclipParts)
     State.CurrentAimTarget = nil
     State.CurrentAimPart = nil
     State.CurrentAimPredictedPos = nil
@@ -2890,34 +2995,51 @@ end
 
 local function getCharacterHealth(entry)
     local hum = entry.Humanoid
-    if hum and hum.Parent then
-        local maxHp = hum.MaxHealth > 0 and hum.MaxHealth or 100
-        local hp = math.clamp(hum.Health, 0, maxHp)
-        return hp, maxHp, math.clamp(hp / maxHp, 0, 1)
-    end
-
-    local char = entry.Character
-    if char then
-        local hpVal = char:FindFirstChild("Health") or char:FindFirstChild("HP")
-        local maxVal = char:FindFirstChild("MaxHealth") or char:FindFirstChild("MaxHP")
-        if hpVal and (hpVal:IsA("NumberValue") or hpVal:IsA("IntValue")) then
-            local maxHp = (maxVal and (maxVal:IsA("NumberValue") or maxVal:IsA("IntValue")) and maxVal.Value > 0) and maxVal.Value or 100
-            local hp = math.clamp(hpVal.Value, 0, maxHp)
-            return hp, maxHp, math.clamp(hp / maxHp, 0, 1)
-        end
-
-        local attrHp = char:GetAttribute("Health")
-        if attrHp == nil then attrHp = char:GetAttribute("HP") end
-        local attrMax = char:GetAttribute("MaxHealth")
-        if attrMax == nil then attrMax = char:GetAttribute("MaxHP") end
-        if type(attrHp) == "number" then
-            local maxHp = (type(attrMax) == "number" and attrMax > 0) and attrMax or 100
-            local hp = math.clamp(attrHp, 0, maxHp)
-            return hp, maxHp, math.clamp(hp / maxHp, 0, 1)
+    local humValid = hum ~= nil and hum.Parent ~= nil
+    local humHp = 0
+    local humMax = 0
+    if humValid then
+        local okH, rawHp, rawMax = pcall(function()
+            return hum.Health, hum.MaxHealth
+        end)
+        if okH and isFiniteNumber(rawHp) and isFiniteNumber(rawMax) then
+            humHp = rawHp
+            humMax = rawMax
+        else
+            humValid = false
         end
     end
 
-    return 100, 100, 1
+    local customHp, customMax, customShield = VisualHelper.readCustomHealth(entry)
+    local safeShield = (type(customShield) == "number" and customShield > 0) and customShield or 0
+
+    -- Standard active Humanoid takes priority if it is actively changing below MaxHealth
+    if humValid and humMax > 0 and humHp > 0 and humHp < (humMax - 0.01) then
+        entry.UseCustomHealth = false
+        return humHp, humMax, math.clamp(humHp / humMax, 0, 1), safeShield
+    end
+
+    -- Intelligent custom health fallback (covers custom HP/Shield systems or locked 100/100 humanoids)
+    if customHp ~= nil then
+        local effectiveMax = (customMax and customMax > 0) and customMax or ((humValid and humMax > 0) and humMax or 100)
+        local shouldUseCustom = (not humValid)
+            or entry.UseCustomHealth
+            or (customMax ~= nil and math.abs(customMax - humMax) > 1)
+            or (humMax > 0 and humHp >= (humMax - 0.01) and customHp < effectiveMax and customHp >= 0)
+        if shouldUseCustom then
+            entry.UseCustomHealth = true
+            local clampedHp = math.clamp(customHp, 0, effectiveMax)
+            return clampedHp, effectiveMax, math.clamp(clampedHp / effectiveMax, 0, 1), safeShield
+        end
+    end
+
+    if humValid then
+        local maxHp = (humMax > 0) and humMax or 100
+        local hp = math.clamp(humHp, 0, maxHp)
+        return hp, maxHp, math.clamp(hp / maxHp, 0, 1), safeShield
+    end
+
+    return 100, 100, 1, safeShield
 end
 
 local function isEntryAlive(entry)
@@ -2929,24 +3051,31 @@ local function isEntryAlive(entry)
         return false
     end
 
+    if char:GetAttribute("Alive") == false or (entry.Player and entry.Player:GetAttribute("Alive") == false) then
+        return false
+    end
+
+    local customHp = VisualHelper.readCustomHealth(entry)
     local hum = entry.Humanoid
     if hum and hum.Parent then
-        if hum.MaxHealth > 0 and hum.Health <= 0 then
-            local customAlive = (char:GetAttribute("Alive") == true) or (type(char:GetAttribute("Health")) == "number" and char:GetAttribute("Health") > 0)
-            if not customAlive then
+        local okState, humState = pcall(function()
+            return hum:GetState()
+        end)
+        if okState and humState == Enum.HumanoidStateType.Dead then
+            if not (entry.UseCustomHealth and type(customHp) == "number" and customHp > 0) then
                 return false
             end
         end
+        if hum.MaxHealth > 0 and hum.Health <= 0 then
+            local customAlive = (char:GetAttribute("Alive") == true) or (type(customHp) == "number" and customHp > 0)
+            if not customAlive then
+                return false
+            end
+        elseif entry.UseCustomHealth and type(customHp) == "number" and customHp <= 0 then
+            return false
+        end
     else
-        if char:GetAttribute("Alive") == false or (entry.Player and entry.Player:GetAttribute("Alive") == false) then
-            return false
-        end
-        local hpVal = char:FindFirstChild("Health") or char:FindFirstChild("HP")
-        if hpVal and (hpVal:IsA("NumberValue") or hpVal:IsA("IntValue")) and hpVal.Value <= 0 then
-            return false
-        end
-        local hp = char:GetAttribute("Health") or char:GetAttribute("HP")
-        if type(hp) == "number" and hp <= 0 then
+        if type(customHp) == "number" and customHp <= 0 then
             return false
         end
     end
@@ -3107,7 +3236,7 @@ local function IsValidTarget(targetKey, opts)
         return false, entry, nil, math.huge
     end
 
-    if opts and opts.ignoreBots == true and entry.IsBot then
+    if opts and opts.ignoreBots == true and entry.IsBot == true and entry.Player == nil then
         return false, entry, nil, math.huge
     end
 
@@ -3318,7 +3447,7 @@ local function updateAllESP(camera, viewportSize, screenCenter)
                 boxValid, bx, by, bw, bh = computeScreenBox(camera, entry, rootVP, worldDist)
             end
 
-            local _, _, hpRatio = getCharacterHealth(entry)
+            local _, _, hpRatio, shieldAmt = getCharacterHealth(entry)
             local hpColor = getHealthColor(hpRatio)
 
             local showTracer = Config.ESP.TracerESP and (not isBehind) and rootOnScreen
@@ -3413,6 +3542,7 @@ local function updateAllESP(camera, viewportSize, screenCenter)
                 ShowHealth = Config.ESP.HealthBar and boxValid,
                 ShowHealthText = Config.ESP.ShowHealthPercent,
                 HealthRatio = hpRatio,
+                ShieldAmount = shieldAmt,
                 HealthColor = hpColor,
                 ShowName = Config.ESP.ShowName and boxValid,
                 NameText = getEntryDisplayName(entry, targetKey),
@@ -3580,6 +3710,8 @@ local function getAimPartForEntry(entry, camera, screenCenter)
         local cands = entry.TargetCandidates
         local bestPart = nil
         local bestDist = math.huge
+        local bestVisPart = nil
+        local bestVisDist = math.huge
         local partsToCheck = {
             entry.Head,
             entry.Torso,
@@ -3589,8 +3721,10 @@ local function getAimPartForEntry(entry, camera, screenCenter)
         for _, rp in ipairs(entry.RigParts) do
             table.insert(partsToCheck, rp)
         end
+        local seenParts = {}
         for _, part in ipairs(partsToCheck) do
-            if part and part.Parent and isFiniteVector3(part.Position) then
+            if part and part.Parent and not seenParts[part] and isFiniteVector3(part.Position) then
+                seenParts[part] = true
                 local vp, onScreen = camera:WorldToViewportPoint(part.Position)
                 if vp.Z > 0 then
                     local dist = (Vector2.new(vp.X, vp.Y) - screenCenter).Magnitude
@@ -3601,10 +3735,16 @@ local function getAimPartForEntry(entry, camera, screenCenter)
                         bestDist = dist
                         bestPart = part
                     end
+                    if Config.Aimbot.VisibleCheck and onScreen and dist < bestVisDist then
+                        if raycastPartVisible(camera, entry.Character, part) then
+                            bestVisDist = dist
+                            bestVisPart = part
+                        end
+                    end
                 end
             end
         end
-        return bestPart or entry.RootPart
+        return bestVisPart or bestPart or entry.RootPart
     end
 end
 
@@ -4697,12 +4837,20 @@ local function findEntryForHitPart(hitPart)
 
     local localChar = State.LocalCharacter or LocalPlayer.Character
     local cur = hitPart.Parent
-    for _ = 1, 4 do
+    for _ = 1, 8 do
         if not cur or cur == Workspace or cur == game then
             break
         end
         if cur ~= localChar and cur:IsA("Model") then
             local plr = Players:GetPlayerFromCharacter(cur)
+            if not plr then
+                for _, p in ipairs(Players:GetPlayers()) do
+                    if p ~= LocalPlayer and isCandidateModelForPlayer(cur, p) then
+                        plr = p
+                        break
+                    end
+                end
+            end
             if plr and plr ~= LocalPlayer then
                 if not Registry[plr] then
                     registerPlayerEntry(plr)
@@ -4730,8 +4878,9 @@ end
 
 local function findTriggerTarget(camera, screenCenter, dt)
     local maxDist = Config.TriggerBot.MaxDistance
-    local origin = camera.CFrame.Position
-    local dirUnit = camera.CFrame.LookVector
+    local centerRay = camera:ViewportPointToRay(screenCenter.X, screenCenter.Y)
+    local origin = centerRay.Origin
+    local dirUnit = centerRay.Direction.Unit
 
     local filterList = {OverlayGui, HighlightContainer, camera}
     local localChar = State.LocalCharacter or LocalPlayer.Character
@@ -4739,11 +4888,12 @@ local function findTriggerTarget(camera, screenCenter, dt)
         table.insert(filterList, localChar)
     end
 
+    RayParams.FilterType = Enum.RaycastFilterType.Exclude
     RayParams.IgnoreWater = Config.ESP.IgnoreGlassWater
     local currentOrigin = origin
     local remaining = maxDist
 
-    for _ = 1, 8 do
+    for _ = 1, 10 do
         if remaining < 0.1 then
             break
         end
@@ -4770,7 +4920,10 @@ local function findTriggerTarget(camera, screenCenter, dt)
                 if valid then
                     return hitKey, hitEntry, hitPart, result.Position
                 end
-            elseif hitPart:FindFirstAncestorOfClass("Accessory") ~= nil then
+            end
+            if hitPart:FindFirstAncestorOfClass("Accessory") ~= nil
+                or ((not hitPart.CanCollide) and hitPart.Transparency >= 0.95)
+            then
                 shouldContinue = true
             end
             if not shouldContinue then
@@ -5052,6 +5205,9 @@ local function onRenderStepFrame(dt)
                     entry = Registry[player]
                 end
                 if entry then
+                    if entry.Character and (not entry.Character.Parent or not entry.Character:IsDescendantOf(Workspace)) then
+                        clearCharacterFromEntry(entry)
+                    end
                     local allowDeep = (entry.Character == nil) and ((now - entry.LastDeepScan) >= 0.4)
                     if allowDeep then
                         entry.LastDeepScan = now
@@ -5145,11 +5301,18 @@ local function onRenderStepFrame(dt)
         end
     end)
 
-    -- Keep LocalAlive synced immediately on respawn before 1.0s periodic reload
+    -- Keep LocalAlive synced live every frame (handles revives, respawns & custom rigs cleanly)
     pcall(function()
         local liveLocalChar = LocalPlayer.Character
         if liveLocalChar and liveLocalChar.Parent and State.LocalCharacter ~= liveLocalChar then
             bindLocalCharacter(liveLocalChar)
+        elseif State.LocalHumanoid and State.LocalHumanoid.Parent then
+            local st = State.LocalHumanoid:GetState()
+            State.LocalAlive = (st ~= Enum.HumanoidStateType.Dead) and ((State.LocalHumanoid.MaxHealth <= 0) or (State.LocalHumanoid.Health > 0))
+        elseif State.LocalCharacter and State.LocalCharacter.Parent then
+            State.LocalAlive = (State.LocalRootPart ~= nil and State.LocalRootPart.Parent ~= nil)
+        else
+            State.LocalAlive = false
         end
     end)
 
@@ -5383,12 +5546,17 @@ local function applyPotatoGraphics(enabled)
             end)
             if Lighting then
                 pcall(function()
-                    if saved.GlobalShadows ~= nil then Lighting.GlobalShadows = saved.GlobalShadows end
+                    if not Config.Utilities.Fullbright then
+                        if saved.GlobalShadows ~= nil then Lighting.GlobalShadows = saved.GlobalShadows end
+                        if saved.FogEnd ~= nil then Lighting.FogEnd = saved.FogEnd end
+                    elseif State.SavedFullbright then
+                        if saved.GlobalShadows ~= nil then State.SavedFullbright.GlobalShadows = saved.GlobalShadows end
+                        if saved.FogEnd ~= nil then State.SavedFullbright.FogEnd = saved.FogEnd end
+                    end
                     if saved.ShadowSoftness ~= nil then Lighting.ShadowSoftness = saved.ShadowSoftness end
-                    if saved.FogEnd ~= nil then Lighting.FogEnd = saved.FogEnd end
                     pcall(function()
                         if saved.EnvDiffuse ~= nil then Lighting.EnvironmentDiffuseScale = saved.EnvDiffuse end
-                        if saved.EnvSpecular ~= nil then Lighting.EnvironmentSpecularScale = saved.EnvSpecular end
+                        if saved.EnvSpecular ~= nil then Lighting.EnvironmentSpecularScale = saved.EnvironmentSpecular end
                     end)
                 end)
             end
@@ -5441,6 +5609,238 @@ if Config.Performance.PotatoGraphics then
     task.defer(function()
         if not State.Unloaded and Config.Performance.PotatoGraphics then
             applyPotatoGraphics(true)
+        end
+    end)
+end
+
+-- Client Utilities & Movement Engine (Speed Boost, Noclip, Infinite Jump, Fullbright)
+local UtilitiesEngine = {}
+
+function UtilitiesEngine.applyFullbrightValues()
+    if not Lighting or State.ApplyingFullbright then
+        return
+    end
+    State.ApplyingFullbright = true
+    pcall(function()
+        Lighting.Ambient = Color3.fromRGB(220, 220, 220)
+        Lighting.OutdoorAmbient = Color3.fromRGB(220, 220, 220)
+        Lighting.Brightness = 2
+        Lighting.ClockTime = 14
+        Lighting.GlobalShadows = false
+        Lighting.FogEnd = 100000
+        Lighting.FogStart = 100000
+        pcall(function()
+            Lighting.ExposureCompensation = 0
+        end)
+    end)
+    State.ApplyingFullbright = false
+end
+
+function UtilitiesEngine.applyFullbright(enabled)
+    Config.Utilities.Fullbright = (enabled == true)
+    if enabled then
+        if Lighting and not State.SavedFullbright then
+            local saved = {}
+            pcall(function()
+                saved.Ambient = Lighting.Ambient
+                saved.OutdoorAmbient = Lighting.OutdoorAmbient
+                saved.Brightness = Lighting.Brightness
+                saved.ClockTime = Lighting.ClockTime
+                saved.FogStart = Lighting.FogStart
+                saved.FogEnd = (State.SavedGraphics and State.SavedGraphics.FogEnd ~= nil) and State.SavedGraphics.FogEnd or Lighting.FogEnd
+                saved.GlobalShadows = (State.SavedGraphics and State.SavedGraphics.GlobalShadows ~= nil) and State.SavedGraphics.GlobalShadows or Lighting.GlobalShadows
+                pcall(function()
+                    saved.ExposureCompensation = Lighting.ExposureCompensation
+                end)
+            end)
+            State.SavedFullbright = saved
+        end
+        UtilitiesEngine.applyFullbrightValues()
+        if Lighting and not State.FullbrightConn then
+            State.FullbrightConn = Lighting.Changed:Connect(function(prop)
+                if Config.Utilities.Fullbright and not State.Unloaded and not State.ApplyingFullbright then
+                    if prop == "Ambient" or prop == "OutdoorAmbient" or prop == "Brightness" or prop == "ClockTime" or prop == "GlobalShadows" or prop == "FogEnd" or prop == "FogStart" then
+                        UtilitiesEngine.applyFullbrightValues()
+                    end
+                end
+            end)
+        end
+    else
+        if State.FullbrightConn then
+            pcall(function()
+                State.FullbrightConn:Disconnect()
+            end)
+            State.FullbrightConn = nil
+        end
+        local saved = State.SavedFullbright
+        if Lighting and saved then
+            State.ApplyingFullbright = true
+            pcall(function()
+                if saved.Ambient ~= nil then Lighting.Ambient = saved.Ambient end
+                if saved.OutdoorAmbient ~= nil then Lighting.OutdoorAmbient = saved.OutdoorAmbient end
+                if saved.Brightness ~= nil then Lighting.Brightness = saved.Brightness end
+                if saved.ClockTime ~= nil then Lighting.ClockTime = saved.ClockTime end
+                if saved.FogStart ~= nil then Lighting.FogStart = saved.FogStart end
+                if not Config.Performance.PotatoGraphics then
+                    if saved.FogEnd ~= nil then Lighting.FogEnd = saved.FogEnd end
+                    if saved.GlobalShadows ~= nil then Lighting.GlobalShadows = saved.GlobalShadows end
+                elseif State.SavedGraphics then
+                    if saved.FogEnd ~= nil then State.SavedGraphics.FogEnd = saved.FogEnd end
+                    if saved.GlobalShadows ~= nil then State.SavedGraphics.GlobalShadows = saved.GlobalShadows end
+                end
+                pcall(function()
+                    if saved.ExposureCompensation ~= nil then Lighting.ExposureCompensation = saved.ExposureCompensation end
+                end)
+            end)
+            State.ApplyingFullbright = false
+        end
+        State.SavedFullbright = nil
+    end
+end
+
+function UtilitiesEngine.restoreNoclipParts()
+    if next(State.SavedNoclipParts) == nil then
+        return
+    end
+    for part, origCollide in pairs(State.SavedNoclipParts) do
+        if part and part.Parent then
+            pcall(function()
+                part.CanCollide = origCollide
+            end)
+        end
+    end
+    clearTable(State.SavedNoclipParts)
+end
+
+function UtilitiesEngine.applyNoclip(enabled)
+    Config.Utilities.Noclip = (enabled == true)
+    if enabled then
+        UtilitiesEngine.stepNoclip()
+    else
+        UtilitiesEngine.restoreNoclipParts()
+    end
+end
+
+function UtilitiesEngine.stepNoclip()
+    if State.Unloaded or not Config.Utilities.Noclip then
+        if next(State.SavedNoclipParts) ~= nil then
+            UtilitiesEngine.restoreNoclipParts()
+        end
+        return
+    end
+    local char = State.LocalCharacter or LocalPlayer.Character
+    if not char or not char.Parent then
+        return
+    end
+    for _, desc in ipairs(char:GetDescendants()) do
+        if desc:IsA("BasePart") then
+            if State.SavedNoclipParts[desc] == nil then
+                State.SavedNoclipParts[desc] = desc.CanCollide
+            end
+            if desc.CanCollide then
+                pcall(function()
+                    desc.CanCollide = false
+                end)
+            end
+        end
+    end
+end
+
+function UtilitiesEngine.applySpeedBoost(enabled)
+    Config.Utilities.SpeedEnabled = (enabled == true)
+    local hum = State.LocalHumanoid
+    if not enabled then
+        if hum and hum.Parent and State.OriginalWalkSpeed ~= nil then
+            local orig = State.OriginalWalkSpeed
+            pcall(function()
+                hum.WalkSpeed = orig
+            end)
+        end
+        State.OriginalWalkSpeed = nil
+    elseif hum and hum.Parent and Config.Utilities.SpeedMethod == "CFrame" and State.OriginalWalkSpeed ~= nil then
+        local orig = State.OriginalWalkSpeed
+        pcall(function()
+            hum.WalkSpeed = orig
+        end)
+    end
+end
+
+function UtilitiesEngine.stepSpeed(dt)
+    if State.Unloaded or not Config.Utilities.SpeedEnabled or not State.LocalAlive then
+        return
+    end
+    local hum = State.LocalHumanoid
+    if not hum or not hum.Parent then
+        return
+    end
+    if State.OriginalWalkSpeed == nil then
+        local okSpd, curSpd = pcall(function()
+            return hum.WalkSpeed
+        end)
+        State.OriginalWalkSpeed = (okSpd and isFiniteNumber(curSpd) and curSpd > 0) and curSpd or 16
+    end
+
+    local targetSpeed = math.clamp(tonumber(Config.Utilities.WalkSpeed) or 24, 16, 150)
+    local method = Config.Utilities.SpeedMethod
+    if method == "WalkSpeed" or method == "Hybrid" then
+        if math.abs(hum.WalkSpeed - targetSpeed) > 0.1 then
+            pcall(function()
+                hum.WalkSpeed = targetSpeed
+            end)
+        end
+    elseif method == "CFrame" and State.OriginalWalkSpeed ~= nil and math.abs(hum.WalkSpeed - State.OriginalWalkSpeed) > 0.1 then
+        pcall(function()
+            hum.WalkSpeed = State.OriginalWalkSpeed
+        end)
+    end
+
+    if method == "CFrame" or method == "Hybrid" then
+        local root = State.LocalRootPart
+        if root and root.Parent then
+            local moveDir = hum.MoveDirection
+            if isFiniteVector3(moveDir) then
+                local flatDir = Vector3.new(moveDir.X, 0, moveDir.Z)
+                if flatDir.Magnitude > 0.05 then
+                    local baseSpeed = (method == "CFrame") and (State.OriginalWalkSpeed or 16) or math.max(hum.WalkSpeed, 0)
+                    local extraSpeed = targetSpeed - baseSpeed
+                    if extraSpeed > 0.25 then
+                        local safeDt = math.clamp(dt or (1 / 60), 0.001, 0.05)
+                        root.CFrame = root.CFrame + (flatDir.Unit * (extraSpeed * safeDt))
+                    end
+                end
+            end
+        end
+    end
+end
+
+addConnection(RunService.Stepped:Connect(function()
+    if not State.Unloaded and (Config.Utilities.Noclip or next(State.SavedNoclipParts) ~= nil) then
+        pcall(UtilitiesEngine.stepNoclip)
+    end
+end))
+
+addConnection(RunService.Heartbeat:Connect(function(dt)
+    if not State.Unloaded and Config.Utilities.SpeedEnabled then
+        pcall(UtilitiesEngine.stepSpeed, dt)
+    end
+end))
+
+addConnection(UserInputService.JumpRequest:Connect(function()
+    if State.Unloaded or not Config.Utilities.InfiniteJump or not State.LocalAlive then
+        return
+    end
+    local hum = State.LocalHumanoid
+    if hum and hum.Parent then
+        pcall(function()
+            hum:ChangeState(Enum.HumanoidStateType.Jumping)
+        end)
+    end
+end))
+
+if Config.Utilities.Fullbright then
+    task.defer(function()
+        if not State.Unloaded and Config.Utilities.Fullbright then
+            UtilitiesEngine.applyFullbright(true)
         end
     end)
 end
@@ -6150,7 +6550,7 @@ do
     tabPadding.PaddingBottom = UDim.new(0, 4)
     tabPadding.Parent = tabBar
 
-    local tabOrder = {"Aimbot", "Trigger", "ESP", "Colors", "Settings"}
+    local tabOrder = {"Aimbot", "Trigger", "ESP", "Utilities", "Colors", "Settings"}
 
     local tabGrid = Instance.new("UIGridLayout")
     tabGrid.CellSize = UDim2.new(1 / #tabOrder, -4, 1, 0)
@@ -6163,8 +6563,8 @@ do
     local contentHolder = Instance.new("Frame")
     contentHolder.Name = "ContentHolder"
     contentHolder.AnchorPoint = Vector2.new(0.5, 0)
-    contentHolder.Position = UDim2.new(0.5, 0, 0, 118)
-    contentHolder.Size = UDim2.new(1, -24, 1, -130)
+    contentHolder.Position = UDim2.new(0.5, 0, 0, 116)
+    contentHolder.Size = UDim2.new(1, -24, 1, -126)
     contentHolder.BackgroundTransparency = 1
     contentHolder.ZIndex = 3
     contentHolder.Parent = MainCard
@@ -6190,12 +6590,12 @@ do
         local list = Instance.new("UIListLayout")
         list.SortOrder = Enum.SortOrder.LayoutOrder
         list.HorizontalAlignment = Enum.HorizontalAlignment.Center
-        list.Padding = UDim.new(0, 10)
+        list.Padding = UDim.new(0, 8)
         list.Parent = page
 
         local pad = Instance.new("UIPadding")
         pad.PaddingTop = UDim.new(0, 3)
-        pad.PaddingBottom = UDim.new(0, 14)
+        pad.PaddingBottom = UDim.new(0, 12)
         pad.PaddingLeft = UDim.new(0, 2)
         pad.PaddingRight = UDim.new(0, 8)
         pad.Parent = page
@@ -6236,7 +6636,7 @@ do
         btn.LayoutOrder = idx
         btn.Font = Enum.Font.GothamMedium
         btn.Text = tabName
-        btn.TextSize = 11
+        btn.TextSize = 10.5
         btn.TextTruncate = Enum.TextTruncate.AtEnd
         btn.AutoButtonColor = false
         btn.BorderSizePixel = 0
@@ -6387,7 +6787,7 @@ local function createCardRow(parent, height, order)
 end
 
 local function addToggle(parent, order, title, subtitle, getter, setter)
-    local row = createCardRow(parent, subtitle and 58 or 48, order)
+    local row = createCardRow(parent, subtitle and 54 or 44, order)
 
     local label = Instance.new("TextLabel")
     label.BackgroundTransparency = 1
@@ -6481,7 +6881,7 @@ local function addToggle(parent, order, title, subtitle, getter, setter)
 end
 
 local function addSlider(parent, order, title, minVal, maxVal, step, formatFn, getter, setter)
-    local row = createCardRow(parent, 68, order)
+    local row = createCardRow(parent, 64, order)
 
     local label = Instance.new("TextLabel")
     label.BackgroundTransparency = 1
@@ -6717,7 +7117,7 @@ local function addSlider(parent, order, title, minVal, maxVal, step, formatFn, g
 end
 
 local function addSelector(parent, order, title, options, getter, setter, reloadOnSelect)
-    local row = createCardRow(parent, 72, order)
+    local row = createCardRow(parent, 66, order)
 
     local label = Instance.new("TextLabel")
     label.BackgroundTransparency = 1
@@ -7023,7 +7423,7 @@ do
         Config.Aimbot.ActivationMode = v
     end, false)
 
-    addSelector(AimbotPage, 4, "Target Part (R6 / R15 / Custom Rigs)", {"Head", "Chest", "HumanoidRootPart", "Closest"}, function()
+    addSelector(AimbotPage, 4, "Target Part (Closest = Nearest Visible)", {"Head", "Chest", "HumanoidRootPart", "Closest"}, function()
         return Config.Aimbot.TargetPart
     end, function(v)
         Config.Aimbot.TargetPart = v
@@ -7607,7 +8007,54 @@ do
     end)
 end
 
--- 4. COLORS & THICKNESS TAB
+-- 4. UTILITIES & MOVEMENT TAB
+do
+    local UtilitiesPage = TabPages["Utilities"]
+    addSectionHeader(UtilitiesPage, 1, "Movement & Mobility")
+
+    addToggle(UtilitiesPage, 2, "Speed Boost", "Boosts WalkSpeed + smooth MoveDirection CFrame step", function()
+        return Config.Utilities.SpeedEnabled
+    end, function(v)
+        UtilitiesEngine.applySpeedBoost(v)
+    end)
+
+    addSelector(UtilitiesPage, 3, "Speed Boost Method", {"Hybrid", "WalkSpeed", "CFrame"}, function()
+        return Config.Utilities.SpeedMethod
+    end, function(v)
+        Config.Utilities.SpeedMethod = v
+        UtilitiesEngine.applySpeedBoost(Config.Utilities.SpeedEnabled)
+    end, false)
+
+    addSlider(UtilitiesPage, 4, "Movement Speed", 16, 150, 1, function(v)
+        return string.format("%d st/s", math.round(v))
+    end, function()
+        return Config.Utilities.WalkSpeed
+    end, function(v)
+        Config.Utilities.WalkSpeed = math.round(v)
+    end)
+
+    addToggle(UtilitiesPage, 5, "Noclip (Pass Through Walls)", "Disables character collisions in Stepped & restores on OFF", function()
+        return Config.Utilities.Noclip
+    end, function(v)
+        UtilitiesEngine.applyNoclip(v)
+    end)
+
+    addToggle(UtilitiesPage, 6, "Infinite Jump", "Triggers jump on every air jump input via JumpRequest", function()
+        return Config.Utilities.InfiniteJump
+    end, function(v)
+        Config.Utilities.InfiniteJump = v
+    end)
+
+    addSectionHeader(UtilitiesPage, 7, "Lighting & Visibility")
+
+    addToggle(UtilitiesPage, 8, "Fullbright", "Locally clears fog & shadows; restores original lighting on OFF", function()
+        return Config.Utilities.Fullbright
+    end, function(v)
+        UtilitiesEngine.applyFullbright(v)
+    end)
+end
+
+-- 5. COLORS & THICKNESS TAB
 do
     local ColorsPage = TabPages["Colors"]
     addSectionHeader(ColorsPage, 1, "Live Thickness Controls (0.1 - 10.0)")
@@ -8529,7 +8976,7 @@ bindSafeTap(ForceReloadBtn, SettingsPage, function()
 end)
 
 bindSafeTap(ResetBtn, SettingsPage, function()
-    for _, secName in ipairs({"Aimbot", "TriggerBot", "ESP", "Resolver", "Performance", "Colors"}) do
+    for _, secName in ipairs({"Aimbot", "TriggerBot", "ESP", "Utilities", "Resolver", "Performance", "Colors"}) do
         for k, v in pairs(DefaultConfig[secName]) do
             if type(v) == "table" then
                 Config[secName][k] = {}
@@ -8539,6 +8986,9 @@ bindSafeTap(ResetBtn, SettingsPage, function()
         end
     end
     applyPotatoGraphics(Config.Performance.PotatoGraphics)
+    UtilitiesEngine.applyFullbright(Config.Utilities.Fullbright)
+    UtilitiesEngine.applyNoclip(Config.Utilities.Noclip)
+    UtilitiesEngine.applySpeedBoost(Config.Utilities.SpeedEnabled)
     Config.UI.ShowMobileAimButton = true
     Config.UI.MobileAimLocked = false
     Config.UI.ShowMobileTriggerButton = true
@@ -8567,9 +9017,13 @@ local function unloadScript()
     end
     State.Unloaded = true
     State.ReloadToken = State.ReloadToken + 1
+    Config.Utilities.InfiniteJump = false
     releaseTriggerFire()
     pcall(InputGuard.forceReleaseAll)
 
+    pcall(UtilitiesEngine.applyFullbright, false)
+    pcall(UtilitiesEngine.applyNoclip, false)
+    pcall(UtilitiesEngine.applySpeedBoost, false)
     pcall(applyPotatoGraphics, false)
 
     pcall(function()
