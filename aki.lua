@@ -5,8 +5,6 @@
       Features  : Liquid-Glass UI + Startup Loader, Per-Game Auto-Save Config,
                   Touch-Safe 3-Mode TriggerBot (VIM / firesignal / Tool:Activate),
                   Sub-0.1 Optical ESP Thickness, Extreme Potato Graphics
-      Hygiene   : Pooled connections, zero debug spam, clean unload; true
-                  server-side authority checks cannot be bypassed client-side
     ============================================================================
 ]]
 
@@ -141,6 +139,18 @@ local function mountGuiSafely(gui)
     return false
 end
 
+local STEALTH_UID = nil
+do
+    local okGuid, guid = pcall(function()
+        return HttpService and string.sub(string.gsub(HttpService:GenerateGUID(false), "-", ""), 1, 10) or nil
+    end)
+    if okGuid and type(guid) == "string" and #guid >= 6 then
+        STEALTH_UID = guid
+    else
+        STEALTH_UID = string.format("%06x%04x", math.random(0, 16777215), math.floor((os.clock() * 1000) % 65535))
+    end
+end
+
 local function cleanupOrphanGuis()
     local targets = {}
     if type(gethui) == "function" then
@@ -165,7 +175,7 @@ local function cleanupOrphanGuis()
     for _, parent in ipairs(targets) do
         pcall(function()
             for _, child in ipairs(parent:GetChildren()) do
-                if orphanNames[child.Name] then
+                if orphanNames[child.Name] or child:GetAttribute("_rLayerTag") == true then
                     child:Destroy()
                 end
             end
@@ -176,6 +186,9 @@ end
 cleanupOrphanGuis()
 
 local function protectGui(gui)
+    pcall(function()
+        gui:SetAttribute("_rLayerTag", true)
+    end)
     if type(syn) == "table" and type(syn.protect_gui) == "function" then
         pcall(syn.protect_gui, gui)
     elseif type(protect_gui) == "function" then
@@ -338,10 +351,11 @@ local State = {
     FullbrightConn = nil,
     ApplyingFullbright = false,
     SavedNoclipParts = {},
+    NoclipParts = {},
     OriginalWalkSpeed = nil,
-    WalkSpeedBlocked = false,
-    WalkSpeedResetCount = 0,
-    LastWalkSpeedSetTime = 0,
+    WalkSpeedClamped = false,
+    LastSpeedWrite = 0,
+    LastWrittenWalkSpeed = nil,
     OriginalJump = nil,
     LastJumpTime = 0,
     LastAutoHopTime = 0,
@@ -351,8 +365,8 @@ local State = {
     ApplyingJumpImpulse = false,
     JumpButtonHeld = false,
     OnHumanoidJumpChanged = nil,
-    SyncAllUtilitiesFn = nil,
-    ApplyPotatoFn = nil,
+    OnLocalCharacterBound = nil,
+    OnSystemsReloaded = nil,
     HookedJumpButton = nil,
     FrameIndex = 0,
     LastRenderTick = 0,
@@ -461,55 +475,10 @@ function InputGuard.endDrag(owner)
     end
 end
 
-InputGuard.ActiveTaps = {}
-InputGuard.TapHookBound = false
-
-function InputGuard.ensureTapPool()
-    if InputGuard.TapHookBound then
-        return
-    end
-    InputGuard.TapHookBound = true
-
-    addConnection(UserInputService.InputChanged:Connect(function(input)
-        if State.Unloaded or next(InputGuard.ActiveTaps) == nil then
-            return
-        end
-        for btn, tap in pairs(InputGuard.ActiveTaps) do
-            if not btn or not btn.Parent or not tap.Input or not InputGuard.isActiveState(tap.Input.UserInputState) then
-                InputGuard.ActiveTaps[btn] = nil
-            elseif input == tap.Input or (tap.Input.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseMovement) then
-                local dist = (Vector2.new(input.Position.X, input.Position.Y) - Vector2.new(tap.StartPos.X, tap.StartPos.Y)).Magnitude
-                if dist > tap.MaxMove then
-                    tap.MaxMove = dist
-                end
-            end
-        end
-    end))
-
-    local function finishPoolTap(input)
-        if next(InputGuard.ActiveTaps) == nil then
-            return
-        end
-        for _, tap in pairs(InputGuard.ActiveTaps) do
-            if input == tap.Input then
-                local dist = tap.StartPos and (Vector2.new(input.Position.X, input.Position.Y) - Vector2.new(tap.StartPos.X, tap.StartPos.Y)).Magnitude or 0
-                if dist > tap.MaxMove then
-                    tap.MaxMove = dist
-                end
-                tap.Ended = true
-            end
-        end
-    end
-
-    addConnection(UserInputService.InputEnded:Connect(finishPoolTap))
-    addConnection(UserInputService.TouchEnded:Connect(finishPoolTap))
-end
-
 function InputGuard.forceReleaseAll()
     InputGuard.ActiveOwner = nil
     InputGuard.ActiveInput = nil
     State.ActiveDragCount = 0
-    clearTable(InputGuard.ActiveTaps)
     if State.DragSinkBound and ContextActionService then
         pcall(function()
             ContextActionService:UnbindAction(InputGuard.ACTION_NAME)
@@ -792,7 +761,7 @@ ConfigStore.loadNow()
 -- [SECTION 3] RELIABLE SCREENGUI-FIRST + OPTIONAL DRAWING OVERLAY ENGINE
 -- ============================================================================
 local OverlayGui = Instance.new("ScreenGui")
-OverlayGui.Name = "TEAM_AKI_Overlay"
+OverlayGui.Name = "CoreOverlay_" .. STEALTH_UID
 OverlayGui.IgnoreGuiInset = true
 OverlayGui.ResetOnSpawn = false
 OverlayGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
@@ -802,10 +771,16 @@ mountGuiSafely(OverlayGui)
 State.OverlayGui = OverlayGui
 
 local EspContainer = Instance.new("Folder")
-EspContainer.Name = "ESP_Elements"
+EspContainer.Name = "Layer_" .. STEALTH_UID
 EspContainer.Parent = OverlayGui
 
 local function getHighlightParent()
+    if type(gethui) == "function" then
+        local okHui, hui = pcall(gethui)
+        if okHui and typeof(hui) == "Instance" then
+            return hui
+        end
+    end
     local okCore = pcall(function()
         return CoreGui.Name
     end)
@@ -820,7 +795,8 @@ local function getHighlightParent()
 end
 
 local HighlightContainer = Instance.new("Folder")
-HighlightContainer.Name = "TEAM_AKI_Highlights"
+HighlightContainer.Name = "Hl_" .. STEALTH_UID
+protectGui(HighlightContainer)
 do
     local okHighlightParent = pcall(function()
         HighlightContainer.Parent = getHighlightParent()
@@ -1678,7 +1654,7 @@ local CUSTOM_CHAR_FOLDERS = {
     "Players", "Characters", "Entities", "ActivePlayers", "Rigs",
     "GamePlayers", "Living", "Bots", "Units", "Models", "WorkspacePlayers", "Targets",
 }
-local SAFETY_SYNC_INTERVAL = 1.0
+local SAFETY_SYNC_INTERVAL = 3.0
 
 local ScheduleReload
 local ReloadAllSystems
@@ -2485,7 +2461,8 @@ local function syncWorkspaceBots(playerCharSet)
 
     -- Periodic full Workspace Humanoid scan ensures bots & custom rigs inside any nested map folder load without aiming at them first
     local now = os.clock()
-    if State.ReloadCount <= 2 or (now - (State.LastDeepBotScan or 0)) >= 0.95 then
+    local shouldDeepBotScan = (not botsDisabledEverywhere) and (State.ReloadCount <= 2 or (now - (State.LastDeepBotScan or 0)) >= 3.5)
+    if shouldDeepBotScan then
         State.LastDeepBotScan = now
         for _, desc in ipairs(Workspace:GetDescendants()) do
             if desc:IsA("Humanoid") then
@@ -2497,7 +2474,7 @@ local function syncWorkspaceBots(playerCharSet)
                 considerModel(desc)
             end
         end
-    else
+    elseif not botsDisabledEverywhere then
         -- Keep already-registered bots fresh between full deep scans
         for key, entry in pairs(Registry) do
             if entry.IsBot and typeof(key) == "Instance" and key.Parent and isModelBotAlive(key) then
@@ -2567,15 +2544,16 @@ local function clearLocalCharacterState()
     State.LocalAlive = false
     State.LastLocalPos = nil
     State.OriginalWalkSpeed = nil
-    State.WalkSpeedBlocked = false
-    State.WalkSpeedResetCount = 0
-    State.LastWalkSpeedSetTime = 0
+    State.WalkSpeedClamped = false
+    State.LastSpeedWrite = 0
+    State.LastWrittenWalkSpeed = nil
     State.OriginalJump = nil
     State.BHopMomentum = 0
     State.JumpButtonHeld = false
     State.LastGroundedTime = 0
     State.HookedJumpButton = nil
     clearTable(State.SavedNoclipParts)
+    clearTable(State.NoclipParts)
     State.CurrentAimTarget = nil
     State.CurrentAimPart = nil
     State.CurrentAimPredictedPos = nil
@@ -2609,6 +2587,12 @@ local function bindLocalCharacter(character)
         State.LastLocalPos = State.LocalRootPart.Position
     end
 
+    for _, desc in ipairs(character:GetDescendants()) do
+        if desc:IsA("BasePart") then
+            State.NoclipParts[desc] = true
+        end
+    end
+
     local function attachHumanoidDeath(hum)
         State.LocalHumanoid = hum
         State.LocalAlive = (hum.MaxHealth <= 0) or (hum.Health > 0)
@@ -2636,11 +2620,23 @@ local function bindLocalCharacter(character)
     if State.LocalHumanoid then
         attachHumanoidDeath(State.LocalHumanoid)
     end
+    table.insert(State.LocalConns, character.DescendantAdded:Connect(function(desc)
+        if not State.Unloaded and desc:IsA("BasePart") then
+            State.NoclipParts[desc] = true
+        end
+    end))
+    table.insert(State.LocalConns, character.DescendantRemoving:Connect(function(desc)
+        State.NoclipParts[desc] = nil
+        State.SavedNoclipParts[desc] = nil
+    end))
     table.insert(State.LocalConns, character.ChildAdded:Connect(function(child)
         if State.Unloaded then return end
         if child:IsA("Humanoid") then
             if State.LocalHumanoid ~= child then
                 attachHumanoidDeath(child)
+                if type(State.OnLocalCharacterBound) == "function" then
+                    pcall(State.OnLocalCharacterBound, character)
+                end
                 ScheduleReload("LocalHumanoidReady", false)
             end
         elseif child.Name == "HumanoidRootPart" and child:IsA("BasePart") then
@@ -2656,6 +2652,10 @@ local function bindLocalCharacter(character)
             ScheduleReload("LocalCharacterRemoved", false)
         end
     end))
+
+    if type(State.OnLocalCharacterBound) == "function" then
+        pcall(State.OnLocalCharacterBound, character)
+    end
 end
 
 -- Full Reload & 1s Reconciliation: refreshes characters, parts, team detection, and healed visuals
@@ -2749,7 +2749,12 @@ ReloadAllSystems = function(reason, hardReset)
                     if liveChar and liveChar.Parent then
                         if entry.Character ~= liveChar then
                             bindCharacterToEntry(entry, liveChar)
-                        else
+                        elseif entry.NeedsRescan
+                            or (not entry.RootPart)
+                            or (not entry.RootPart.Parent)
+                            or (entry.LastChildCount ~= #liveChar:GetChildren())
+                        then
+                            entry.NeedsRescan = false
                             cacheCharacterParts(entry, liveChar)
                             attachRemoteHumanoidDeath(entry)
                         end
@@ -2801,12 +2806,8 @@ ReloadAllSystems = function(reason, hardReset)
     end
 
     syncWorkspaceBots(playerCharSet)
-
-    if type(State.SyncAllUtilitiesFn) == "function" then
-        pcall(State.SyncAllUtilitiesFn)
-    end
-    if Config.Performance.PotatoGraphics and type(State.ApplyPotatoFn) == "function" then
-        pcall(State.ApplyPotatoFn, true)
+    if type(State.OnSystemsReloaded) == "function" then
+        pcall(State.OnSystemsReloaded)
     end
 end
 
@@ -5534,7 +5535,7 @@ end
 -- ============================================================================
 -- [SECTION 8] MAIN RENDER LOOP & EVERY-FRAME PLAYER COVERAGE SYNC
 -- ============================================================================
-local RENDER_STEP_NAME = "TEAM_AKI_RenderStep"
+local RENDER_STEP_NAME = "CamUpdate_" .. STEALTH_UID
 
 local function stepAimbotModule(camera, screenCenter, dt)
     local ok = pcall(updateAimbot, camera, screenCenter, dt)
@@ -5587,8 +5588,7 @@ local function onRenderStepFrame(dt)
                 local dz = curLocalPos.Z - State.LastLocalPos.Z
                 local horizJumpDist = math.sqrt(dx * dx + dz * dz)
                 local vertDist = math.abs(curLocalPos.Y - State.LastLocalPos.Y)
-                local horizThresh = (Config.Utilities.SpeedEnabled or Config.Utilities.BunnyHop) and 95 or 60
-                if horizJumpDist >= horizThresh or vertDist >= 140 then
+                if horizJumpDist >= 120 or vertDist >= 180 then
                     State.LastLocalPos = curLocalPos
                     State.CurrentAimTarget = nil
                     pcall(ReloadAllSystems, "LocalTeleportDetected", false)
@@ -5675,7 +5675,7 @@ local function onRenderStepFrame(dt)
         end)
     end
 
-    if (now - (State.LastBotScan or 0)) >= 0.5 then
+    if (now - (State.LastBotScan or 0)) >= 1.25 then
         State.LastBotScan = now
         pcall(syncWorkspaceBots, nil)
     end
@@ -6016,8 +6016,6 @@ local function applyPotatoGraphics(enabled)
     end
 end
 
-State.ApplyPotatoFn = applyPotatoGraphics
-
 if Config.Performance.PotatoGraphics then
     task.defer(function()
         if not State.Unloaded and Config.Performance.PotatoGraphics then
@@ -6145,16 +6143,24 @@ function UtilitiesEngine.stepNoclip()
     if not char or not char.Parent then
         return
     end
-    for _, desc in ipairs(char:GetDescendants()) do
-        if desc:IsA("BasePart") then
-            if State.SavedNoclipParts[desc] == nil then
-                State.SavedNoclipParts[desc] = desc.CanCollide
+    if next(State.NoclipParts) == nil then
+        for _, desc in ipairs(char:GetDescendants()) do
+            if desc:IsA("BasePart") then
+                State.NoclipParts[desc] = true
             end
-            if desc.CanCollide then
-                pcall(function()
-                    desc.CanCollide = false
-                end)
+        end
+    end
+    for part in pairs(State.NoclipParts) do
+        if part and part.Parent then
+            if State.SavedNoclipParts[part] == nil then
+                State.SavedNoclipParts[part] = part.CanCollide
             end
+            if part.CanCollide then
+                part.CanCollide = false
+            end
+        else
+            State.NoclipParts[part] = nil
+            State.SavedNoclipParts[part] = nil
         end
     end
 end
@@ -6265,9 +6271,8 @@ end
 
 function UtilitiesEngine.applySpeedBoost(enabled)
     Config.Utilities.SpeedEnabled = (enabled == true)
-    State.WalkSpeedBlocked = false
-    State.WalkSpeedResetCount = 0
-    State.LastWalkSpeedSetTime = 0
+    State.WalkSpeedClamped = false
+    State.LastWrittenWalkSpeed = nil
     local _, hum = UtilitiesEngine.getLocalMovementRefs()
     if not enabled then
         if hum and hum.Parent and State.OriginalWalkSpeed ~= nil then
@@ -6486,6 +6491,16 @@ function UtilitiesEngine.ensureTouchJumpHook()
     end
 end
 
+local function safeGetHumState(hum)
+    local ok, st = pcall(hum.GetState, hum)
+    return ok and st or nil
+end
+
+local function safeIsKeyDown(keyCode)
+    local ok, down = pcall(UserInputService.IsKeyDown, UserInputService, keyCode)
+    return ok and down == true
+end
+
 function UtilitiesEngine.stepMovement(dt)
     if State.Unloaded then
         return
@@ -6504,19 +6519,12 @@ function UtilitiesEngine.stepMovement(dt)
     end
 
     local now = os.clock()
-    local humState = nil
-    pcall(function()
-        humState = hum:GetState()
-    end)
+    local humState = safeGetHumState(hum)
     if humState == Enum.HumanoidStateType.Dead then
         return
     end
 
-    local curVel = Vector3.zero
-    pcall(function()
-        curVel = root.AssemblyLinearVelocity
-    end)
-
+    local curVel = root.AssemblyLinearVelocity
     local onGroundNow = (hum.FloorMaterial ~= Enum.Material.Air) and (humState ~= Enum.HumanoidStateType.Freefall) and (humState ~= Enum.HumanoidStateType.Jumping)
     if onGroundNow then
         State.LastGroundedTime = now
@@ -6529,34 +6537,25 @@ function UtilitiesEngine.stepMovement(dt)
         local nearTakeoff = (now - (State.LastGroundedTime or 0)) <= 0.12
         if humState == Enum.HumanoidStateType.Jumping and nearTakeoff and isFiniteVector3(curVel) and curVel.Y > 2 and curVel.Y < (targetVelY * 0.85) and (now - (State.LastJumpBoostTime or 0)) >= 0.25 then
             State.LastJumpBoostTime = now
-            pcall(function()
-                root.AssemblyLinearVelocity = Vector3.new(curVel.X, targetVelY, curVel.Z)
-            end)
+            root.AssemblyLinearVelocity = Vector3.new(curVel.X, targetVelY, curVel.Z)
             curVel = Vector3.new(curVel.X, targetVelY, curVel.Z)
         end
     end
 
     -- 2. Infinite Jump held-button fall rescue (lets mobile/PC players hold jump while falling to keep climbing)
-    local isAirborne = (hum.FloorMaterial == Enum.Material.Air) or (humState == Enum.HumanoidStateType.Freefall) or (humState == Enum.HumanoidStateType.FallingDown)
+    local isAirborne = (hum.FloorMaterial == Enum.Material.Air) or (humState == Enum.HumanoidStateType.Freefall) or (humState == Enum.HumanoidStateType.Jumping) or (humState == Enum.HumanoidStateType.FallingDown)
     if Config.Utilities.InfiniteJump and isAirborne then
-        local spaceHeld = false
-        pcall(function()
-            spaceHeld = UserInputService:IsKeyDown(Enum.KeyCode.Space)
-        end)
+        local spaceHeld = safeIsKeyDown(Enum.KeyCode.Space)
         if (State.JumpButtonHeld or spaceHeld or hum.Jump) and isFiniteVector3(curVel) and curVel.Y < -2.0 and (now - (State.LastJumpTime or 0)) >= 0.24 then
             UtilitiesEngine.performJump("InfiniteJump")
-            pcall(function()
-                curVel = root.AssemblyLinearVelocity
-            end)
+            curVel = root.AssemblyLinearVelocity
         end
     end
 
-    -- 3. Speed Boost + Bunny Hop synchronized horizontal velocity & auto-hop
+    -- 3. Speed Boost + Bunny Hop (strict X/Z horizontal separation from Y jump physics)
     if State.OriginalWalkSpeed == nil then
-        local okSpd, curSpd = pcall(function()
-            return hum.WalkSpeed
-        end)
-        State.OriginalWalkSpeed = (okSpd and isFiniteNumber(curSpd) and curSpd > 0) and curSpd or 16
+        local curSpd = hum.WalkSpeed
+        State.OriginalWalkSpeed = (isFiniteNumber(curSpd) and curSpd > 0) and curSpd or 16
     end
 
     local moveDir = hum.MoveDirection
@@ -6564,22 +6563,13 @@ function UtilitiesEngine.stepMovement(dt)
     local isMoving = flatDir.Magnitude > 0.05
 
     if Config.Utilities.BunnyHop then
-        local isGrounded = (hum.FloorMaterial ~= Enum.Material.Air)
-            and (humState ~= Enum.HumanoidStateType.Freefall)
-            and (humState ~= Enum.HumanoidStateType.Jumping)
-            and (isFiniteVector3(curVel) and curVel.Y <= 4.5 and curVel.Y >= -14.0)
-        local wantsJump = isMoving or hum.Jump
-        if not wantsJump then
-            pcall(function()
-                wantsJump = UserInputService:IsKeyDown(Enum.KeyCode.Space)
-            end)
-        end
+        local isGrounded = onGroundNow and (isFiniteVector3(curVel) and curVel.Y <= 4.5 and curVel.Y >= -14.0)
+        local wantsJump = isMoving or hum.Jump or State.JumpButtonHeld or safeIsKeyDown(Enum.KeyCode.Space)
         if wantsJump and isGrounded and (now - (State.LastAutoHopTime or 0)) >= 0.11 then
             State.LastAutoHopTime = now
             UtilitiesEngine.performJump("BunnyHop")
-            pcall(function()
-                curVel = root.AssemblyLinearVelocity
-            end)
+            curVel = root.AssemblyLinearVelocity
+            isAirborne = true
         end
         if not isMoving then
             State.BHopMomentum = math.max((State.BHopMomentum or 0) - ((dt or 0.016) * 28), 0)
@@ -6594,85 +6584,78 @@ function UtilitiesEngine.stepMovement(dt)
         local bhopBonus = (Config.Utilities.BunnyHop and isMoving) and (Config.Utilities.SpeedEnabled and ((State.BHopMomentum or 0) * 0.6) or (State.BHopMomentum or 0)) or 0
         local desiredSpeed = configuredSpeed + bhopBonus
         local method = Config.Utilities.SpeedMethod
-        local liveSpeed = baseSpeed
-        pcall(function()
-            liveSpeed = hum.WalkSpeed
-        end)
+        local useWalkSpeedMethod = (method == "WalkSpeed") or (method == "Hybrid" and not State.WalkSpeedClamped)
 
-        if Config.Utilities.SpeedEnabled then
-            if method == "WalkSpeed" then
-                if math.abs(liveSpeed - configuredSpeed) > 0.25 then
-                    pcall(function()
-                        hum.WalkSpeed = configuredSpeed
-                    end)
-                    liveSpeed = configuredSpeed
-                end
-            elseif method == "Hybrid" and not State.WalkSpeedBlocked then
-                if (now - (State.LastWalkSpeedSetTime or 0)) <= 0.25 and liveSpeed < (configuredSpeed - 2.0) then
-                    State.WalkSpeedResetCount = (State.WalkSpeedResetCount or 0) + 1
-                    if State.WalkSpeedResetCount >= 3 then
-                        State.WalkSpeedBlocked = true
-                    end
-                end
-                if not State.WalkSpeedBlocked and math.abs(liveSpeed - configuredSpeed) > 0.25 then
-                    State.LastWalkSpeedSetTime = now
-                    pcall(function()
-                        hum.WalkSpeed = configuredSpeed
-                    end)
-                    liveSpeed = configuredSpeed
-                end
+        if useWalkSpeedMethod then
+            -- Detect if game anti-speed immediately snaps WalkSpeed down in Hybrid mode
+            if method == "Hybrid"
+                and State.LastWrittenWalkSpeed ~= nil
+                and (now - (State.LastSpeedWrite or 0)) > 0.04
+                and (now - (State.LastSpeedWrite or 0)) < 0.35
+                and hum.WalkSpeed < (State.LastWrittenWalkSpeed - 1.5)
+            then
+                State.WalkSpeedClamped = true
+                useWalkSpeedMethod = false
+            elseif math.abs(hum.WalkSpeed - desiredSpeed) > 0.15 then
+                hum.WalkSpeed = desiredSpeed
+                State.LastWrittenWalkSpeed = desiredSpeed
+                State.LastSpeedWrite = now
             end
         end
 
         if isMoving then
             local dirUnit = flatDir.Unit
-            local activeWalk = math.max(liveSpeed, 0)
+            local activeWalk = math.max(hum.WalkSpeed, 0)
             local extraSpeed = desiredSpeed - activeWalk
-            local useHorizCFrame = (Config.Utilities.SpeedEnabled and (method == "CFrame" or (method == "Hybrid" and (State.WalkSpeedBlocked or extraSpeed > 0.25))))
-                or Config.Utilities.BunnyHop
+            local needsFallbackMove = (not useWalkSpeedMethod) and extraSpeed > 0.25
 
-            -- Strictly horizontal X/Z displacement only; never touch Y position or AssemblyLinearVelocity.Y
-            if useHorizCFrame and extraSpeed > 0.25 then
-                local safeDt = math.clamp(dt or (1 / 60), 0.001, 0.05)
-                local horizStep = Vector3.new(dirUnit.X, 0, dirUnit.Z) * (extraSpeed * safeDt)
-                pcall(function()
-                    root.CFrame = root.CFrame + horizStep
-                end)
-            end
-
-            -- Keep mid-air BHop steering smooth using freshly sampled Y velocity so Jump / InfiniteJump impulses are never overwritten
-            if Config.Utilities.BunnyHop and isAirborne then
-                local liveVel = Vector3.zero
-                pcall(function()
-                    liveVel = root.AssemblyLinearVelocity
-                end)
-                if isFiniteVector3(liveVel) then
-                    local horizCur = Vector3.new(liveVel.X, 0, liveVel.Z)
-                    local horizTarget = dirUnit * desiredSpeed
-                    local blended = horizCur:Lerp(horizTarget, 0.28)
-                    pcall(function()
+            if isAirborne then
+                -- Mid-air: ONLY steer horizontal X/Z AssemblyLinearVelocity while preserving live Y untouched (zero CFrame stutter)
+                if needsFallbackMove or Config.Utilities.BunnyHop then
+                    local liveVel = root.AssemblyLinearVelocity
+                    if isFiniteVector3(liveVel) then
+                        local horizCur = Vector3.new(liveVel.X, 0, liveVel.Z)
+                        local horizTarget = dirUnit * desiredSpeed
+                        local alpha = Config.Utilities.BunnyHop and 0.35 or 0.55
+                        local blended = horizCur:Lerp(horizTarget, alpha)
                         root.AssemblyLinearVelocity = Vector3.new(blended.X, liveVel.Y, blended.Z)
-                    end)
+                    end
                 end
+            elseif needsFallbackMove and (now - (State.LastJumpTime or 0)) >= 0.06 then
+                -- Grounded CFrame fallback: strictly X/Z horizontal displacement, never modifying Y
+                local safeDt = math.clamp(dt or (1 / 60), 0.001, 0.05)
+                local step = extraSpeed * safeDt
+                root.CFrame = root.CFrame + Vector3.new(dirUnit.X * step, 0, dirUnit.Z * step)
             end
         end
     end
 end
 
-function UtilitiesEngine.syncAll()
+function UtilitiesEngine.syncAll(preserveClamp)
+    local prevClamped = State.WalkSpeedClamped
     UtilitiesEngine.applyFullbright(Config.Utilities.Fullbright)
     UtilitiesEngine.applyNoclip(Config.Utilities.Noclip)
     UtilitiesEngine.applySpeedBoost(Config.Utilities.SpeedEnabled)
+    if preserveClamp and Config.Utilities.SpeedEnabled then
+        State.WalkSpeedClamped = prevClamped
+    end
     UtilitiesEngine.applyJumpHeight(Config.Utilities.JumpEnabled)
     UtilitiesEngine.applyBunnyHop(Config.Utilities.BunnyHop)
+    UtilitiesEngine.ensureTouchJumpHook()
 end
-
-State.SyncAllUtilitiesFn = UtilitiesEngine.syncAll
 
 State.OnHumanoidJumpChanged = function(hum)
     if Config.Utilities.InfiniteJump and hum and hum.FloorMaterial == Enum.Material.Air then
         UtilitiesEngine.triggerAirJump(false)
     end
+end
+
+State.OnLocalCharacterBound = function()
+    UtilitiesEngine.syncAll(false)
+end
+
+State.OnSystemsReloaded = function()
+    UtilitiesEngine.syncAll(true)
 end
 
 addConnection(RunService.Stepped:Connect(function()
@@ -6760,7 +6743,7 @@ end))
 -- [SECTION 9] ADAPTIVE LIQUID-GLASS UI SHELL & STARTUP LOADER (TEAM AKI)
 -- ============================================================================
 local MainGui = Instance.new("ScreenGui")
-MainGui.Name = "TEAM_AKI_Hub"
+MainGui.Name = "Shell_" .. STEALTH_UID
 MainGui.IgnoreGuiInset = true
 MainGui.ResetOnSpawn = false
 MainGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
@@ -7569,43 +7552,68 @@ local function SyncDependentSettings(needsFullReload, reason, skipSave)
     end
 end
 
--- Scroll-guarded tap handler pooled through InputGuard (prevents per-button global listener bloat)
+-- Scroll-guarded tap handler so vertical scrolling on mobile never triggers accidental mis-touches
 local function bindSafeTap(btn, scrollParent, callback)
-    InputGuard.ensureTapPool()
     local isScrollingFrame = scrollParent and scrollParent:IsA("ScrollingFrame")
+    local trackedInput = nil
+    local startPos = nil
     local startCanvasY = 0
+    local maxMove = 0
     local hadValidPress = false
 
-    addConnection(btn.InputBegan:Connect(function(input)
-        if State.Unloaded or input.UserInputState ~= Enum.UserInputState.Begin then
+    btn.InputBegan:Connect(function(input)
+        if input.UserInputState ~= Enum.UserInputState.Begin then
             return
         end
         if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
             hadValidPress = true
+            trackedInput = input
+            startPos = input.Position
             startCanvasY = isScrollingFrame and scrollParent.CanvasPosition.Y or 0
-            InputGuard.ActiveTaps[btn] = {
-                Input = input,
-                StartPos = input.Position,
-                MaxMove = 0,
-                Ended = false,
-            }
+            maxMove = 0
+        end
+    end)
+
+    addConnection(UserInputService.InputChanged:Connect(function(input)
+        if not trackedInput or not startPos then
+            return
+        end
+        if not InputGuard.isActiveState(trackedInput.UserInputState) then
+            trackedInput = nil
+            return
+        end
+        if input == trackedInput or (trackedInput.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseMovement) then
+            local dist = (Vector2.new(input.Position.X, input.Position.Y) - Vector2.new(startPos.X, startPos.Y)).Magnitude
+            if dist > maxMove then
+                maxMove = dist
+            end
         end
     end))
 
-    addConnection(btn.Activated:Connect(function()
-        if State.Unloaded then
-            return
+    local function finishTrackedTap(input)
+        if input == trackedInput then
+            local dist = startPos and (Vector2.new(input.Position.X, input.Position.Y) - Vector2.new(startPos.X, startPos.Y)).Magnitude or 0
+            if dist > maxMove then
+                maxMove = dist
+            end
+            trackedInput = nil
         end
-        local tap = InputGuard.ActiveTaps[btn]
-        local moveDist = tap and tap.MaxMove or 0
-        InputGuard.ActiveTaps[btn] = nil
+    end
+
+    addConnection(UserInputService.InputEnded:Connect(finishTrackedTap))
+    addConnection(UserInputService.TouchEnded:Connect(finishTrackedTap))
+
+    btn.Activated:Connect(function()
         local canvasDelta = isScrollingFrame and math.abs(scrollParent.CanvasPosition.Y - startCanvasY) or 0
-        local wasCleanTap = hadValidPress and (moveDist <= 10) and (canvasDelta <= 4)
+        local wasCleanTap = hadValidPress and (maxMove <= 10) and (canvasDelta <= 4)
         hadValidPress = false
+        trackedInput = nil
+        startPos = nil
+        maxMove = 0
         if wasCleanTap then
             callback()
         end
-    end))
+    end)
 end
 
 local function createCardRow(parent, height, order)
@@ -8863,8 +8871,6 @@ do
         return Config.Utilities.SpeedMethod
     end, function(v)
         Config.Utilities.SpeedMethod = v
-        State.WalkSpeedBlocked = false
-        State.WalkSpeedResetCount = 0
         UtilitiesEngine.applySpeedBoost(Config.Utilities.SpeedEnabled)
     end, false)
 
@@ -8874,8 +8880,6 @@ do
         return Config.Utilities.WalkSpeed
     end, function(v)
         Config.Utilities.WalkSpeed = math.round(v)
-        State.WalkSpeedBlocked = false
-        State.WalkSpeedResetCount = 0
     end)
 
     addToggle(UtilitiesPage, 5, "Jump Height Boost", "Scales jump height across standard, JumpPower & air jumps", function()
