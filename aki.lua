@@ -341,6 +341,7 @@ local State = {
     LastSafetySync = 0,
     LastWorkspaceDeepScan = 0,
     LastBotScan = 0,
+    LastDeepBotScan = 0,
     LastTeamScan = -1,
     DetectedTeamScheme = "FFA",
     LastReloadReason = "Startup",
@@ -899,6 +900,67 @@ function VisualHelper.readCustomHealth(entry)
         if maxShield == nil then maxShield = VisualHelper.readHealthNumeric(c, maxShieldKeys) end
     end
     return hp, maxHp, shield, maxShield
+end
+
+function VisualHelper.isRayPartNonBlocking(hitPart, distFromCam, allowViewmodel)
+    if not hitPart then
+        return true
+    end
+    if (State.OverlayGui and hitPart:IsDescendantOf(State.OverlayGui))
+        or (string.find(hitPart.Name, "TEAM_AKI", 1, true) ~= nil)
+    then
+        return true
+    end
+    if hitPart:FindFirstAncestorOfClass("Accessory") ~= nil then
+        return true
+    end
+
+    local nl = string.lower(hitPart.Name)
+    local parentName = hitPart.Parent and string.lower(hitPart.Parent.Name) or ""
+    if allowViewmodel and (distFromCam or 999) < 5.0 then
+        if hitPart:FindFirstAncestorOfClass("Tool") ~= nil
+            or string.find(nl, "viewmodel", 1, true) ~= nil
+            or string.find(parentName, "viewmodel", 1, true) ~= nil
+            or string.find(parentName, "arms", 1, true) ~= nil
+        then
+            return true
+        end
+    end
+
+    local isVfxName = string.find(parentName, "bullet", 1, true) ~= nil
+        or string.find(parentName, "effect", 1, true) ~= nil
+        or string.find(parentName, "debris", 1, true) ~= nil
+        or string.find(parentName, "vfx", 1, true) ~= nil
+        or string.find(parentName, "tracer", 1, true) ~= nil
+        or string.find(parentName, "projectile", 1, true) ~= nil
+        or string.find(parentName, "muzzle", 1, true) ~= nil
+        or string.find(nl, "bullet", 1, true) ~= nil
+        or string.find(nl, "tracer", 1, true) ~= nil
+        or string.find(nl, "muzzle", 1, true) ~= nil
+    if isVfxName then
+        local s = hitPart.Size
+        if (not hitPart.CanCollide) or (s.X <= 16 and s.Y <= 16 and s.Z <= 16) then
+            return true
+        end
+    end
+
+    if Config.ESP.IgnoreGlassWater
+        and (hitPart.Material == Enum.Material.Glass or hitPart.Material == Enum.Material.ForceField)
+        and hitPart.Transparency >= 0.30
+    then
+        return true
+    end
+
+    if hitPart.Transparency >= 0.95 then
+        return true
+    end
+
+    -- Never bypass opaque CanCollide=false visual walls/props; only bypass truly transparent non-colliding volumes
+    if (not hitPart.CanCollide) and (hitPart.Transparency >= 0.70) then
+        return true
+    end
+
+    return false
 end
 
 -- FOV Circle (ScreenGui + optional Drawing synced cleanly)
@@ -1574,8 +1636,12 @@ local function isCandidateModelForPlayer(model, player)
     end
 
     local matched = false
+    if model:IsA("Model") and Players:GetPlayerFromCharacter(model) == player then
+        matched = true
+    end
+
     local name = model.Name
-    if name == player.Name or name == player.DisplayName or name == tostring(player.UserId) then
+    if not matched and (name == player.Name or name == player.DisplayName or name == tostring(player.UserId)) then
         matched = true
     end
     if not matched then
@@ -1585,8 +1651,41 @@ local function isCandidateModelForPlayer(model, player)
         end
     end
     if not matched then
-        local ownerVal = model:FindFirstChild("Player") or model:FindFirstChild("Owner") or model:FindFirstChild("Creator")
-        if ownerVal and ownerVal:IsA("ObjectValue") and ownerVal.Value == player then
+        local strAttr = model:GetAttribute("PlayerName") or model:GetAttribute("Owner") or model:GetAttribute("Player") or model:GetAttribute("Username") or model:GetAttribute("CharacterOwner")
+        if type(strAttr) == "string" and (strAttr == player.Name or strAttr == player.DisplayName or strAttr == tostring(player.UserId)) then
+            matched = true
+        end
+    end
+    if not matched then
+        for _, childName in ipairs({"Player", "Owner", "Creator", "PlayerName", "Username", "UserId", "PlayerId", "OwnerId"}) do
+            local valObj = model:FindFirstChild(childName)
+            if valObj then
+                if valObj:IsA("ObjectValue") and valObj.Value == player then
+                    matched = true
+                    break
+                elseif valObj:IsA("StringValue") and (valObj.Value == player.Name or valObj.Value == player.DisplayName or valObj.Value == tostring(player.UserId)) then
+                    matched = true
+                    break
+                elseif (valObj:IsA("IntValue") or valObj:IsA("NumberValue")) and valObj.Value == player.UserId then
+                    matched = true
+                    break
+                end
+            end
+        end
+    end
+
+    local hum = model:FindFirstChildOfClass("Humanoid")
+    if not matched and hum and model:GetAttribute("IsBot") ~= true and model:GetAttribute("IsNPC") ~= true then
+        local okDn, dn = pcall(function()
+            return hum.DisplayName
+        end)
+        if okDn and type(dn) == "string" and dn ~= "" and (dn == player.Name or dn == player.DisplayName) then
+            matched = true
+        end
+    end
+    if not matched and hum and model.Parent and model.Parent ~= Workspace and (model.Parent:IsA("Folder") or model.Parent:IsA("Model")) then
+        local pName = model.Parent.Name
+        if pName == player.Name or pName == tostring(player.UserId) then
             matched = true
         end
     end
@@ -1594,7 +1693,6 @@ local function isCandidateModelForPlayer(model, player)
         return false, false
     end
 
-    local hum = model:FindFirstChildOfClass("Humanoid")
     local isAlive = (hum == nil) or (hum.MaxHealth <= 0) or (hum.Health > 0) or (model:GetAttribute("Alive") == true)
     return true, isAlive
 end
@@ -1857,10 +1955,11 @@ local function cacheCharacterParts(entry, character)
         or entry.Head
         or rigParts[1]
         or (character:IsA("BasePart") and character or character:FindFirstChildWhichIsA("BasePart", true))
+    entry.LastChildCount = #character:GetChildren()
     entry.LastScanTime = os.clock()
 end
 
--- Deep arbitrary-depth Workspace descendant scan used only for players whose Character isn't bound yet
+-- Deep arbitrary-depth Workspace descendant scan used for players whose Character isn't bound yet
 local function deepWorkspaceScanForMissingPlayers(missingPlayers)
     local foundMap = {}
     if not missingPlayers or #missingPlayers == 0 or not Config.Resolver.CustomContainerScan then
@@ -1871,8 +1970,13 @@ local function deepWorkspaceScanForMissingPlayers(missingPlayers)
     local remainingCount = 0
     for _, plr in ipairs(missingPlayers) do
         if plr and plr ~= LocalPlayer and plr.Parent == Players then
-            remaining[plr] = true
-            remainingCount = remainingCount + 1
+            local direct = plr.Character
+            if direct and direct.Parent and direct:IsDescendantOf(Workspace) and hasInstanceParts(direct) then
+                foundMap[plr] = direct
+            else
+                remaining[plr] = true
+                remainingCount = remainingCount + 1
+            end
         end
     end
     if remainingCount == 0 then
@@ -1881,16 +1985,23 @@ local function deepWorkspaceScanForMissingPlayers(missingPlayers)
 
     for _, desc in ipairs(Workspace:GetDescendants()) do
         if (desc:IsA("Model") or desc:IsA("BasePart")) and desc ~= State.LocalCharacter then
-            for plr in pairs(remaining) do
-                local ok, alive = isCandidateModelForPlayer(desc, plr)
-                if ok then
-                    if alive or not foundMap[plr] then
-                        foundMap[plr] = desc
-                    end
-                    if alive then
-                        remaining[plr] = nil
-                        remainingCount = remainingCount - 1
-                        break
+            local directOwner = desc:IsA("Model") and Players:GetPlayerFromCharacter(desc) or nil
+            if directOwner and remaining[directOwner] and hasInstanceParts(desc) then
+                foundMap[directOwner] = desc
+                remaining[directOwner] = nil
+                remainingCount = remainingCount - 1
+            else
+                for plr in pairs(remaining) do
+                    local ok, alive = isCandidateModelForPlayer(desc, plr)
+                    if ok then
+                        if alive or not foundMap[plr] then
+                            foundMap[plr] = desc
+                        end
+                        if alive then
+                            remaining[plr] = nil
+                            remainingCount = remainingCount - 1
+                            break
+                        end
                     end
                 end
             end
@@ -2193,18 +2304,6 @@ local function syncWorkspaceBots(playerCharSet)
     if State.Unloaded then
         return
     end
-    if Config.Aimbot.IgnoreBots and Config.TriggerBot.IgnoreBots and Config.ESP.IgnoreBots then
-        local toDrop = {}
-        for key, entry in pairs(Registry) do
-            if entry.IsBot then
-                table.insert(toDrop, key)
-            end
-        end
-        for _, key in ipairs(toDrop) do
-            destroyPlayerEntry(key)
-        end
-        return
-    end
 
     local charLookup = playerCharSet or {}
     if not playerCharSet then
@@ -2225,10 +2324,24 @@ local function syncWorkspaceBots(playerCharSet)
         end
     end
 
+    local botsDisabledEverywhere = Config.Aimbot.IgnoreBots and Config.TriggerBot.IgnoreBots and Config.ESP.IgnoreBots
+    if botsDisabledEverywhere then
+        local toDrop = {}
+        for key, entry in pairs(Registry) do
+            if entry.IsBot then
+                table.insert(toDrop, key)
+            end
+        end
+        for _, key in ipairs(toDrop) do
+            destroyPlayerEntry(key)
+        end
+    end
+
     local cam = State.Camera or Workspace.CurrentCamera
     local camPos = cam and cam.CFrame.Position or nil
     local candidates = {}
     local candidateSeen = {}
+    local playerList = Players:GetPlayers()
 
     local function considerModel(model)
         if not model or candidateSeen[model] or charLookup[model] then
@@ -2240,14 +2353,35 @@ local function syncWorkspaceBots(playerCharSet)
         if model == Workspace.Terrain or model == cam then
             return
         end
-        if Players:GetPlayerFromCharacter(model) ~= nil then
+        local realOwner = model:IsA("Model") and Players:GetPlayerFromCharacter(model) or nil
+        if realOwner ~= nil then
+            if realOwner ~= LocalPlayer and hasInstanceParts(model) then
+                if not Registry[realOwner] then
+                    registerPlayerEntry(realOwner)
+                end
+                local pEntry = Registry[realOwner]
+                if pEntry and pEntry.Character ~= model then
+                    bindCharacterToEntry(pEntry, model)
+                end
+            end
+            charLookup[model] = true
             return
         end
-        for _, plr in ipairs(Players:GetPlayers()) do
-            if isCandidateModelForPlayer(model, plr) then
+        for _, plr in ipairs(playerList) do
+            if plr ~= LocalPlayer and isCandidateModelForPlayer(model, plr) then
+                if not Registry[plr] then
+                    registerPlayerEntry(plr)
+                end
+                local pEntry = Registry[plr]
+                if pEntry and pEntry.Character ~= model then
+                    bindCharacterToEntry(pEntry, model)
+                end
                 charLookup[model] = true
                 return
             end
+        end
+        if botsDisabledEverywhere then
+            return
         end
         local hasHum = model:FindFirstChildOfClass("Humanoid") ~= nil
         local hasBotTag = (model:GetAttribute("IsBot") == true) or (model:GetAttribute("IsNPC") == true) or (model:GetAttribute("Enemy") == true)
@@ -2268,6 +2402,11 @@ local function syncWorkspaceBots(playerCharSet)
         if folder then
             for _, child in ipairs(folder:GetChildren()) do
                 considerModel(child)
+                if child:IsA("Folder") and #child:GetChildren() <= 200 then
+                    for _, nested in ipairs(child:GetChildren()) do
+                        considerModel(nested)
+                    end
+                end
             end
         end
     end
@@ -2276,6 +2415,33 @@ local function syncWorkspaceBots(playerCharSet)
         if child:IsA("Model") then
             considerModel(child)
         end
+    end
+
+    -- Periodic full Workspace Humanoid scan ensures bots & custom rigs inside any nested map folder load without aiming at them first
+    local now = os.clock()
+    if State.ReloadCount <= 2 or (now - (State.LastDeepBotScan or 0)) >= 0.95 then
+        State.LastDeepBotScan = now
+        for _, desc in ipairs(Workspace:GetDescendants()) do
+            if desc:IsA("Humanoid") then
+                local parentModel = desc.Parent
+                if parentModel and (parentModel:IsA("Model") or parentModel:IsA("BasePart")) then
+                    considerModel(parentModel)
+                end
+            elseif (desc:IsA("Model") or desc:IsA("BasePart")) and (desc:GetAttribute("IsBot") == true or desc:GetAttribute("IsNPC") == true or desc:GetAttribute("Enemy") == true) then
+                considerModel(desc)
+            end
+        end
+    else
+        -- Keep already-registered bots fresh between full deep scans
+        for key, entry in pairs(Registry) do
+            if entry.IsBot and typeof(key) == "Instance" and key.Parent and isModelBotAlive(key) then
+                considerModel(key)
+            end
+        end
+    end
+
+    if botsDisabledEverywhere then
+        return
     end
 
     if #candidates > MAX_TRACKED_BOTS then
@@ -3148,27 +3314,11 @@ local function raycastPointVisible(camera, targetCharacter, targetPos)
         end
 
         local hitPart = result.Instance
-        local parentName = hitPart.Parent and string.lower(hitPart.Parent.Name) or ""
-        local isVfxOrDebris = string.find(parentName, "bullet", 1, true) ~= nil
-            or string.find(parentName, "effect", 1, true) ~= nil
-            or string.find(parentName, "debris", 1, true) ~= nil
-            or string.find(parentName, "vfx", 1, true) ~= nil
-            or string.find(parentName, "tracer", 1, true) ~= nil
-            or string.find(parentName, "projectile", 1, true) ~= nil
-        local isOverlay = (OverlayGui and hitPart:IsDescendantOf(OverlayGui))
-            or (HighlightContainer and hitPart:IsDescendantOf(HighlightContainer))
-            or (string.find(hitPart.Name, "TEAM_AKI", 1, true) ~= nil)
-        local isAccessory = hitPart:FindFirstAncestorOfClass("Accessory") ~= nil
-        local isInvisibleHitbox = (hitPart.Transparency >= 0.95)
-        local isNonCollidable = (not hitPart.CanCollide)
-        local isNonBlockingGlass = Config.ESP.IgnoreGlassWater
-            and hitPart.Material == Enum.Material.Glass
-            and hitPart.Transparency >= 0.35
-
-        if isOverlay or isNonCollidable or isInvisibleHitbox or isAccessory or isVfxOrDebris or isNonBlockingGlass then
+        local distFromCam = (result.Position - origin).Magnitude
+        if VisualHelper.isRayPartNonBlocking(hitPart, distFromCam, true) then
             table.insert(filterList, hitPart)
             local stepDist = (result.Position - currentOrigin).Magnitude
-            currentOrigin = currentOrigin + dirUnit * math.min(stepDist + 0.002, remaining)
+            currentOrigin = currentOrigin + dirUnit * math.min(stepDist + 0.015, remaining)
         else
             return false
         end
@@ -3450,7 +3600,7 @@ local function updateAllESP(camera, viewportSize, screenCenter)
             local _, _, hpRatio, shieldAmt = getCharacterHealth(entry)
             local hpColor = getHealthColor(hpRatio)
 
-            local showTracer = Config.ESP.TracerESP and (not isBehind) and rootOnScreen
+            local showTracer = Config.ESP.TracerESP and (not isBehind) and (rootOnScreen or boxValid)
             local tracerFrom = Vector2.new(viewportSize.X * 0.5, viewportSize.Y)
             local tracerTo = boxValid and Vector2.new(bx + bw * 0.5, by + bh) or screenPos
 
@@ -3771,30 +3921,24 @@ local function getAimWorldPosition(entry, aimPart, camera, screenCenter)
     return basePos
 end
 
-local function getRawPingSeconds()
+local function getOneWayPingSeconds()
     if not StatsService then
-        return 0.055
+        return 0.032
     end
     local ok, pingMs = pcall(function()
         return StatsService.Network.ServerStatsItem["Data Ping"]:GetValue()
     end)
     if ok and isFiniteNumber(pingMs) and pingMs > 0 then
-        return math.clamp((pingMs / 1000) * 0.55, 0.01, 0.28)
+        return math.clamp(pingMs / 2000, 0.005, 0.14)
     end
-    return 0.055
+    return 0.032
 end
 
 local function getLocalPingSeconds()
     if not Config.Aimbot.PingCompensation or not StatsService then
         return 0
     end
-    local ok, pingMs = pcall(function()
-        return StatsService.Network.ServerStatsItem["Data Ping"]:GetValue()
-    end)
-    if ok and isFiniteNumber(pingMs) and pingMs > 0 then
-        return math.clamp((pingMs / 1000) * 0.5, 0, 0.25)
-    end
-    return 0
+    return getOneWayPingSeconds() * 0.72
 end
 
 local function resolveTargetVelocity(entry, part, targetPos, dt, readOnly)
@@ -3807,7 +3951,8 @@ local function resolveTargetVelocity(entry, part, targetPos, dt, readOnly)
             roPhys = part.AssemblyLinearVelocity
         end)
         if isFiniteVector3(roPhys) and roPhys.Magnitude <= 140 then
-            return Vector3.new(roPhys.X, math.clamp(roPhys.Y, -60, 60) * 0.45, roPhys.Z)
+            local roY = (math.abs(roPhys.Y) < 1.8) and 0 or (math.clamp(roPhys.Y, -55, 55) * 0.35)
+            return Vector3.new(roPhys.X, roY, roPhys.Z)
         end
         return Vector3.zero
     end
@@ -3822,11 +3967,13 @@ local function resolveTargetVelocity(entry, part, targetPos, dt, readOnly)
         return Vector3.zero
     end
 
+    local hasFrameVel = false
     local frameVel = Vector3.zero
     if entry.LastTrackedPart == part and entry.LastTrackedPos and dt > 0.0005 then
         local deltaPos = pos - entry.LastTrackedPos
         if isFiniteVector3(deltaPos) and deltaPos.Magnitude < 18 then
             frameVel = deltaPos / dt
+            hasFrameVel = true
         end
     end
     entry.LastTrackedPart = part
@@ -3836,21 +3983,51 @@ local function resolveTargetVelocity(entry, part, targetPos, dt, readOnly)
     pcall(function()
         physVel = part.AssemblyLinearVelocity
     end)
+    local validPhys = isFiniteVector3(physVel) and physVel.Magnitude <= 140
 
-    local rawVel = (isFiniteVector3(physVel) and physVel.Magnitude >= 0.25 and physVel.Magnitude <= 140) and physVel or frameVel
+    local rawVel = Vector3.zero
+    if validPhys and hasFrameVel then
+        if physVel.Magnitude < 0.8 and frameVel.Magnitude < 0.8 then
+            rawVel = Vector3.zero
+        elseif physVel.Magnitude >= 0.4 and frameVel.Magnitude >= 0.4 then
+            rawVel = physVel:Lerp(frameVel, 0.35)
+        elseif frameVel.Magnitude >= 1.0 then
+            rawVel = frameVel
+        else
+            rawVel = physVel
+        end
+    elseif validPhys then
+        rawVel = physVel
+    elseif hasFrameVel then
+        rawVel = frameVel
+    end
+
     if not isFiniteVector3(rawVel) or rawVel.Magnitude > 140 then
         rawVel = Vector3.zero
     end
 
-    -- Dampen vertical spikes so jumping/ragdolling targets never snap camera toward the sky
     local horiz = Vector3.new(rawVel.X, 0, rawVel.Z)
-    if horiz.Magnitude > 115 then
+    if horiz.Magnitude < 0.85 then
+        horiz = Vector3.zero
+    elseif horiz.Magnitude > 115 then
         horiz = horiz.Unit * 115
     end
-    local clampedY = math.clamp(rawVel.Y, -60, 60) * 0.45
+    local clampedY = (math.abs(rawVel.Y) < 1.8) and 0 or (math.clamp(rawVel.Y, -55, 55) * 0.35)
     local safeVel = Vector3.new(horiz.X, clampedY, horiz.Z)
 
-    entry.EstimatedVel = entry.EstimatedVel:Lerp(safeVel, 0.52)
+    -- Snap immediately on ADAD strafe reversal or sudden stop so aim never overshoots past the enemy
+    local prevVel = entry.EstimatedVel
+    local blend = 0.56
+    if safeVel.Magnitude < 1.25 then
+        entry.EstimatedVel = prevVel:Lerp(Vector3.zero, 0.84)
+        if entry.EstimatedVel.Magnitude < 0.35 then
+            entry.EstimatedVel = Vector3.zero
+        end
+    elseif isFiniteVector3(prevVel) and prevVel.Magnitude > 2.5 and prevVel:Dot(safeVel) < -3.0 then
+        entry.EstimatedVel = safeVel * 0.72
+    else
+        entry.EstimatedVel = prevVel:Lerp(safeVel, blend)
+    end
     if not isFiniteVector3(entry.EstimatedVel) then
         entry.EstimatedVel = Vector3.zero
     end
@@ -3895,28 +4072,153 @@ local function evaluateAimCandidate(targetKey, camera, screenCenter)
     return true, entry, aimPart, screenDist, worldDist
 end
 
-local function computePredictedTargetPoint(entry, part, basePos, worldDist, dt, readOnly)
+function VisualHelper.raycastSolidMovementPath(origin, offsetVec, targetCharacter)
+    if not isFiniteVector3(origin) or not isFiniteVector3(offsetVec) or offsetVec.Magnitude < 0.04 then
+        return nil
+    end
+    local filterList = {OverlayGui, HighlightContainer}
+    if targetCharacter then
+        table.insert(filterList, targetCharacter)
+    end
+    local localChar = State.LocalCharacter or LocalPlayer.Character
+    if localChar then
+        table.insert(filterList, localChar)
+    end
+    local cam = State.Camera or Workspace.CurrentCamera
+    if cam then
+        table.insert(filterList, cam)
+    end
+
+    RayParams.FilterType = Enum.RaycastFilterType.Exclude
+    RayParams.IgnoreWater = Config.ESP.IgnoreGlassWater
+    local currentOrigin = origin
+    local dirUnit = offsetVec.Unit
+    local totalLen = offsetVec.Magnitude
+
+    for _ = 1, 6 do
+        local covered = (currentOrigin - origin).Magnitude
+        local remaining = totalLen - covered
+        if remaining <= 0.03 then
+            return nil
+        end
+        RayParams.FilterDescendantsInstances = filterList
+        local res = Workspace:Raycast(currentOrigin, dirUnit * remaining, RayParams)
+        if not res or not res.Instance then
+            return nil
+        end
+        if VisualHelper.isRayPartNonBlocking(res.Instance, 999, false) then
+            table.insert(filterList, res.Instance)
+            local stepDist = (res.Position - currentOrigin).Magnitude
+            currentOrigin = currentOrigin + dirUnit * math.min(stepDist + 0.015, remaining)
+        else
+            return res
+        end
+    end
+    return nil
+end
+
+function VisualHelper.clampPredictedToEnvironment(entry, basePos, predOffset, camera)
+    if not isFiniteVector3(predOffset) or predOffset.Magnitude < 0.05 then
+        return basePos + (isFiniteVector3(predOffset) and predOffset or Vector3.zero)
+    end
+
+    local candidateOffset = predOffset
+    local char = entry and entry.Character or nil
+    local wallHit = VisualHelper.raycastSolidMovementPath(basePos, candidateOffset, char)
+    if wallHit then
+        local hitDist = (wallHit.Position - basePos).Magnitude
+        local safeStop = math.max(0, hitDist - math.min(0.65, hitDist * 0.35))
+        local stopOffset = candidateOffset.Unit * safeStop
+        local leftover = candidateOffset - stopOffset
+        local n = wallHit.Normal
+        if math.abs(n.Y) < 0.65 then
+            local flatN = Vector3.new(n.X, 0, n.Z)
+            if flatN.Magnitude > 0.01 then
+                n = flatN.Unit
+            end
+        end
+        local slideVec = leftover - n * leftover:Dot(n)
+        if slideVec.Magnitude > 0.04 then
+            local slideOrigin = basePos + stopOffset
+            local slideHit = VisualHelper.raycastSolidMovementPath(slideOrigin, slideVec, char)
+            if slideHit then
+                local sDist = (slideHit.Position - slideOrigin).Magnitude
+                local safeSlide = math.max(0, sDist - math.min(0.45, sDist * 0.35))
+                slideVec = slideVec.Unit * safeSlide
+            end
+            candidateOffset = stopOffset + slideVec
+        else
+            candidateOffset = stopOffset
+        end
+    end
+
+    local predictedPos = basePos + candidateOffset
+    if camera and char and isFiniteVector3(predictedPos) then
+        -- Peek protection: if enemy's body is visible around cover but predicted lead enters the wall beside them, pull back onto exposed edge
+        if raycastPointVisible(camera, char, basePos) and not raycastPointVisible(camera, char, predictedPos) then
+            local resolved = basePos
+            for _, frac in ipairs({0.72, 0.45, 0.22}) do
+                local probe = basePos:Lerp(predictedPos, frac)
+                if raycastPointVisible(camera, char, probe) then
+                    resolved = probe
+                    break
+                end
+            end
+            predictedPos = resolved
+        end
+    end
+
+    return isFiniteVector3(predictedPos) and predictedPos or basePos
+end
+
+local function computePredictedTargetPoint(entry, part, basePos, worldDist, dt, readOnly, camera, skipEnvCheck)
     local velocity = resolveTargetVelocity(entry, part, basePos, dt, readOnly)
-    local projLead = (Config.Aimbot.ProjectileSpeed > 0) and (worldDist / Config.Aimbot.ProjectileSpeed) or 0
-    local leadTime
-    if Config.Aimbot.AutoPredict then
-        local pingSec = getRawPingSeconds()
-        local distFactor = math.clamp(worldDist / 1350, 0, 0.095)
-        local horizSpeed = Vector3.new(velocity.X, 0, velocity.Z).Magnitude
-        local speedScale = (horizSpeed < 1.2) and 0.35 or math.clamp(0.75 + (horizSpeed / 120), 0.75, 1.42)
-        leadTime = math.clamp((pingSec + distFactor) * speedScale + projLead, 0.01, 0.34)
+    local horizSpeed = Vector3.new(velocity.X, 0, velocity.Z).Magnitude
+    local cam = camera or State.Camera or Workspace.CurrentCamera
+    local camPos = cam and cam.CFrame.Position or basePos
+    local projSpeed = Config.Aimbot.ProjectileSpeed
+
+    local leadTime = 0
+    if projSpeed > 0 then
+        -- 2-iteration ballistic intercept solve so moving targets are met cleanly without under-leading
+        local t = worldDist / projSpeed
+        if isFiniteVector3(camPos) then
+            for _ = 1, 2 do
+                local estPos = basePos + velocity * math.min(t, 1.35)
+                t = (estPos - camPos).Magnitude / projSpeed
+            end
+        end
+        local extraLead = Config.Aimbot.AutoPredict
+            and (getOneWayPingSeconds() * 0.48)
+            or (Config.Aimbot.Prediction * 0.5 + getLocalPingSeconds())
+        leadTime = math.clamp(t + extraLead, 0, 1.35)
+    elseif Config.Aimbot.AutoPredict then
+        if horizSpeed < 1.6 and math.abs(velocity.Y) < 2.5 then
+            leadTime = 0
+        else
+            local oneWay = getOneWayPingSeconds()
+            local distMicro = math.clamp(worldDist / 4500, 0, 0.025)
+            local speedFactor = math.clamp(0.55 + (horizSpeed / 90), 0.55, 0.92)
+            leadTime = math.clamp((oneWay * 0.78 + distMicro) * speedFactor, 0.004, 0.095)
+        end
     else
-        leadTime = math.clamp(Config.Aimbot.Prediction + projLead + getLocalPingSeconds(), 0, 0.36)
+        leadTime = math.clamp(Config.Aimbot.Prediction + getLocalPingSeconds(), 0, 0.35)
     end
 
     local predOffset = velocity * leadTime
+    local maxOffset = (projSpeed > 0) and math.clamp(worldDist * 0.35, 16, 42) or 10
     if not isFiniteVector3(predOffset) then
         predOffset = Vector3.zero
-    elseif predOffset.Magnitude > 16 then
-        predOffset = predOffset.Unit * 16
+    elseif predOffset.Magnitude > maxOffset then
+        predOffset = predOffset.Unit * maxOffset
     end
 
-    local predictedPos = basePos + predOffset
+    local predictedPos
+    if skipEnvCheck then
+        predictedPos = basePos + predOffset
+    else
+        predictedPos = VisualHelper.clampPredictedToEnvironment(entry, basePos, predOffset, cam)
+    end
     if not isFiniteVector3(predictedPos) then
         return basePos, leadTime
     end
@@ -3984,7 +4286,7 @@ local function updateAimbot(camera, screenCenter, dt)
         return
     end
 
-    local predictedPos = computePredictedTargetPoint(chosenEntry, chosenPart, aimBasePos, chosenDist, dt)
+    local predictedPos = computePredictedTargetPoint(chosenEntry, chosenPart, aimBasePos, chosenDist, dt, false, camera, false)
     State.CurrentAimPart = chosenPart
     State.CurrentAimPredictedPos = predictedPos
     State.CurrentAimFrame = State.FrameIndex
@@ -4936,20 +5238,10 @@ local function findTriggerTarget(camera, screenCenter, dt)
             remaining = remaining - (result.Position - currentOrigin).Magnitude - 0.05
             currentOrigin = result.Position + dirUnit * 0.05
         else
-            local isCloseViewmodel = hitDistFromCam < 4.5 and (
-                hitPart:FindFirstAncestorOfClass("Tool") ~= nil
-                or string.find(string.lower(hitPart.Name), "viewmodel", 1, true) ~= nil
-                or (hitPart.Parent and string.find(string.lower(hitPart.Parent.Name), "viewmodel", 1, true) ~= nil)
-                or (hitPart.Parent and string.find(string.lower(hitPart.Parent.Name), "arms", 1, true) ~= nil)
-            )
-            local isAccessory = hitPart:FindFirstAncestorOfClass("Accessory") ~= nil
-            local isNonBlockingGlass = Config.ESP.IgnoreGlassWater
-                and hitPart.Material == Enum.Material.Glass
-                and hitPart.Transparency >= 0.35
-            if isCloseViewmodel or (not hitPart.CanCollide) or isAccessory or isNonBlockingGlass or hitPart.Transparency >= 0.95 then
+            if VisualHelper.isRayPartNonBlocking(hitPart, hitDistFromCam, true) then
                 table.insert(filterList, hitPart)
-                remaining = remaining - (result.Position - currentOrigin).Magnitude - 0.005
-                currentOrigin = result.Position + dirUnit * 0.005
+                remaining = remaining - (result.Position - currentOrigin).Magnitude - 0.015
+                currentOrigin = result.Position + dirUnit * 0.015
             else
                 break
             end
@@ -5033,7 +5325,7 @@ local function findTriggerTarget(camera, screenCenter, dt)
 
                     if usePredSweep then
                         local worldDist = (checkPos - origin).Magnitude
-                        local predPos = computePredictedTargetPoint(entry, part, checkPos, worldDist, dt or (1 / 60), true)
+                        local predPos = computePredictedTargetPoint(entry, part, checkPos, worldDist, dt or (1 / 60), true, camera, true)
                         local vpP, onP = camera:WorldToViewportPoint(predPos)
                         if vpP.Z > 0 and onP then
                             local pDist = (Vector2.new(vpP.X, vpP.Y) - screenCenter).Magnitude
@@ -5053,6 +5345,17 @@ local function findTriggerTarget(camera, screenCenter, dt)
                             camera = camera,
                             targetPart = part,
                         })
+                        if valid then
+                            if usePredSweep and matchedPos ~= checkPos then
+                                local envPos = VisualHelper.clampPredictedToEnvironment(entry, checkPos, matchedPos - checkPos, Config.TriggerBot.VisibleCheck and camera or nil)
+                                local vpEnv, onEnv = camera:WorldToViewportPoint(envPos)
+                                if not (vpEnv.Z > 0 and onEnv and (Vector2.new(vpEnv.X, vpEnv.Y) - screenCenter).Magnitude <= bestScreenDist) then
+                                    valid = false
+                                else
+                                    matchedPos = envPos
+                                end
+                            end
+                        end
                         if valid then
                             bestScreenDist = sDist
                             bestKey = targetKey
@@ -5216,25 +5519,29 @@ local function onRenderStepFrame(dt)
                     if okRes and liveChar and liveChar.Parent then
                         if entry.Character ~= liveChar then
                             bindCharacterToEntry(entry, liveChar)
-                        elseif entry.NeedsRescan
-                            or (not entry.RootPart)
-                            or (not entry.RootPart.Parent)
-                            or (#entry.RigParts == 0 and (now - entry.LastScanTime) > 0.25)
-                        then
-                            entry.NeedsRescan = false
-                            cacheCharacterParts(entry, liveChar)
-                            attachRemoteHumanoidDeath(entry)
-                        elseif entry.RootPart and entry.RootPart.Parent then
-                            local curPos = entry.RootPart.Position
-                            if entry.LastKnownWorldPos and (curPos - entry.LastKnownWorldPos).Magnitude >= 35 then
-                                entry.LastKnownWorldPos = curPos
-                                entry.EstimatedVel = Vector3.zero
-                                entry.LastTrackedPos = nil
-                                entry.FrameVisualCache = nil
+                        else
+                            local childCount = #liveChar:GetChildren()
+                            if entry.NeedsRescan
+                                or (not entry.RootPart)
+                                or (not entry.RootPart.Parent)
+                                or (entry.LastChildCount ~= childCount)
+                                or ((now - entry.LastScanTime) >= 1.25 and (#entry.RigParts <= 1 or not entry.Head or not entry.Humanoid))
+                            then
+                                entry.NeedsRescan = false
                                 cacheCharacterParts(entry, liveChar)
-                                ScheduleReload("RemoteTeleport:" .. player.Name, false)
-                            else
-                                entry.LastKnownWorldPos = curPos
+                                attachRemoteHumanoidDeath(entry)
+                            elseif entry.RootPart and entry.RootPart.Parent then
+                                local curPos = entry.RootPart.Position
+                                if entry.LastKnownWorldPos and (curPos - entry.LastKnownWorldPos).Magnitude >= 35 then
+                                    entry.LastKnownWorldPos = curPos
+                                    entry.EstimatedVel = Vector3.zero
+                                    entry.LastTrackedPos = nil
+                                    entry.FrameVisualCache = nil
+                                    cacheCharacterParts(entry, liveChar)
+                                    ScheduleReload("RemoteTeleport:" .. player.Name, false)
+                                else
+                                    entry.LastKnownWorldPos = curPos
+                                end
                             end
                         end
                     else
@@ -7439,7 +7746,7 @@ do
     end)
 
     addSectionHeader(AimbotPage, 6, "Prediction & Auto Predict")
-    addToggle(AimbotPage, 7, "Auto Predict", "Automatically adjusts lead by live ping, distance & target speed", function()
+    addToggle(AimbotPage, 7, "Auto Predict", "Calibrates hitscan/projectile lead by ping, speed & wall awareness", function()
         return Config.Aimbot.AutoPredict
     end, function(v)
         Config.Aimbot.AutoPredict = v
@@ -7453,7 +7760,7 @@ do
         Config.Aimbot.Prediction = v
     end)
 
-    addSlider(AimbotPage, 9, "Projectile Speed (0 = Lead Only)", 0, 2000, 50, function(v)
+    addSlider(AimbotPage, 9, "Projectile Speed (0 = Hitscan)", 0, 2000, 50, function(v)
         local n = math.round(v)
         return (n == 0) and "Off" or string.format("%d st/s", n)
     end, function()
