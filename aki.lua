@@ -386,6 +386,10 @@ local State = {
     LastExternalHighlightScan = 0,
     LastTeamScan = -1,
     DetectedTeamScheme = "FFA",
+    TeamSignals = nil,
+    TeamIgnoreNeutral = false,
+    ColorIgnoreNeutral = false,
+    TeamZeroIsNeutral = false,
     LastReloadReason = "Startup",
     ActiveDragCount = 0,
     DragSinkBound = false,
@@ -2327,6 +2331,16 @@ local function registerPlayerEntry(player)
         end
     end))
 
+    table.insert(entry.PlayerConns, player:GetPropertyChangedSignal("Team"):Connect(function()
+        State.LastTeamScan = -1
+    end))
+    table.insert(entry.PlayerConns, player:GetPropertyChangedSignal("TeamColor"):Connect(function()
+        State.LastTeamScan = -1
+    end))
+    table.insert(entry.PlayerConns, player:GetPropertyChangedSignal("Neutral"):Connect(function()
+        State.LastTeamScan = -1
+    end))
+
     local initialChar = resolveCharacterForPlayer(player, true)
     if initialChar then
         bindCharacterToEntry(entry, initialChar)
@@ -3012,6 +3026,15 @@ addConnection(LocalPlayer:GetPropertyChangedSignal("Neutral"):Connect(function()
     State.LastTeamScan = -1
 end))
 
+if Teams then
+    addConnection(Teams.ChildAdded:Connect(function()
+        State.LastTeamScan = -1
+    end))
+    addConnection(Teams.ChildRemoved:Connect(function()
+        State.LastTeamScan = -1
+    end))
+end
+
 addConnection(LocalPlayer.CharacterAdded:Connect(function(char)
     if not State.Unloaded then
         State.LastTeamScan = -1
@@ -3044,6 +3067,9 @@ local NON_COMBAT_TEAM_NAMES = {
     spectator = true,
     spectators = true,
     spectating = true,
+    spectate = true,
+    choosing = true,
+    selecting = true,
     afk = true,
     waiting = true,
     ["waiting room"] = true,
@@ -3080,9 +3106,17 @@ local NON_COMBAT_TEAM_NAMES = {
     solo = true,
     none = true,
     default = true,
-    ["0"] = true,
+    safezone = true,
+    peaceful = true,
+    hub = true,
     ["-1"] = true,
     ["false"] = true,
+    ["nil"] = true,
+    ["null"] = true,
+    ["n/a"] = true,
+    na = true,
+    undefined = true,
+    unknown = true,
     [""] = true,
 }
 
@@ -3098,13 +3132,18 @@ local NEUTRAL_BRICK_COLORS = {
 
 local TEAM_ATTR_KEYS = {
     "Team", "TeamId", "TeamID", "TeamName", "TeamColor",
-    "Faction", "Squad", "Side", "Role", "Allegiance",
-    "Alliance", "Clan", "TeamIndex", "TeamNumber", "team", "teamId",
+    "CurrentTeam", "AssignedTeam", "MatchTeam", "TeamIndex", "TeamNumber",
+    "TeamNum", "TeamTag", "Team_Id", "team", "teamId", "team_id",
+    "Faction", "Squad", "Side", "SideId", "Party", "PartyId", "PartyID",
+    "Allegiance", "Alliance", "Clan", "Crew", "Gang", "Guild", "Tribe",
+    "Nation", "Division", "Role", "Group", "GroupId",
+    "faction", "squad", "side", "role", "party", "clan", "crew", "gang",
 }
 
 local TEAM_VALUE_CHILD_NAMES = {
     "Team", "TeamValue", "TeamName", "TeamId", "TeamID",
-    "Faction", "Side", "Squad", "Role", "TeamColor",
+    "CurrentTeam", "AssignedTeam", "TeamColor", "TeamIndex", "TeamNumber",
+    "Faction", "Side", "Squad", "Party", "PartyId", "Clan", "Crew", "Role",
 }
 
 local function isCombatTeam(teamObj)
@@ -3133,7 +3172,11 @@ local function normalizeTeamTag(val)
             end
             return nil
         end
-        return "inst:" .. string.lower(val.Name)
+        local nm = string.lower(val.Name)
+        if NON_COMBAT_TEAM_NAMES[nm] then
+            return nil
+        end
+        return "inst:" .. nm
     end
     if typeof(val) == "BrickColor" then
         if isCombatBrickColor(val) then
@@ -3153,6 +3196,9 @@ local function normalizeTeamTag(val)
     if NON_COMBAT_TEAM_NAMES[key] then
         return nil
     end
+    if key == "0" and State.TeamZeroIsNeutral then
+        return nil
+    end
     return key
 end
 
@@ -3160,14 +3206,42 @@ local function readTeamTagFromContainer(inst)
     if not inst then
         return nil
     end
-    for _, attrKey in ipairs(TEAM_ATTR_KEYS) do
-        local norm = normalizeTeamTag(inst:GetAttribute(attrKey))
+    -- Pass 1: Explicit Team keys across both Attributes & ValueBases before secondary Role/Clan/Squad keys
+    for i = 1, 16 do
+        local attrKey = TEAM_ATTR_KEYS[i]
+        if attrKey then
+            local norm = normalizeTeamTag(inst:GetAttribute(attrKey))
+            if norm ~= nil then
+                return norm
+            end
+        end
+    end
+    for i = 1, 10 do
+        local childName = TEAM_VALUE_CHILD_NAMES[i]
+        if childName then
+            local child = inst:FindFirstChild(childName)
+            if child and child:IsA("ValueBase") then
+                local okVal, v = pcall(function()
+                    return child.Value
+                end)
+                if okVal then
+                    local norm = normalizeTeamTag(v)
+                    if norm ~= nil then
+                        return norm
+                    end
+                end
+            end
+        end
+    end
+    -- Pass 2: Faction / Squad / Party / Clan / Role keys
+    for i = 17, #TEAM_ATTR_KEYS do
+        local norm = normalizeTeamTag(inst:GetAttribute(TEAM_ATTR_KEYS[i]))
         if norm ~= nil then
             return norm
         end
     end
-    for _, childName in ipairs(TEAM_VALUE_CHILD_NAMES) do
-        local child = inst:FindFirstChild(childName)
+    for i = 11, #TEAM_VALUE_CHILD_NAMES do
+        local child = inst:FindFirstChild(TEAM_VALUE_CHILD_NAMES[i])
         if child and child:IsA("ValueBase") then
             local okVal, v = pcall(function()
                 return child.Value
@@ -3189,7 +3263,12 @@ local function readCustomTeamTag(player, character)
         if directTag ~= nil then
             return directTag
         end
-        for _, folderName in ipairs({"leaderstats", "Data", "Stats", "Status", "PlayerData"}) do
+        for _, folderName in ipairs({
+            "leaderstats", "Data", "Stats", "Status", "PlayerData",
+            "Values", "Info", "PlayerInfo", "MatchData", "TeamData",
+            "State", "Flags", "ReplicatedData", "Profile", "ServerData",
+            "PublicData", "SessionData",
+        }) do
             local sub = player:FindFirstChild(folderName)
             if sub then
                 local subTag = readTeamTagFromContainer(sub)
@@ -3208,11 +3287,68 @@ local function readCustomTeamTag(player, character)
     return nil
 end
 
-local function hasCombatTeamColor(plr)
-    if not plr or plr.Neutral then
+function VisualHelper.readWorkspaceFolderTag(character)
+    if not character or not character.Parent or character.Parent == Workspace then
+        return nil
+    end
+    local p = character.Parent
+    if not (p:IsA("Folder") or p:IsA("Model")) then
+        return nil
+    end
+    local lname = string.lower(p.Name)
+    if NON_COMBAT_TEAM_NAMES[lname] then
+        return nil
+    end
+    local generic = {
+        players = true, characters = true, entities = true, activeplayers = true,
+        rigs = true, gameplayers = true, living = true, bots = true, npcs = true,
+        npc = true, enemies = true, zombies = true, mobs = true, dummies = true,
+        targets = true, units = true, monsters = true, ai = true, workspace = true,
+        map = true, maps = true, arena = true, spawns = true, temp = true,
+        misc = true, workspaceplayers = true, models = true, guards = true,
+        soldiers = true, bosses = true, creeps = true, bandits = true,
+        raiders = true, practice = true,
+    }
+    if generic[lname] then
+        return nil
+    end
+    return "fld:" .. lname
+end
+
+function VisualHelper.hasFriendlyOverheadMarker(character)
+    if not character or not character.Parent then
         return false
     end
-    if plr.Team ~= nil and not isCombatTeam(plr.Team) then
+    for _, desc in ipairs(character:GetDescendants()) do
+        if desc:IsA("BillboardGui") and desc.Enabled and desc.PlayerToHideFrom ~= LocalPlayer then
+            local nm = string.lower(desc.Name)
+            local isEnemy = string.find(nm, "enemy", 1, true) or string.find(nm, "hostile", 1, true)
+            local isAlly = string.find(nm, "ally", 1, true)
+                or string.find(nm, "teammate", 1, true)
+                or string.find(nm, "friendly", 1, true)
+                or string.find(nm, "teammarker", 1, true)
+                or string.find(nm, "squadmarker", 1, true)
+                or string.find(nm, "partymarker", 1, true)
+            if isAlly and not isEnemy then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function hasCombatTeamColor(plr)
+    if not plr then
+        return false
+    end
+    if plr.Team ~= nil then
+        if not isCombatTeam(plr.Team) then
+            return false
+        end
+        if plr.Neutral and not State.ColorIgnoreNeutral then
+            return false
+        end
+    elseif plr.Neutral and not State.ColorIgnoreNeutral then
         return false
     end
     return isCombatBrickColor(plr.TeamColor)
@@ -3239,61 +3375,161 @@ local function playerHasLivingWorkspaceChar(plr)
     return entry ~= nil and entry.Character ~= nil and entry.Character.Parent ~= nil and entry.RootPart ~= nil
 end
 
--- Detects whether this server has >= 2 distinct combat teams via Team, TeamColor fallback, or CustomTag
+-- Detects all active team schemes across standard Team, Neutral-tolerant TeamColor, 0/1-indexed CustomTag, FolderTag, and AllyMarker
 local function refreshDetectedTeamScheme()
     local now = os.clock()
-    if State.LastTeamScan >= 0 and (now - State.LastTeamScan) < 0.75 then
+    if State.LastTeamScan >= 0 and (now - State.LastTeamScan) < 0.50 then
         return State.DetectedTeamScheme
     end
     State.LastTeamScan = now
 
+    local allPlrs = Players:GetPlayers()
     local distinctTeams = {}
     local teamCount = 0
-    local distinctColors = {}
-    local colorCount = 0
-    local distinctTags = {}
-    local tagCount = 0
+    local definedCombatTeams = 0
+    local combatTeamPlayers = 0
+    local nonNeutralTeamPlayers = 0
+    local unteamedPlayers = 0
 
     if Teams then
         pcall(function()
             for _, teamObj in ipairs(Teams:GetTeams()) do
                 if isCombatTeam(teamObj) and not distinctTeams[teamObj] then
                     distinctTeams[teamObj] = true
-                    teamCount = teamCount + 1
+                    definedCombatTeams = definedCombatTeams + 1
                 end
             end
         end)
     end
 
-    for _, plr in ipairs(Players:GetPlayers()) do
-        if isCombatTeam(plr.Team) and not plr.Neutral then
+    local distinctColors = {}
+    local colorCount = 0
+    local colorPlayers = 0
+    local colorNonNeutral = 0
+    local uncoloredPlayers = 0
+
+    local rawTags = {}
+    local rawTagDistinct = {}
+    local hasZeroTag = false
+    local posIntCount = 0
+
+    local distinctFolders = {}
+    local folderCount = 0
+    local allyMarkers = 0
+
+    for _, plr in ipairs(allPlrs) do
+        if plr.Team ~= nil and isCombatTeam(plr.Team) then
+            combatTeamPlayers = combatTeamPlayers + 1
+            if not plr.Neutral then
+                nonNeutralTeamPlayers = nonNeutralTeamPlayers + 1
+            end
             if not distinctTeams[plr.Team] then
                 distinctTeams[plr.Team] = true
-                teamCount = teamCount + 1
             end
+        else
+            unteamedPlayers = unteamedPlayers + 1
         end
-        if hasCombatTeamColor(plr) then
+
+        if isCombatBrickColor(plr.TeamColor) and (plr.Team == nil or isCombatTeam(plr.Team)) then
+            colorPlayers = colorPlayers + 1
+            if not plr.Neutral then
+                colorNonNeutral = colorNonNeutral + 1
+            end
             local ck = plr.TeamColor.Name
             if not distinctColors[ck] then
                 distinctColors[ck] = true
                 colorCount = colorCount + 1
             end
+        else
+            uncoloredPlayers = uncoloredPlayers + 1
         end
+
         local entry = Registry[plr]
         local char = (entry and entry.Character) or plr.Character
         local tag = readCustomTeamTag(plr, char)
-        if tag ~= nil and not distinctTags[tag] then
-            distinctTags[tag] = true
-            tagCount = tagCount + 1
+        rawTags[plr] = tag
+        if tag ~= nil and not rawTagDistinct[tag] then
+            rawTagDistinct[tag] = true
+            if tag == "0" then
+                hasZeroTag = true
+            elseif tag == "1" or tag == "2" or tag == "3" or tag == "4" then
+                posIntCount = posIntCount + 1
+            end
+        end
+
+        if char then
+            local fTag = VisualHelper.readWorkspaceFolderTag(char)
+            if fTag and not distinctFolders[fTag] then
+                distinctFolders[fTag] = true
+                folderCount = folderCount + 1
+            end
+            if plr ~= LocalPlayer and VisualHelper.hasFriendlyOverheadMarker(char) then
+                allyMarkers = allyMarkers + 1
+            end
         end
     end
 
-    if teamCount >= 2 and isCombatTeam(LocalPlayer.Team) and not LocalPlayer.Neutral then
+    for _ in pairs(distinctTeams) do
+        teamCount = teamCount + 1
+    end
+
+    -- Detect whether "0" is an unassigned sentinel alongside 1, 2+ OR a valid 0-indexed Team 0
+    State.TeamZeroIsNeutral = (hasZeroTag and posIntCount >= 2)
+    -- Detect games that assign Player.Team or Player.TeamColor while leaving Neutral = true on everyone
+    State.TeamIgnoreNeutral = (combatTeamPlayers >= 2 and nonNeutralTeamPlayers == 0 and teamCount >= 2)
+    State.ColorIgnoreNeutral = (colorPlayers >= 2 and colorNonNeutral == 0 and colorCount >= 2)
+
+    local distinctTags = {}
+    local tagCount = 0
+    local untaggedPlayers = 0
+    for _, plr in ipairs(allPlrs) do
+        local tag = rawTags[plr]
+        if tag == "0" and State.TeamZeroIsNeutral then
+            tag = nil
+        end
+        if tag ~= nil then
+            if not distinctTags[tag] then
+                distinctTags[tag] = true
+                tagCount = tagCount + 1
+            end
+        else
+            untaggedPlayers = untaggedPlayers + 1
+        end
+    end
+
+    local hasBots = false
+    for _, entry in pairs(Registry) do
+        if entry.IsBot then
+            hasBots = true
+            break
+        end
+    end
+
+    local localChar = State.LocalCharacter or LocalPlayer.Character
+    local myTeamValid = isCombatTeam(LocalPlayer.Team) and (not LocalPlayer.Neutral or State.TeamIgnoreNeutral)
+    local myColorValid = hasCombatTeamColor(LocalPlayer)
+    local myTag = readCustomTeamTag(LocalPlayer, localChar)
+    local myFolderTag = localChar and VisualHelper.readWorkspaceFolderTag(localChar) or nil
+
+    local signals = {
+        Team = myTeamValid and (teamCount >= 2 or definedCombatTeams >= 2 or (teamCount == 1 and (unteamedPlayers >= 1 or hasBots))),
+        TeamColor = myColorValid and (colorCount >= 2 or (colorCount == 1 and (uncoloredPlayers >= 1 or hasBots))),
+        CustomTag = (myTag ~= nil) and (tagCount >= 2 or (tagCount == 1 and (untaggedPlayers >= 1 or hasBots))),
+        FolderTag = (myFolderTag ~= nil) and (folderCount >= 2),
+        AllyMarker = (allyMarkers >= 1),
+    }
+    State.TeamSignals = signals
+
+    if signals.Team then
         State.DetectedTeamScheme = "Team"
-    elseif colorCount >= 2 and hasCombatTeamColor(LocalPlayer) then
+    elseif signals.TeamColor then
         State.DetectedTeamScheme = "TeamColor"
-    elseif tagCount >= 2 and readCustomTeamTag(LocalPlayer, State.LocalCharacter or LocalPlayer.Character) ~= nil then
+    elseif signals.CustomTag then
         State.DetectedTeamScheme = "CustomTag"
+    elseif signals.FolderTag then
+        State.DetectedTeamScheme = "FolderTag"
+    elseif signals.AllyMarker then
+        State.DetectedTeamScheme = "AllyMarker"
     else
         State.DetectedTeamScheme = "FFA"
     end
@@ -3305,7 +3541,7 @@ local function isStandardTeamMatch(targetPlr)
     if not targetPlr or LocalPlayer.Team == nil or targetPlr.Team == nil then
         return false
     end
-    if LocalPlayer.Neutral or targetPlr.Neutral then
+    if not State.TeamIgnoreNeutral and (LocalPlayer.Neutral or targetPlr.Neutral) then
         return false
     end
     if not isCombatTeam(LocalPlayer.Team) or not isCombatTeam(targetPlr.Team) then
@@ -3339,18 +3575,19 @@ local function IsTeammate(player, entry)
     local resolvedEntry = entry or Registry[player]
     local targetPlr = nil
 
+    if VisualHelper.isLocalTargetOrOwned(player, resolvedEntry) then
+        return true
+    end
+
     if typeof(player) == "Instance" then
-        if player == LocalPlayer or player == State.LocalCharacter or player == LocalPlayer.Character then
-            return true
-        end
         if player:IsA("Player") then
             targetPlr = player
         elseif player:IsA("Model") then
             targetPlr = Players:GetPlayerFromCharacter(player)
-            if targetPlr == LocalPlayer then
-                return true
-            end
         end
+    end
+    if not targetPlr and resolvedEntry and resolvedEntry.Player then
+        targetPlr = resolvedEntry.Player
     end
 
     local mode = Config.Resolver.TeamCheckMode
@@ -3358,18 +3595,32 @@ local function IsTeammate(player, entry)
         return false
     end
 
-    -- Bots / Non-player Models: match custom tags against LocalPlayer's Team / TeamColor / CustomTag
+    -- Bots / Non-player Models: match ally flags, folder tags, and custom tags against LocalPlayer
     if (resolvedEntry and resolvedEntry.IsBot) or (targetPlr == nil) then
         local botModel = (resolvedEntry and resolvedEntry.Character) or (typeof(player) == "Instance" and player or nil)
+        if botModel and (botModel:GetAttribute("Ally") == true or botModel:GetAttribute("Friendly") == true or botModel:GetAttribute("Teammate") == true) then
+            return true
+        end
+        if botModel and VisualHelper.hasFriendlyOverheadMarker(botModel) then
+            return true
+        end
         local botTag = readCustomTeamTag(nil, botModel)
+        if botTag == nil then
+            botTag = VisualHelper.readWorkspaceFolderTag(botModel)
+        end
         if botTag == nil then
             return false
         end
-        local myTag = readCustomTeamTag(LocalPlayer, State.LocalCharacter or LocalPlayer.Character)
+        local localChar = State.LocalCharacter or LocalPlayer.Character
+        local myTag = readCustomTeamTag(LocalPlayer, localChar)
         if myTag ~= nil and botTag == myTag then
             return true
         end
-        if isCombatTeam(LocalPlayer.Team) and not LocalPlayer.Neutral then
+        local myFolderTag = VisualHelper.readWorkspaceFolderTag(localChar)
+        if myFolderTag ~= nil and botTag == myFolderTag then
+            return true
+        end
+        if isCombatTeam(LocalPlayer.Team) and (not LocalPlayer.Neutral or State.TeamIgnoreNeutral) then
             local myTeamNorm = normalizeTeamTag(LocalPlayer.Team)
             if botTag == string.lower(LocalPlayer.Team.Name) or (myTeamNorm ~= nil and botTag == myTeamNorm) then
                 return true
@@ -3384,25 +3635,57 @@ local function IsTeammate(player, entry)
         return false
     end
 
+    refreshDetectedTeamScheme()
+
     if mode == "Team Property" then
         return isStandardTeamMatch(targetPlr)
     elseif mode == "TeamColor" then
         return isTeamColorMatch(targetPlr)
     elseif mode == "Custom Tags" then
-        return isCustomTagMatch(targetPlr, resolvedEntry)
+        if isCustomTagMatch(targetPlr, resolvedEntry) then
+            return true
+        end
+        local lFolder = VisualHelper.readWorkspaceFolderTag(State.LocalCharacter or LocalPlayer.Character)
+        local tFolder = VisualHelper.readWorkspaceFolderTag((resolvedEntry and resolvedEntry.Character) or targetPlr.Character)
+        return lFolder ~= nil and tFolder ~= nil and lFolder == tFolder
     end
 
-    -- "Auto" FFA-aware mode: Team -> TeamColor fallback -> CustomTag fallback
-    local scheme = refreshDetectedTeamScheme()
-    if scheme == "FFA" then
+    -- "Auto" FFA-aware multi-signal pipeline:
+    -- Authoritative conflict guard prevents secondary Clan/Role tags from overriding opposing combat teams.
+    local signals = State.TeamSignals
+    if not signals then
         return false
-    elseif scheme == "Team" then
-        return isStandardTeamMatch(targetPlr)
-    elseif scheme == "TeamColor" then
-        return isTeamColorMatch(targetPlr)
-    elseif scheme == "CustomTag" then
-        return isCustomTagMatch(targetPlr, resolvedEntry)
     end
+
+    if signals.Team and LocalPlayer.Team ~= nil and targetPlr.Team ~= nil and isCombatTeam(LocalPlayer.Team) and isCombatTeam(targetPlr.Team) then
+        if State.TeamIgnoreNeutral or (not LocalPlayer.Neutral and not targetPlr.Neutral) then
+            return LocalPlayer.Team == targetPlr.Team
+        end
+    end
+
+    if signals.TeamColor and hasCombatTeamColor(LocalPlayer) and hasCombatTeamColor(targetPlr) then
+        return LocalPlayer.TeamColor == targetPlr.TeamColor
+    end
+
+    if signals.CustomTag and isCustomTagMatch(targetPlr, resolvedEntry) then
+        return true
+    end
+
+    if signals.FolderTag then
+        local lFolder = VisualHelper.readWorkspaceFolderTag(State.LocalCharacter or LocalPlayer.Character)
+        local tFolder = VisualHelper.readWorkspaceFolderTag((resolvedEntry and resolvedEntry.Character) or targetPlr.Character)
+        if lFolder ~= nil and tFolder ~= nil then
+            return lFolder == tFolder
+        end
+    end
+
+    if signals.AllyMarker then
+        local tChar = (resolvedEntry and resolvedEntry.Character) or targetPlr.Character
+        if VisualHelper.hasFriendlyOverheadMarker(tChar) then
+            return true
+        end
+    end
+
     return false
 end
 
