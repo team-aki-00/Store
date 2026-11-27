@@ -5,6 +5,8 @@
       Features  : Liquid-Glass UI + Startup Loader, Per-Game Auto-Save Config,
                   Touch-Safe 3-Mode TriggerBot (VIM / firesignal / Tool:Activate),
                   Sub-0.1 Optical ESP Thickness, Extreme Potato Graphics
+      Hygiene   : Pooled connections, zero debug spam, clean unload; true
+                  server-side authority checks cannot be bypassed client-side
     ============================================================================
 ]]
 
@@ -337,6 +339,9 @@ local State = {
     ApplyingFullbright = false,
     SavedNoclipParts = {},
     OriginalWalkSpeed = nil,
+    WalkSpeedBlocked = false,
+    WalkSpeedResetCount = 0,
+    LastWalkSpeedSetTime = 0,
     OriginalJump = nil,
     LastJumpTime = 0,
     LastAutoHopTime = 0,
@@ -346,6 +351,8 @@ local State = {
     ApplyingJumpImpulse = false,
     JumpButtonHeld = false,
     OnHumanoidJumpChanged = nil,
+    SyncAllUtilitiesFn = nil,
+    ApplyPotatoFn = nil,
     HookedJumpButton = nil,
     FrameIndex = 0,
     LastRenderTick = 0,
@@ -454,10 +461,55 @@ function InputGuard.endDrag(owner)
     end
 end
 
+InputGuard.ActiveTaps = {}
+InputGuard.TapHookBound = false
+
+function InputGuard.ensureTapPool()
+    if InputGuard.TapHookBound then
+        return
+    end
+    InputGuard.TapHookBound = true
+
+    addConnection(UserInputService.InputChanged:Connect(function(input)
+        if State.Unloaded or next(InputGuard.ActiveTaps) == nil then
+            return
+        end
+        for btn, tap in pairs(InputGuard.ActiveTaps) do
+            if not btn or not btn.Parent or not tap.Input or not InputGuard.isActiveState(tap.Input.UserInputState) then
+                InputGuard.ActiveTaps[btn] = nil
+            elseif input == tap.Input or (tap.Input.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseMovement) then
+                local dist = (Vector2.new(input.Position.X, input.Position.Y) - Vector2.new(tap.StartPos.X, tap.StartPos.Y)).Magnitude
+                if dist > tap.MaxMove then
+                    tap.MaxMove = dist
+                end
+            end
+        end
+    end))
+
+    local function finishPoolTap(input)
+        if next(InputGuard.ActiveTaps) == nil then
+            return
+        end
+        for _, tap in pairs(InputGuard.ActiveTaps) do
+            if input == tap.Input then
+                local dist = tap.StartPos and (Vector2.new(input.Position.X, input.Position.Y) - Vector2.new(tap.StartPos.X, tap.StartPos.Y)).Magnitude or 0
+                if dist > tap.MaxMove then
+                    tap.MaxMove = dist
+                end
+                tap.Ended = true
+            end
+        end
+    end
+
+    addConnection(UserInputService.InputEnded:Connect(finishPoolTap))
+    addConnection(UserInputService.TouchEnded:Connect(finishPoolTap))
+end
+
 function InputGuard.forceReleaseAll()
     InputGuard.ActiveOwner = nil
     InputGuard.ActiveInput = nil
     State.ActiveDragCount = 0
+    clearTable(InputGuard.ActiveTaps)
     if State.DragSinkBound and ContextActionService then
         pcall(function()
             ContextActionService:UnbindAction(InputGuard.ACTION_NAME)
@@ -2515,6 +2567,9 @@ local function clearLocalCharacterState()
     State.LocalAlive = false
     State.LastLocalPos = nil
     State.OriginalWalkSpeed = nil
+    State.WalkSpeedBlocked = false
+    State.WalkSpeedResetCount = 0
+    State.LastWalkSpeedSetTime = 0
     State.OriginalJump = nil
     State.BHopMomentum = 0
     State.JumpButtonHeld = false
@@ -2746,6 +2801,13 @@ ReloadAllSystems = function(reason, hardReset)
     end
 
     syncWorkspaceBots(playerCharSet)
+
+    if type(State.SyncAllUtilitiesFn) == "function" then
+        pcall(State.SyncAllUtilitiesFn)
+    end
+    if Config.Performance.PotatoGraphics and type(State.ApplyPotatoFn) == "function" then
+        pcall(State.ApplyPotatoFn, true)
+    end
 end
 
 ScheduleReload = function(reason, hardReset)
@@ -5525,7 +5587,8 @@ local function onRenderStepFrame(dt)
                 local dz = curLocalPos.Z - State.LastLocalPos.Z
                 local horizJumpDist = math.sqrt(dx * dx + dz * dz)
                 local vertDist = math.abs(curLocalPos.Y - State.LastLocalPos.Y)
-                if horizJumpDist >= 60 or vertDist >= 140 then
+                local horizThresh = (Config.Utilities.SpeedEnabled or Config.Utilities.BunnyHop) and 95 or 60
+                if horizJumpDist >= horizThresh or vertDist >= 140 then
                     State.LastLocalPos = curLocalPos
                     State.CurrentAimTarget = nil
                     pcall(ReloadAllSystems, "LocalTeleportDetected", false)
@@ -5953,6 +6016,8 @@ local function applyPotatoGraphics(enabled)
     end
 end
 
+State.ApplyPotatoFn = applyPotatoGraphics
+
 if Config.Performance.PotatoGraphics then
     task.defer(function()
         if not State.Unloaded and Config.Performance.PotatoGraphics then
@@ -6200,6 +6265,9 @@ end
 
 function UtilitiesEngine.applySpeedBoost(enabled)
     Config.Utilities.SpeedEnabled = (enabled == true)
+    State.WalkSpeedBlocked = false
+    State.WalkSpeedResetCount = 0
+    State.LastWalkSpeedSetTime = 0
     local _, hum = UtilitiesEngine.getLocalMovementRefs()
     if not enabled then
         if hum and hum.Parent and State.OriginalWalkSpeed ~= nil then
@@ -6526,39 +6594,66 @@ function UtilitiesEngine.stepMovement(dt)
         local bhopBonus = (Config.Utilities.BunnyHop and isMoving) and (Config.Utilities.SpeedEnabled and ((State.BHopMomentum or 0) * 0.6) or (State.BHopMomentum or 0)) or 0
         local desiredSpeed = configuredSpeed + bhopBonus
         local method = Config.Utilities.SpeedMethod
+        local liveSpeed = baseSpeed
+        pcall(function()
+            liveSpeed = hum.WalkSpeed
+        end)
 
         if Config.Utilities.SpeedEnabled then
-            if method == "WalkSpeed" or method == "Hybrid" then
-                if math.abs(hum.WalkSpeed - configuredSpeed) > 0.1 then
+            if method == "WalkSpeed" then
+                if math.abs(liveSpeed - configuredSpeed) > 0.25 then
                     pcall(function()
                         hum.WalkSpeed = configuredSpeed
                     end)
+                    liveSpeed = configuredSpeed
                 end
-            elseif method == "CFrame" and math.abs(hum.WalkSpeed - baseSpeed) > 0.1 then
-                pcall(function()
-                    hum.WalkSpeed = baseSpeed
-                end)
+            elseif method == "Hybrid" and not State.WalkSpeedBlocked then
+                if (now - (State.LastWalkSpeedSetTime or 0)) <= 0.25 and liveSpeed < (configuredSpeed - 2.0) then
+                    State.WalkSpeedResetCount = (State.WalkSpeedResetCount or 0) + 1
+                    if State.WalkSpeedResetCount >= 3 then
+                        State.WalkSpeedBlocked = true
+                    end
+                end
+                if not State.WalkSpeedBlocked and math.abs(liveSpeed - configuredSpeed) > 0.25 then
+                    State.LastWalkSpeedSetTime = now
+                    pcall(function()
+                        hum.WalkSpeed = configuredSpeed
+                    end)
+                    liveSpeed = configuredSpeed
+                end
             end
         end
 
         if isMoving then
             local dirUnit = flatDir.Unit
-            local activeWalk = (Config.Utilities.SpeedEnabled and method == "CFrame") and baseSpeed or math.max(hum.WalkSpeed, 0)
+            local activeWalk = math.max(liveSpeed, 0)
             local extraSpeed = desiredSpeed - activeWalk
-            local useCFrameStep = (Config.Utilities.SpeedEnabled and (method == "CFrame" or method == "Hybrid")) or Config.Utilities.BunnyHop
-            if useCFrameStep and extraSpeed > 0.25 then
+            local useHorizCFrame = (Config.Utilities.SpeedEnabled and (method == "CFrame" or (method == "Hybrid" and (State.WalkSpeedBlocked or extraSpeed > 0.25))))
+                or Config.Utilities.BunnyHop
+
+            -- Strictly horizontal X/Z displacement only; never touch Y position or AssemblyLinearVelocity.Y
+            if useHorizCFrame and extraSpeed > 0.25 then
                 local safeDt = math.clamp(dt or (1 / 60), 0.001, 0.05)
-                root.CFrame = root.CFrame + (dirUnit * (extraSpeed * safeDt))
+                local horizStep = Vector3.new(dirUnit.X, 0, dirUnit.Z) * (extraSpeed * safeDt)
+                pcall(function()
+                    root.CFrame = root.CFrame + horizStep
+                end)
             end
 
-            -- Keep mid-air BHop steering crisp and responsive when turning in air
-            if Config.Utilities.BunnyHop and isAirborne and isFiniteVector3(curVel) then
-                local horizCur = Vector3.new(curVel.X, 0, curVel.Z)
-                local horizTarget = dirUnit * desiredSpeed
-                local blended = horizCur:Lerp(horizTarget, 0.28)
+            -- Keep mid-air BHop steering smooth using freshly sampled Y velocity so Jump / InfiniteJump impulses are never overwritten
+            if Config.Utilities.BunnyHop and isAirborne then
+                local liveVel = Vector3.zero
                 pcall(function()
-                    root.AssemblyLinearVelocity = Vector3.new(blended.X, curVel.Y, blended.Z)
+                    liveVel = root.AssemblyLinearVelocity
                 end)
+                if isFiniteVector3(liveVel) then
+                    local horizCur = Vector3.new(liveVel.X, 0, liveVel.Z)
+                    local horizTarget = dirUnit * desiredSpeed
+                    local blended = horizCur:Lerp(horizTarget, 0.28)
+                    pcall(function()
+                        root.AssemblyLinearVelocity = Vector3.new(blended.X, liveVel.Y, blended.Z)
+                    end)
+                end
             end
         end
     end
@@ -6571,6 +6666,8 @@ function UtilitiesEngine.syncAll()
     UtilitiesEngine.applyJumpHeight(Config.Utilities.JumpEnabled)
     UtilitiesEngine.applyBunnyHop(Config.Utilities.BunnyHop)
 end
+
+State.SyncAllUtilitiesFn = UtilitiesEngine.syncAll
 
 State.OnHumanoidJumpChanged = function(hum)
     if Config.Utilities.InfiniteJump and hum and hum.FloorMaterial == Enum.Material.Air then
@@ -7472,68 +7569,43 @@ local function SyncDependentSettings(needsFullReload, reason, skipSave)
     end
 end
 
--- Scroll-guarded tap handler so vertical scrolling on mobile never triggers accidental mis-touches
+-- Scroll-guarded tap handler pooled through InputGuard (prevents per-button global listener bloat)
 local function bindSafeTap(btn, scrollParent, callback)
+    InputGuard.ensureTapPool()
     local isScrollingFrame = scrollParent and scrollParent:IsA("ScrollingFrame")
-    local trackedInput = nil
-    local startPos = nil
     local startCanvasY = 0
-    local maxMove = 0
     local hadValidPress = false
 
-    btn.InputBegan:Connect(function(input)
-        if input.UserInputState ~= Enum.UserInputState.Begin then
+    addConnection(btn.InputBegan:Connect(function(input)
+        if State.Unloaded or input.UserInputState ~= Enum.UserInputState.Begin then
             return
         end
         if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
             hadValidPress = true
-            trackedInput = input
-            startPos = input.Position
             startCanvasY = isScrollingFrame and scrollParent.CanvasPosition.Y or 0
-            maxMove = 0
-        end
-    end)
-
-    addConnection(UserInputService.InputChanged:Connect(function(input)
-        if not trackedInput or not startPos then
-            return
-        end
-        if not InputGuard.isActiveState(trackedInput.UserInputState) then
-            trackedInput = nil
-            return
-        end
-        if input == trackedInput or (trackedInput.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseMovement) then
-            local dist = (Vector2.new(input.Position.X, input.Position.Y) - Vector2.new(startPos.X, startPos.Y)).Magnitude
-            if dist > maxMove then
-                maxMove = dist
-            end
+            InputGuard.ActiveTaps[btn] = {
+                Input = input,
+                StartPos = input.Position,
+                MaxMove = 0,
+                Ended = false,
+            }
         end
     end))
 
-    local function finishTrackedTap(input)
-        if input == trackedInput then
-            local dist = startPos and (Vector2.new(input.Position.X, input.Position.Y) - Vector2.new(startPos.X, startPos.Y)).Magnitude or 0
-            if dist > maxMove then
-                maxMove = dist
-            end
-            trackedInput = nil
+    addConnection(btn.Activated:Connect(function()
+        if State.Unloaded then
+            return
         end
-    end
-
-    addConnection(UserInputService.InputEnded:Connect(finishTrackedTap))
-    addConnection(UserInputService.TouchEnded:Connect(finishTrackedTap))
-
-    btn.Activated:Connect(function()
+        local tap = InputGuard.ActiveTaps[btn]
+        local moveDist = tap and tap.MaxMove or 0
+        InputGuard.ActiveTaps[btn] = nil
         local canvasDelta = isScrollingFrame and math.abs(scrollParent.CanvasPosition.Y - startCanvasY) or 0
-        local wasCleanTap = hadValidPress and (maxMove <= 10) and (canvasDelta <= 4)
+        local wasCleanTap = hadValidPress and (moveDist <= 10) and (canvasDelta <= 4)
         hadValidPress = false
-        trackedInput = nil
-        startPos = nil
-        maxMove = 0
         if wasCleanTap then
             callback()
         end
-    end)
+    end))
 end
 
 local function createCardRow(parent, height, order)
@@ -8791,6 +8863,8 @@ do
         return Config.Utilities.SpeedMethod
     end, function(v)
         Config.Utilities.SpeedMethod = v
+        State.WalkSpeedBlocked = false
+        State.WalkSpeedResetCount = 0
         UtilitiesEngine.applySpeedBoost(Config.Utilities.SpeedEnabled)
     end, false)
 
@@ -8800,6 +8874,8 @@ do
         return Config.Utilities.WalkSpeed
     end, function(v)
         Config.Utilities.WalkSpeed = math.round(v)
+        State.WalkSpeedBlocked = false
+        State.WalkSpeedResetCount = 0
     end)
 
     addToggle(UtilitiesPage, 5, "Jump Height Boost", "Scales jump height across standard, JumpPower & air jumps", function()
