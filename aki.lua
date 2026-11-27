@@ -261,8 +261,11 @@ local Config = {
         SpeedEnabled = false,
         WalkSpeed = 24,
         SpeedMethod = "Hybrid",         -- "Hybrid" | "WalkSpeed" | "CFrame"
-        Noclip = false,
+        JumpEnabled = false,
+        JumpHeight = 16,                -- 7 .. 120 studs (synced with Infinite Jump & Bunny Hop)
         InfiniteJump = false,
+        BunnyHop = false,               -- Auto-hops on landing & builds air momentum synced with Speed & Jump
+        Noclip = false,
         Fullbright = false,
     },
     Performance = {
@@ -334,6 +337,14 @@ local State = {
     ApplyingFullbright = false,
     SavedNoclipParts = {},
     OriginalWalkSpeed = nil,
+    OriginalJump = nil,
+    LastJumpTime = 0,
+    LastAutoHopTime = 0,
+    LastJumpBoostTime = 0,
+    BHopMomentum = 0,
+    ApplyingJumpImpulse = false,
+    OnHumanoidJumpChanged = nil,
+    HookedJumpButton = nil,
     FrameIndex = 0,
     LastRenderTick = 0,
     ReloadCount = 0,
@@ -574,6 +585,7 @@ function ConfigStore.sanitizeConfig()
     Config.TriggerBot.PointerScaleX = math.clamp(Config.TriggerBot.PointerScaleX or 0.84, 0.04, 0.96)
     Config.TriggerBot.PointerScaleY = math.clamp(Config.TriggerBot.PointerScaleY or 0.68, 0.06, 0.94)
     Config.Utilities.WalkSpeed = math.clamp(math.round(tonumber(Config.Utilities.WalkSpeed) or 24), 16, 150)
+    Config.Utilities.JumpHeight = math.clamp(math.round(tonumber(Config.Utilities.JumpHeight) or 16), 7, 120)
     if Config.Utilities.SpeedMethod ~= "Hybrid"
         and Config.Utilities.SpeedMethod ~= "WalkSpeed"
         and Config.Utilities.SpeedMethod ~= "CFrame"
@@ -2501,6 +2513,9 @@ local function clearLocalCharacterState()
     State.LocalAlive = false
     State.LastLocalPos = nil
     State.OriginalWalkSpeed = nil
+    State.OriginalJump = nil
+    State.BHopMomentum = 0
+    State.HookedJumpButton = nil
     clearTable(State.SavedNoclipParts)
     State.CurrentAimTarget = nil
     State.CurrentAimPart = nil
@@ -2544,23 +2559,29 @@ local function bindLocalCharacter(character)
             releaseTriggerFire()
             ScheduleReload("LocalPlayerDied", false)
         end))
+        table.insert(State.LocalConns, hum:GetPropertyChangedSignal("Jump"):Connect(function()
+            if hum.Jump and not State.ApplyingJumpImpulse and type(State.OnHumanoidJumpChanged) == "function" then
+                pcall(State.OnHumanoidJumpChanged, hum)
+            end
+        end))
     end
 
     if State.LocalHumanoid then
         attachHumanoidDeath(State.LocalHumanoid)
-    else
-        table.insert(State.LocalConns, character.ChildAdded:Connect(function(child)
-            if State.Unloaded then return end
-            if child:IsA("Humanoid") then
+    end
+    table.insert(State.LocalConns, character.ChildAdded:Connect(function(child)
+        if State.Unloaded then return end
+        if child:IsA("Humanoid") then
+            if State.LocalHumanoid ~= child then
                 attachHumanoidDeath(child)
                 ScheduleReload("LocalHumanoidReady", false)
-            elseif child.Name == "HumanoidRootPart" and child:IsA("BasePart") then
-                State.LocalRootPart = child
-            elseif (not State.LocalRootPart or not State.LocalRootPart.Parent) and child:IsA("BasePart") then
-                State.LocalRootPart = child
             end
-        end))
-    end
+        elseif child.Name == "HumanoidRootPart" and child:IsA("BasePart") then
+            State.LocalRootPart = child
+        elseif (not State.LocalRootPart or not State.LocalRootPart.Parent) and child:IsA("BasePart") then
+            State.LocalRootPart = child
+        end
+    end))
 
     table.insert(State.LocalConns, character.AncestryChanged:Connect(function(_, newParent)
         if not newParent and not State.Unloaded then
@@ -5487,10 +5508,18 @@ local function onRenderStepFrame(dt)
         local localRoot = State.LocalRootPart
         if localRoot and localRoot.Parent then
             local curLocalPos = localRoot.Position
-            if State.LastLocalPos and (curLocalPos - State.LastLocalPos).Magnitude >= 35 then
-                State.LastLocalPos = curLocalPos
-                State.CurrentAimTarget = nil
-                pcall(ReloadAllSystems, "LocalTeleportDetected", false)
+            if State.LastLocalPos then
+                local dx = curLocalPos.X - State.LastLocalPos.X
+                local dz = curLocalPos.Z - State.LastLocalPos.Z
+                local horizJumpDist = math.sqrt(dx * dx + dz * dz)
+                local vertDist = math.abs(curLocalPos.Y - State.LastLocalPos.Y)
+                if horizJumpDist >= 60 or vertDist >= 140 then
+                    State.LastLocalPos = curLocalPos
+                    State.CurrentAimTarget = nil
+                    pcall(ReloadAllSystems, "LocalTeleportDetected", false)
+                else
+                    State.LastLocalPos = curLocalPos
+                end
             else
                 State.LastLocalPos = curLocalPos
             end
@@ -6053,9 +6082,113 @@ function UtilitiesEngine.stepNoclip()
     end
 end
 
+function UtilitiesEngine.getLocalMovementRefs()
+    local char = State.LocalCharacter or LocalPlayer.Character
+    if not char or not char.Parent then
+        return nil, nil, nil
+    end
+    local hum = (State.LocalHumanoid and State.LocalHumanoid.Parent == char) and State.LocalHumanoid or char:FindFirstChildOfClass("Humanoid")
+    if hum then
+        State.LocalHumanoid = hum
+    end
+    local root = (State.LocalRootPart and State.LocalRootPart.Parent) and State.LocalRootPart
+        or char:FindFirstChild("HumanoidRootPart")
+        or (char:IsA("Model") and char.PrimaryPart)
+        or (char:IsA("BasePart") and char or char:FindFirstChildWhichIsA("BasePart", true))
+    if root then
+        State.LocalRootPart = root
+    end
+    if hum and hum.MaxHealth > 0 and hum.Health <= 0 then
+        return nil, nil, nil
+    end
+    return char, hum, root
+end
+
+function UtilitiesEngine.getEffectiveJumpHeight(hum)
+    if Config.Utilities.JumpEnabled then
+        return math.clamp(tonumber(Config.Utilities.JumpHeight) or 16, 7, 120)
+    end
+    if State.OriginalJump then
+        if State.OriginalJump.UseJumpPower == false and isFiniteNumber(State.OriginalJump.JumpHeight) and State.OriginalJump.JumpHeight > 1 then
+            return math.clamp(State.OriginalJump.JumpHeight, 4, 120)
+        elseif isFiniteNumber(State.OriginalJump.JumpPower) and State.OriginalJump.JumpPower > 1 then
+            local g = math.max(Workspace.Gravity, 1)
+            return math.clamp((State.OriginalJump.JumpPower * State.OriginalJump.JumpPower) / (2 * g), 4, 120)
+        end
+    end
+    if hum and hum.Parent then
+        local okH, useJP, jp, jh = pcall(function()
+            return hum.UseJumpPower, hum.JumpPower, hum.JumpHeight
+        end)
+        if okH then
+            if useJP == false and isFiniteNumber(jh) and jh > 1 then
+                return math.clamp(jh, 4, 120)
+            elseif isFiniteNumber(jp) and jp > 1 then
+                local g = math.max(Workspace.Gravity, 1)
+                return math.clamp((jp * jp) / (2 * g), 4, 120)
+            end
+        end
+    end
+    return 7.2
+end
+
+function UtilitiesEngine.applyJumpHeight(enabled)
+    Config.Utilities.JumpEnabled = (enabled == true)
+    local _, hum = UtilitiesEngine.getLocalMovementRefs()
+    if not enabled then
+        if hum and hum.Parent and State.OriginalJump then
+            local orig = State.OriginalJump
+            pcall(function()
+                if orig.UseJumpPower ~= nil then hum.UseJumpPower = orig.UseJumpPower end
+                if orig.JumpPower ~= nil then hum.JumpPower = orig.JumpPower end
+                if orig.JumpHeight ~= nil then hum.JumpHeight = orig.JumpHeight end
+            end)
+        end
+        State.OriginalJump = nil
+    elseif hum and hum.Parent then
+        UtilitiesEngine.syncJumpProperties(hum)
+    end
+end
+
+function UtilitiesEngine.syncJumpProperties(hum)
+    if not hum or not hum.Parent then
+        return
+    end
+    if State.OriginalJump == nil then
+        local saved = {}
+        pcall(function()
+            saved.UseJumpPower = hum.UseJumpPower
+            saved.JumpPower = hum.JumpPower
+            saved.JumpHeight = hum.JumpHeight
+        end)
+        State.OriginalJump = saved
+    end
+    local targetH = math.clamp(tonumber(Config.Utilities.JumpHeight) or 16, 7, 120)
+    local g = math.max(Workspace.Gravity, 1)
+    local targetPower = math.sqrt(2 * g * targetH)
+    pcall(function()
+        if hum.UseJumpPower == false then
+            if math.abs(hum.JumpHeight - targetH) > 0.1 then
+                hum.JumpHeight = targetH
+            end
+        else
+            if math.abs(hum.JumpPower - targetPower) > 0.25 then
+                hum.JumpPower = targetPower
+            end
+        end
+    end)
+end
+
+function UtilitiesEngine.applyBunnyHop(enabled)
+    Config.Utilities.BunnyHop = (enabled == true)
+    if not enabled then
+        State.BHopMomentum = 0
+    end
+end
+
 function UtilitiesEngine.applySpeedBoost(enabled)
     Config.Utilities.SpeedEnabled = (enabled == true)
-    local hum = State.LocalHumanoid
+    local _, hum = UtilitiesEngine.getLocalMovementRefs()
     if not enabled then
         if hum and hum.Parent and State.OriginalWalkSpeed ~= nil then
             local orig = State.OriginalWalkSpeed
@@ -6072,14 +6205,163 @@ function UtilitiesEngine.applySpeedBoost(enabled)
     end
 end
 
-function UtilitiesEngine.stepSpeed(dt)
-    if State.Unloaded or not Config.Utilities.SpeedEnabled or not State.LocalAlive then
+function UtilitiesEngine.performJump(source)
+    if State.Unloaded then
+        return false
+    end
+    local _, hum, root = UtilitiesEngine.getLocalMovementRefs()
+    if not hum or not hum.Parent or not root or not root.Parent then
+        return false
+    end
+
+    local targetH = UtilitiesEngine.getEffectiveJumpHeight(hum)
+    local g = math.max(Workspace.Gravity, 1)
+    local targetVelY = math.sqrt(2 * g * targetH)
+
+    State.ApplyingJumpImpulse = true
+    pcall(function()
+        hum:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
+    end)
+    pcall(function()
+        hum:ChangeState(Enum.HumanoidStateType.Jumping)
+        hum.Jump = true
+    end)
+
+    local curVel = Vector3.zero
+    pcall(function()
+        curVel = root.AssemblyLinearVelocity
+    end)
+    if isFiniteVector3(curVel) then
+        local launchX, launchZ = curVel.X, curVel.Z
+        if source == "BunnyHop" then
+            local md = hum.MoveDirection
+            local flat = Vector3.new(md.X, 0, md.Z)
+            if flat.Magnitude > 0.05 then
+                local dir = flat.Unit
+                local baseSpd = Config.Utilities.SpeedEnabled and math.clamp(tonumber(Config.Utilities.WalkSpeed) or 24, 16, 150) or (State.OriginalWalkSpeed or 16)
+                State.BHopMomentum = math.min((State.BHopMomentum or 0) + 3.6, 18)
+                local hopHoriz = baseSpd + (Config.Utilities.SpeedEnabled and (State.BHopMomentum * 0.6) or State.BHopMomentum)
+                launchX = dir.X * hopHoriz
+                launchZ = dir.Z * hopHoriz
+            end
+        end
+        pcall(function()
+            root.AssemblyLinearVelocity = Vector3.new(launchX, math.max(targetVelY, 24), launchZ)
+        end)
+    end
+    State.ApplyingJumpImpulse = false
+    State.LastJumpTime = os.clock()
+    State.LastJumpBoostTime = State.LastJumpTime
+    return true
+end
+
+function UtilitiesEngine.triggerAirJump(forceTrigger)
+    if State.Unloaded or not Config.Utilities.InfiniteJump or not State.LocalAlive then
+        return false
+    end
+    local now = os.clock()
+    if (now - (State.LastJumpTime or 0)) < 0.075 then
+        return false
+    end
+    local _, hum = UtilitiesEngine.getLocalMovementRefs()
+    if not hum then
+        return false
+    end
+    if forceTrigger then
+        return UtilitiesEngine.performJump("InfiniteJump")
+    end
+    local isAir = (hum.FloorMaterial == Enum.Material.Air)
+    if isAir or Config.Utilities.JumpEnabled then
+        return UtilitiesEngine.performJump("InfiniteJump")
+    end
+    return false
+end
+
+function UtilitiesEngine.ensureTouchJumpHook()
+    if not UserInputService.TouchEnabled then
         return
     end
-    local hum = State.LocalHumanoid
-    if not hum or not hum.Parent then
+    local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if not pg then
         return
     end
+    local touchGui = pg:FindFirstChild("TouchGui")
+    local touchFrame = touchGui and touchGui:FindFirstChild("TouchControlFrame")
+    local jumpBtn = touchFrame and touchFrame:FindFirstChild("JumpButton")
+    if jumpBtn and jumpBtn:IsA("GuiObject") and State.HookedJumpButton ~= jumpBtn then
+        State.HookedJumpButton = jumpBtn
+        table.insert(State.LocalConns, jumpBtn.InputBegan:Connect(function(input)
+            if State.Unloaded or not Config.Utilities.InfiniteJump then
+                return
+            end
+            if input.UserInputState == Enum.UserInputState.Begin and (input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1) then
+                UtilitiesEngine.triggerAirJump(true)
+            end
+        end))
+    end
+end
+
+function UtilitiesEngine.stepMovement(dt)
+    if State.Unloaded then
+        return
+    end
+    local anyMoveActive = Config.Utilities.SpeedEnabled or Config.Utilities.JumpEnabled or Config.Utilities.BunnyHop or Config.Utilities.InfiniteJump
+    if not anyMoveActive then
+        State.BHopMomentum = 0
+        return
+    end
+
+    UtilitiesEngine.ensureTouchJumpHook()
+
+    local _, hum, root = UtilitiesEngine.getLocalMovementRefs()
+    if not hum or not hum.Parent or not root or not root.Parent then
+        return
+    end
+
+    local now = os.clock()
+    local humState = nil
+    pcall(function()
+        humState = hum:GetState()
+    end)
+    if humState == Enum.HumanoidStateType.Dead then
+        return
+    end
+
+    local curVel = Vector3.zero
+    pcall(function()
+        curVel = root.AssemblyLinearVelocity
+    end)
+
+    -- 1. Jump Height Boost sync + anti-reset enforcement
+    if Config.Utilities.JumpEnabled then
+        UtilitiesEngine.syncJumpProperties(hum)
+        local targetH = math.clamp(tonumber(Config.Utilities.JumpHeight) or 16, 7, 120)
+        local targetVelY = math.sqrt(2 * math.max(Workspace.Gravity, 1) * targetH)
+        if humState == Enum.HumanoidStateType.Jumping and isFiniteVector3(curVel) and curVel.Y > 4 and curVel.Y < (targetVelY * 0.90) and (now - (State.LastJumpBoostTime or 0)) >= 0.22 then
+            State.LastJumpBoostTime = now
+            pcall(function()
+                root.AssemblyLinearVelocity = Vector3.new(curVel.X, targetVelY, curVel.Z)
+            end)
+            curVel = Vector3.new(curVel.X, targetVelY, curVel.Z)
+        end
+    end
+
+    -- 2. Infinite Jump held-button fall rescue (lets mobile players tap OR hold jump to climb)
+    local isAirborne = (hum.FloorMaterial == Enum.Material.Air) or (humState == Enum.HumanoidStateType.Freefall)
+    if Config.Utilities.InfiniteJump and isAirborne then
+        local spaceHeld = false
+        pcall(function()
+            spaceHeld = UserInputService:IsKeyDown(Enum.KeyCode.Space)
+        end)
+        if (hum.Jump or spaceHeld) and isFiniteVector3(curVel) and curVel.Y < -2.0 and (now - (State.LastJumpTime or 0)) >= 0.26 then
+            UtilitiesEngine.performJump("InfiniteJump")
+            pcall(function()
+                curVel = root.AssemblyLinearVelocity
+            end)
+        end
+    end
+
+    -- 3. Speed Boost + Bunny Hop synchronized horizontal velocity & auto-hop
     if State.OriginalWalkSpeed == nil then
         local okSpd, curSpd = pcall(function()
             return hum.WalkSpeed
@@ -6087,36 +6369,90 @@ function UtilitiesEngine.stepSpeed(dt)
         State.OriginalWalkSpeed = (okSpd and isFiniteNumber(curSpd) and curSpd > 0) and curSpd or 16
     end
 
-    local targetSpeed = math.clamp(tonumber(Config.Utilities.WalkSpeed) or 24, 16, 150)
-    local method = Config.Utilities.SpeedMethod
-    if method == "WalkSpeed" or method == "Hybrid" then
-        if math.abs(hum.WalkSpeed - targetSpeed) > 0.1 then
+    local moveDir = hum.MoveDirection
+    local flatDir = isFiniteVector3(moveDir) and Vector3.new(moveDir.X, 0, moveDir.Z) or Vector3.zero
+    local isMoving = flatDir.Magnitude > 0.05
+
+    if Config.Utilities.BunnyHop then
+        local isGrounded = (hum.FloorMaterial ~= Enum.Material.Air)
+            and (humState ~= Enum.HumanoidStateType.Freefall)
+            and (humState ~= Enum.HumanoidStateType.Jumping)
+            and (isFiniteVector3(curVel) and curVel.Y <= 4.5 and curVel.Y >= -14.0)
+        local wantsJump = isMoving or hum.Jump
+        if not wantsJump then
             pcall(function()
-                hum.WalkSpeed = targetSpeed
+                wantsJump = UserInputService:IsKeyDown(Enum.KeyCode.Space)
             end)
         end
-    elseif method == "CFrame" and State.OriginalWalkSpeed ~= nil and math.abs(hum.WalkSpeed - State.OriginalWalkSpeed) > 0.1 then
-        pcall(function()
-            hum.WalkSpeed = State.OriginalWalkSpeed
-        end)
+        if wantsJump and isGrounded and (now - (State.LastAutoHopTime or 0)) >= 0.11 then
+            State.LastAutoHopTime = now
+            UtilitiesEngine.performJump("BunnyHop")
+            pcall(function()
+                curVel = root.AssemblyLinearVelocity
+            end)
+        end
+        if not isMoving then
+            State.BHopMomentum = math.max((State.BHopMomentum or 0) - ((dt or 0.016) * 28), 0)
+        end
+    else
+        State.BHopMomentum = 0
     end
 
-    if method == "CFrame" or method == "Hybrid" then
-        local root = State.LocalRootPart
-        if root and root.Parent then
-            local moveDir = hum.MoveDirection
-            if isFiniteVector3(moveDir) then
-                local flatDir = Vector3.new(moveDir.X, 0, moveDir.Z)
-                if flatDir.Magnitude > 0.05 then
-                    local baseSpeed = (method == "CFrame") and (State.OriginalWalkSpeed or 16) or math.max(hum.WalkSpeed, 0)
-                    local extraSpeed = targetSpeed - baseSpeed
-                    if extraSpeed > 0.25 then
-                        local safeDt = math.clamp(dt or (1 / 60), 0.001, 0.05)
-                        root.CFrame = root.CFrame + (flatDir.Unit * (extraSpeed * safeDt))
-                    end
+    if Config.Utilities.SpeedEnabled or Config.Utilities.BunnyHop then
+        local baseSpeed = State.OriginalWalkSpeed or 16
+        local configuredSpeed = Config.Utilities.SpeedEnabled and math.clamp(tonumber(Config.Utilities.WalkSpeed) or 24, 16, 150) or baseSpeed
+        local bhopBonus = (Config.Utilities.BunnyHop and isMoving) and (Config.Utilities.SpeedEnabled and ((State.BHopMomentum or 0) * 0.6) or (State.BHopMomentum or 0)) or 0
+        local desiredSpeed = configuredSpeed + bhopBonus
+        local method = Config.Utilities.SpeedMethod
+
+        if Config.Utilities.SpeedEnabled then
+            if method == "WalkSpeed" or method == "Hybrid" then
+                if math.abs(hum.WalkSpeed - configuredSpeed) > 0.1 then
+                    pcall(function()
+                        hum.WalkSpeed = configuredSpeed
+                    end)
                 end
+            elseif method == "CFrame" and math.abs(hum.WalkSpeed - baseSpeed) > 0.1 then
+                pcall(function()
+                    hum.WalkSpeed = baseSpeed
+                end)
             end
         end
+
+        if isMoving then
+            local dirUnit = flatDir.Unit
+            local activeWalk = (Config.Utilities.SpeedEnabled and method == "CFrame") and baseSpeed or math.max(hum.WalkSpeed, 0)
+            local extraSpeed = desiredSpeed - activeWalk
+            local useCFrameStep = (Config.Utilities.SpeedEnabled and (method == "CFrame" or method == "Hybrid")) or Config.Utilities.BunnyHop
+            if useCFrameStep and extraSpeed > 0.25 then
+                local safeDt = math.clamp(dt or (1 / 60), 0.001, 0.05)
+                root.CFrame = root.CFrame + (dirUnit * (extraSpeed * safeDt))
+            end
+
+            -- Keep mid-air BHop steering crisp and responsive when turning in air
+            if Config.Utilities.BunnyHop and isAirborne and isFiniteVector3(curVel) then
+                local horizCur = Vector3.new(curVel.X, 0, curVel.Z)
+                local horizTarget = dirUnit * desiredSpeed
+                local blended = horizCur:Lerp(horizTarget, 0.28)
+                pcall(function()
+                    root.AssemblyLinearVelocity = Vector3.new(blended.X, curVel.Y, blended.Z)
+                end)
+            end
+        end
+    end
+end
+
+function UtilitiesEngine.syncAll()
+    UtilitiesEngine.applyFullbright(Config.Utilities.Fullbright)
+    UtilitiesEngine.applyNoclip(Config.Utilities.Noclip)
+    UtilitiesEngine.applySpeedBoost(Config.Utilities.SpeedEnabled)
+    UtilitiesEngine.applyJumpHeight(Config.Utilities.JumpEnabled)
+    UtilitiesEngine.applyBunnyHop(Config.Utilities.BunnyHop)
+end
+
+State.OnHumanoidJumpChanged = function(hum)
+    if Config.Utilities.InfiniteJump and hum and (hum.FloorMaterial == Enum.Material.Air or Config.Utilities.JumpEnabled) then
+        UtilitiesEngine.triggerAirJump(false)
     end
 end
 
@@ -6127,20 +6463,23 @@ addConnection(RunService.Stepped:Connect(function()
 end))
 
 addConnection(RunService.Heartbeat:Connect(function(dt)
-    if not State.Unloaded and Config.Utilities.SpeedEnabled then
-        pcall(UtilitiesEngine.stepSpeed, dt)
+    if not State.Unloaded and (Config.Utilities.SpeedEnabled or Config.Utilities.JumpEnabled or Config.Utilities.BunnyHop or Config.Utilities.InfiniteJump) then
+        pcall(UtilitiesEngine.stepMovement, dt)
     end
 end))
 
 addConnection(UserInputService.JumpRequest:Connect(function()
-    if State.Unloaded or not Config.Utilities.InfiniteJump or not State.LocalAlive then
+    if not State.Unloaded and Config.Utilities.InfiniteJump then
+        UtilitiesEngine.triggerAirJump(true)
+    end
+end))
+
+addConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if State.Unloaded or gameProcessed or not Config.Utilities.InfiniteJump then
         return
     end
-    local hum = State.LocalHumanoid
-    if hum and hum.Parent then
-        pcall(function()
-            hum:ChangeState(Enum.HumanoidStateType.Jumping)
-        end)
+    if input.KeyCode == Enum.KeyCode.Space or input.KeyCode == Enum.KeyCode.ButtonA then
+        UtilitiesEngine.triggerAirJump(false)
     end
 end))
 
@@ -6998,6 +7337,7 @@ local function SyncDependentSettings(needsFullReload, reason, skipSave)
         end
     end
     State.LastTeamScan = -1
+    pcall(UtilitiesEngine.syncAll)
     syncMobileAimVisibility()
     syncMobileTriggerVisibility()
     pcall(UI.syncVimPointer)
@@ -8340,21 +8680,44 @@ do
         Config.Utilities.WalkSpeed = math.round(v)
     end)
 
-    addToggle(UtilitiesPage, 5, "Noclip (Pass Through Walls)", "Disables character collisions in Stepped & restores on OFF", function()
-        return Config.Utilities.Noclip
+    addToggle(UtilitiesPage, 5, "Jump Height Boost", "Scales jump height across standard, JumpPower & air jumps", function()
+        return Config.Utilities.JumpEnabled
     end, function(v)
-        UtilitiesEngine.applyNoclip(v)
+        UtilitiesEngine.applyJumpHeight(v)
     end)
 
-    addToggle(UtilitiesPage, 6, "Infinite Jump", "Triggers jump on every air jump input via JumpRequest", function()
+    addSlider(UtilitiesPage, 6, "Jump Height", 7, 120, 1, function(v)
+        return string.format("%d st", math.round(v))
+    end, function()
+        return Config.Utilities.JumpHeight
+    end, function(v)
+        Config.Utilities.JumpHeight = math.round(v)
+        if Config.Utilities.JumpEnabled then
+            UtilitiesEngine.applyJumpHeight(true)
+        end
+    end)
+
+    addToggle(UtilitiesPage, 7, "Infinite Jump", "Universal PC/Mobile mid-air jump synced with Jump Height", function()
         return Config.Utilities.InfiniteJump
     end, function(v)
         Config.Utilities.InfiniteJump = v
     end)
 
-    addSectionHeader(UtilitiesPage, 7, "Lighting & Visibility")
+    addToggle(UtilitiesPage, 8, "Bunny Hop (BHop)", "Auto-hops on landing & carries air momentum synced with Speed & Jump", function()
+        return Config.Utilities.BunnyHop
+    end, function(v)
+        UtilitiesEngine.applyBunnyHop(v)
+    end)
 
-    addToggle(UtilitiesPage, 8, "Fullbright", "Locally clears fog & shadows; restores original lighting on OFF", function()
+    addToggle(UtilitiesPage, 9, "Noclip (Pass Through Walls)", "Disables character collisions in Stepped & restores on OFF", function()
+        return Config.Utilities.Noclip
+    end, function(v)
+        UtilitiesEngine.applyNoclip(v)
+    end)
+
+    addSectionHeader(UtilitiesPage, 10, "Lighting & Visibility")
+
+    addToggle(UtilitiesPage, 11, "Fullbright", "Locally clears fog & shadows; restores original lighting on OFF", function()
         return Config.Utilities.Fullbright
     end, function(v)
         UtilitiesEngine.applyFullbright(v)
@@ -9293,9 +9656,7 @@ bindSafeTap(ResetBtn, SettingsPage, function()
         end
     end
     applyPotatoGraphics(Config.Performance.PotatoGraphics)
-    UtilitiesEngine.applyFullbright(Config.Utilities.Fullbright)
-    UtilitiesEngine.applyNoclip(Config.Utilities.Noclip)
-    UtilitiesEngine.applySpeedBoost(Config.Utilities.SpeedEnabled)
+    UtilitiesEngine.syncAll()
     Config.UI.ShowMobileAimButton = true
     Config.UI.MobileAimLocked = false
     Config.UI.ShowMobileTriggerButton = true
@@ -9325,12 +9686,15 @@ local function unloadScript()
     State.Unloaded = true
     State.ReloadToken = State.ReloadToken + 1
     Config.Utilities.InfiniteJump = false
+    Config.Utilities.BunnyHop = false
     releaseTriggerFire()
     pcall(InputGuard.forceReleaseAll)
 
     pcall(UtilitiesEngine.applyFullbright, false)
     pcall(UtilitiesEngine.applyNoclip, false)
     pcall(UtilitiesEngine.applySpeedBoost, false)
+    pcall(UtilitiesEngine.applyJumpHeight, false)
+    pcall(UtilitiesEngine.applyBunnyHop, false)
     pcall(applyPotatoGraphics, false)
 
     pcall(function()
