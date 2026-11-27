@@ -341,8 +341,10 @@ local State = {
     LastJumpTime = 0,
     LastAutoHopTime = 0,
     LastJumpBoostTime = 0,
+    LastGroundedTime = 0,
     BHopMomentum = 0,
     ApplyingJumpImpulse = false,
+    JumpButtonHeld = false,
     OnHumanoidJumpChanged = nil,
     HookedJumpButton = nil,
     FrameIndex = 0,
@@ -2515,6 +2517,8 @@ local function clearLocalCharacterState()
     State.OriginalWalkSpeed = nil
     State.OriginalJump = nil
     State.BHopMomentum = 0
+    State.JumpButtonHeld = false
+    State.LastGroundedTime = 0
     State.HookedJumpButton = nil
     clearTable(State.SavedNoclipParts)
     State.CurrentAimTarget = nil
@@ -2562,6 +2566,14 @@ local function bindLocalCharacter(character)
         table.insert(State.LocalConns, hum:GetPropertyChangedSignal("Jump"):Connect(function()
             if hum.Jump and not State.ApplyingJumpImpulse and type(State.OnHumanoidJumpChanged) == "function" then
                 pcall(State.OnHumanoidJumpChanged, hum)
+            end
+        end))
+        table.insert(State.LocalConns, hum.StateChanged:Connect(function(_, newState)
+            if newState == Enum.HumanoidStateType.Jumping and not State.ApplyingJumpImpulse then
+                local now = os.clock()
+                if (now - (State.LastJumpTime or 0)) >= 0.12 then
+                    State.LastJumpTime = now
+                end
             end
         end))
     end
@@ -6205,6 +6217,34 @@ function UtilitiesEngine.applySpeedBoost(enabled)
     end
 end
 
+function UtilitiesEngine.computeJumpVelocity(hum)
+    local g = math.max(Workspace.Gravity, 1)
+    if Config.Utilities.JumpEnabled then
+        local targetH = math.clamp(tonumber(Config.Utilities.JumpHeight) or 16, 7, 120)
+        return math.sqrt(2 * g * targetH)
+    end
+    if hum and hum.Parent then
+        local okH, useJP, jp, jh = pcall(function()
+            return hum.UseJumpPower, hum.JumpPower, hum.JumpHeight
+        end)
+        if okH then
+            if useJP == false and isFiniteNumber(jh) and jh > 0.5 then
+                return math.sqrt(2 * g * math.clamp(jh, 1, 200))
+            elseif isFiniteNumber(jp) and jp > 1 then
+                return math.clamp(jp, 10, 400)
+            end
+        end
+    end
+    if State.OriginalJump then
+        if State.OriginalJump.UseJumpPower == false and isFiniteNumber(State.OriginalJump.JumpHeight) and State.OriginalJump.JumpHeight > 0.5 then
+            return math.sqrt(2 * g * math.clamp(State.OriginalJump.JumpHeight, 1, 200))
+        elseif isFiniteNumber(State.OriginalJump.JumpPower) and State.OriginalJump.JumpPower > 1 then
+            return math.clamp(State.OriginalJump.JumpPower, 10, 400)
+        end
+    end
+    return 50
+end
+
 function UtilitiesEngine.performJump(source)
     if State.Unloaded then
         return false
@@ -6214,41 +6254,85 @@ function UtilitiesEngine.performJump(source)
         return false
     end
 
-    local targetH = UtilitiesEngine.getEffectiveJumpHeight(hum)
-    local g = math.max(Workspace.Gravity, 1)
-    local targetVelY = math.sqrt(2 * g * targetH)
-
-    State.ApplyingJumpImpulse = true
+    local humState = nil
     pcall(function()
-        hum:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
+        humState = hum:GetState()
     end)
-    pcall(function()
-        hum:ChangeState(Enum.HumanoidStateType.Jumping)
-        hum.Jump = true
-    end)
+    if humState == Enum.HumanoidStateType.Dead then
+        return false
+    end
 
     local curVel = Vector3.zero
     pcall(function()
         curVel = root.AssemblyLinearVelocity
     end)
-    if isFiniteVector3(curVel) then
-        local launchX, launchZ = curVel.X, curVel.Z
-        if source == "BunnyHop" then
-            local md = hum.MoveDirection
-            local flat = Vector3.new(md.X, 0, md.Z)
-            if flat.Magnitude > 0.05 then
-                local dir = flat.Unit
-                local baseSpd = Config.Utilities.SpeedEnabled and math.clamp(tonumber(Config.Utilities.WalkSpeed) or 24, 16, 150) or (State.OriginalWalkSpeed or 16)
-                State.BHopMomentum = math.min((State.BHopMomentum or 0) + 3.6, 18)
-                local hopHoriz = baseSpd + (Config.Utilities.SpeedEnabled and (State.BHopMomentum * 0.6) or State.BHopMomentum)
-                launchX = dir.X * hopHoriz
-                launchZ = dir.Z * hopHoriz
-            end
+    local launchX = isFiniteVector3(curVel) and curVel.X or 0
+    local launchZ = isFiniteVector3(curVel) and curVel.Z or 0
+    local curY = isFiniteVector3(curVel) and curVel.Y or 0
+
+    local targetVelY = math.max(UtilitiesEngine.computeJumpVelocity(hum), 24)
+    local isAirborne = (hum.FloorMaterial == Enum.Material.Air)
+        or (humState == Enum.HumanoidStateType.Freefall)
+        or (humState == Enum.HumanoidStateType.Jumping)
+        or (humState == Enum.HumanoidStateType.FallingDown)
+
+    State.ApplyingJumpImpulse = true
+
+    if source == "BunnyHop" then
+        local md = hum.MoveDirection
+        local flat = Vector3.new(md.X, 0, md.Z)
+        if flat.Magnitude > 0.05 then
+            local dir = flat.Unit
+            local baseSpd = Config.Utilities.SpeedEnabled and math.clamp(tonumber(Config.Utilities.WalkSpeed) or 24, 16, 150) or (State.OriginalWalkSpeed or 16)
+            State.BHopMomentum = math.min((State.BHopMomentum or 0) + 3.6, 18)
+            local hopHoriz = baseSpd + (Config.Utilities.SpeedEnabled and (State.BHopMomentum * 0.6) or State.BHopMomentum)
+            launchX = dir.X * hopHoriz
+            launchZ = dir.Z * hopHoriz
+        end
+        if curY < 0 then
+            pcall(function()
+                root.AssemblyLinearVelocity = Vector3.new(launchX, 0, launchZ)
+            end)
         end
         pcall(function()
-            root.AssemblyLinearVelocity = Vector3.new(launchX, math.max(targetVelY, 24), launchZ)
+            hum:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
+            hum:ChangeState(Enum.HumanoidStateType.Jumping)
+        end)
+        pcall(function()
+            root.AssemblyLinearVelocity = Vector3.new(launchX, targetVelY, launchZ)
+        end)
+    elseif isAirborne then
+        -- Mid-air Infinite Jump: reset downward fall velocity first, then apply upward impulse directly.
+        -- Never force ChangeState(Jumping) while already airborne, which causes Roblox physics to slam downward.
+        if curY < 0 then
+            pcall(function()
+                root.AssemblyLinearVelocity = Vector3.new(launchX, 0, launchZ)
+            end)
+        end
+        if humState == Enum.HumanoidStateType.FallingDown or humState == Enum.HumanoidStateType.PlatformStanding or humState == Enum.HumanoidStateType.Ragdoll then
+            pcall(function()
+                hum:ChangeState(Enum.HumanoidStateType.Freefall)
+            end)
+        end
+        pcall(function()
+            root.AssemblyLinearVelocity = Vector3.new(launchX, targetVelY, launchZ)
+        end)
+    else
+        -- Grounded jump launch
+        if curY < 0 then
+            pcall(function()
+                root.AssemblyLinearVelocity = Vector3.new(launchX, 0, launchZ)
+            end)
+        end
+        pcall(function()
+            hum:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
+            hum:ChangeState(Enum.HumanoidStateType.Jumping)
+        end)
+        pcall(function()
+            root.AssemblyLinearVelocity = Vector3.new(launchX, targetVelY, launchZ)
         end)
     end
+
     State.ApplyingJumpImpulse = false
     State.LastJumpTime = os.clock()
     State.LastJumpBoostTime = State.LastJumpTime
@@ -6260,18 +6344,43 @@ function UtilitiesEngine.triggerAirJump(forceTrigger)
         return false
     end
     local now = os.clock()
-    if (now - (State.LastJumpTime or 0)) < 0.075 then
+    if (now - (State.LastJumpTime or 0)) < 0.10 then
         return false
     end
-    local _, hum = UtilitiesEngine.getLocalMovementRefs()
-    if not hum then
+    local _, hum, root = UtilitiesEngine.getLocalMovementRefs()
+    if not hum or not root then
         return false
     end
-    if forceTrigger then
-        return UtilitiesEngine.performJump("InfiniteJump")
+    local humState = nil
+    pcall(function()
+        humState = hum:GetState()
+    end)
+    if humState == Enum.HumanoidStateType.Dead then
+        return false
     end
-    local isAir = (hum.FloorMaterial == Enum.Material.Air)
-    if isAir or Config.Utilities.JumpEnabled then
+
+    local isAirborne = (hum.FloorMaterial == Enum.Material.Air)
+        or (humState == Enum.HumanoidStateType.Freefall)
+        or (humState == Enum.HumanoidStateType.Jumping)
+        or (humState == Enum.HumanoidStateType.FallingDown)
+
+    if not isAirborne then
+        -- First jump from solid ground: let Roblox handle native takeoff cleanly and debounce duplicate signals from this tap
+        pcall(function()
+            hum:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
+        end)
+        local okJumpProps, useJP, jp, jh = pcall(function()
+            return hum.UseJumpPower, hum.JumpPower, hum.JumpHeight
+        end)
+        local jumpLocked = okJumpProps and ((useJP == false and (jh or 0) <= 0.5) or (useJP ~= false and (jp or 0) <= 1))
+        if jumpLocked then
+            return UtilitiesEngine.performJump("InfiniteJump")
+        end
+        State.LastJumpTime = now
+        return false
+    end
+
+    if forceTrigger or isAirborne then
         return UtilitiesEngine.performJump("InfiniteJump")
     end
     return false
@@ -6291,11 +6400,19 @@ function UtilitiesEngine.ensureTouchJumpHook()
     if jumpBtn and jumpBtn:IsA("GuiObject") and State.HookedJumpButton ~= jumpBtn then
         State.HookedJumpButton = jumpBtn
         table.insert(State.LocalConns, jumpBtn.InputBegan:Connect(function(input)
-            if State.Unloaded or not Config.Utilities.InfiniteJump then
+            if State.Unloaded then
                 return
             end
             if input.UserInputState == Enum.UserInputState.Begin and (input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1) then
-                UtilitiesEngine.triggerAirJump(true)
+                State.JumpButtonHeld = true
+                if Config.Utilities.InfiniteJump then
+                    UtilitiesEngine.triggerAirJump(true)
+                end
+            end
+        end))
+        table.insert(State.LocalConns, jumpBtn.InputEnded:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+                State.JumpButtonHeld = false
             end
         end))
     end
@@ -6332,12 +6449,17 @@ function UtilitiesEngine.stepMovement(dt)
         curVel = root.AssemblyLinearVelocity
     end)
 
-    -- 1. Jump Height Boost sync + anti-reset enforcement
+    local onGroundNow = (hum.FloorMaterial ~= Enum.Material.Air) and (humState ~= Enum.HumanoidStateType.Freefall) and (humState ~= Enum.HumanoidStateType.Jumping)
+    if onGroundNow then
+        State.LastGroundedTime = now
+    end
+
+    -- 1. Jump Height Boost sync + takeoff-only anti-reset enforcement
     if Config.Utilities.JumpEnabled then
         UtilitiesEngine.syncJumpProperties(hum)
-        local targetH = math.clamp(tonumber(Config.Utilities.JumpHeight) or 16, 7, 120)
-        local targetVelY = math.sqrt(2 * math.max(Workspace.Gravity, 1) * targetH)
-        if humState == Enum.HumanoidStateType.Jumping and isFiniteVector3(curVel) and curVel.Y > 4 and curVel.Y < (targetVelY * 0.90) and (now - (State.LastJumpBoostTime or 0)) >= 0.22 then
+        local targetVelY = UtilitiesEngine.computeJumpVelocity(hum)
+        local nearTakeoff = (now - (State.LastGroundedTime or 0)) <= 0.12
+        if humState == Enum.HumanoidStateType.Jumping and nearTakeoff and isFiniteVector3(curVel) and curVel.Y > 2 and curVel.Y < (targetVelY * 0.85) and (now - (State.LastJumpBoostTime or 0)) >= 0.25 then
             State.LastJumpBoostTime = now
             pcall(function()
                 root.AssemblyLinearVelocity = Vector3.new(curVel.X, targetVelY, curVel.Z)
@@ -6346,14 +6468,14 @@ function UtilitiesEngine.stepMovement(dt)
         end
     end
 
-    -- 2. Infinite Jump held-button fall rescue (lets mobile players tap OR hold jump to climb)
-    local isAirborne = (hum.FloorMaterial == Enum.Material.Air) or (humState == Enum.HumanoidStateType.Freefall)
+    -- 2. Infinite Jump held-button fall rescue (lets mobile/PC players hold jump while falling to keep climbing)
+    local isAirborne = (hum.FloorMaterial == Enum.Material.Air) or (humState == Enum.HumanoidStateType.Freefall) or (humState == Enum.HumanoidStateType.FallingDown)
     if Config.Utilities.InfiniteJump and isAirborne then
         local spaceHeld = false
         pcall(function()
             spaceHeld = UserInputService:IsKeyDown(Enum.KeyCode.Space)
         end)
-        if (hum.Jump or spaceHeld) and isFiniteVector3(curVel) and curVel.Y < -2.0 and (now - (State.LastJumpTime or 0)) >= 0.26 then
+        if (State.JumpButtonHeld or spaceHeld or hum.Jump) and isFiniteVector3(curVel) and curVel.Y < -2.0 and (now - (State.LastJumpTime or 0)) >= 0.24 then
             UtilitiesEngine.performJump("InfiniteJump")
             pcall(function()
                 curVel = root.AssemblyLinearVelocity
@@ -6451,7 +6573,7 @@ function UtilitiesEngine.syncAll()
 end
 
 State.OnHumanoidJumpChanged = function(hum)
-    if Config.Utilities.InfiniteJump and hum and (hum.FloorMaterial == Enum.Material.Air or Config.Utilities.JumpEnabled) then
+    if Config.Utilities.InfiniteJump and hum and hum.FloorMaterial == Enum.Material.Air then
         UtilitiesEngine.triggerAirJump(false)
     end
 end
