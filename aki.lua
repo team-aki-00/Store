@@ -79,6 +79,9 @@ local function shallowClone(tbl)
 end
 
 local function clearTable(tbl)
+    if type(tbl) ~= "table" then
+        return
+    end
     for k in pairs(tbl) do
         tbl[k] = nil
     end
@@ -385,15 +388,31 @@ local State = {
     ExternalHighlightCount = 0,
     LastExternalHighlightScan = 0,
     LastTeamScan = -1,
+    TeamEpoch = 0,
     LastVisualCueScan = 0,
     WorkspaceBotCandidates = {},
     TrackedExternalHighlights = {},
+    RemotePlayers = {},
     BotPoolReady = false,
     BotPoolTaskActive = false,
+    AsyncMissingScanActive = false,
+    LastAsyncMissingScan = 0,
     PotatoScanToken = 0,
     LastTouchJumpCheck = 0,
     LastJumpPropSync = 0,
     HighlightCandidatePool = {},
+    EspAllHidden = false,
+    LastFovRadius = -1,
+    LastFovThickness = -1,
+    LastFovAlpha = -1,
+    LastFovColor = nil,
+    LastTriggerDotActive = nil,
+    LastTriggerDotLocked = nil,
+    LastTriggerDotX = -1,
+    LastTriggerDotY = -1,
+    CachedPingSeconds = 0.032,
+    LastPingRead = 0,
+    CustomTeamTagCache = {},
     DetectedTeamScheme = "FFA",
     TeamSignals = nil,
     TeamIgnoreNeutral = false,
@@ -1203,12 +1222,6 @@ local function createRegistryVisualBundle()
     hpBack.ZIndex = 2
     hpBack.Parent = guiRoot
 
-    local hpBackStroke = Instance.new("UIStroke")
-    hpBackStroke.Thickness = 1
-    hpBackStroke.Color = Color3.fromRGB(0, 0, 0)
-    hpBackStroke.Transparency = 0.3
-    hpBackStroke.Parent = hpBack
-
     local hpFill = Instance.new("Frame")
     hpFill.AnchorPoint = Vector2.new(0, 1)
     hpFill.Position = UDim2.fromScale(0, 1)
@@ -1306,9 +1319,11 @@ local function createRegistryVisualBundle()
         lastHpPct = -1,
         lastShield = -1,
         lastHpText = "",
+        lastRenderedHpText = "",
         lastName = "",
         lastDistMeters = -1,
         lastDistText = "",
+        lastRenderedDistText = "",
         lastBoxStyle = "",
         lastBoxCol = nil,
         lastTracerCol = nil,
@@ -1317,6 +1332,24 @@ local function createRegistryVisualBundle()
         lastBoxT = -1,
         lastLineT = -1,
         lastArrowT = -1,
+        lastBX = -9999,
+        lastBY = -9999,
+        lastBW = -1,
+        lastBH = -1,
+        lastHpRatio = -1,
+        lastHpTextY = -9999,
+        lastNameX = -9999,
+        lastNameY = -9999,
+        lastDistX = -9999,
+        lastDistY = -9999,
+        lastTrMidX = -9999,
+        lastTrMidY = -9999,
+        lastTrLen = -1,
+        lastTrRot = -9999,
+        lastArrX = -9999,
+        lastArrY = -9999,
+        lastArrRot = -9999,
+        lastWingLen = -1,
     }
 
     local function ensureDrawingCache()
@@ -1654,27 +1687,35 @@ local function createRegistryVisualBundle()
                 return
             end
 
-            -- Reliable Native ScreenGui Render Path (Sub-0.1 optical hairline support)
+            -- Reliable Native ScreenGui Render Path (Sub-0.1 optical hairline support + coordinate dirty-checking)
             hideDrawing()
             local wasGuiHidden = dirty.guiHidden
             dirty.guiHidden = false
 
             if state.ShowBox then
-                local x, y, w, h = state.BX, state.BY, state.BW, state.BH
+                local x = math.round(state.BX)
+                local y = math.round(state.BY)
+                local w = math.max(math.round(state.BW), 2)
+                local h = math.max(math.round(state.BH), 2)
                 local col = state.BoxColor
+                local boxGeomChanged = wasGuiHidden or x ~= dirty.lastBX or y ~= dirty.lastBY or w ~= dirty.lastBW or h ~= dirty.lastBH
 
                 if state.BoxStyle == "Full" then
                     local strokeT, strokeTrans = VisualHelper.resolveStrokeThickness(state.BoxThickness, 0.04)
                     if not fullBoxFrame.Visible then
                         fullBoxFrame.Visible = true
-                        for i = 1, 8 do cornerSegs[i].Visible = false end
+                        for i = 1, 8 do
+                            if cornerSegs[i].Visible then cornerSegs[i].Visible = false end
+                        end
                     end
-                    fullBoxFrame.Position = UDim2.fromOffset(x, y)
-                    fullBoxFrame.Size = UDim2.fromOffset(w, h)
+                    if boxGeomChanged or dirty.lastBoxStyle ~= "Full" then
+                        fullBoxFrame.Position = UDim2.fromOffset(x, y)
+                        fullBoxFrame.Size = UDim2.fromOffset(w, h)
+                    end
                     if wasGuiHidden or dirty.lastBoxCol ~= col then
                         fullBoxStroke.Color = col
                     end
-                    if wasGuiHidden or dirty.lastBoxT ~= strokeT then
+                    if wasGuiHidden or dirty.lastBoxT ~= strokeT or dirty.lastBoxStyle ~= "Full" then
                         fullBoxStroke.Thickness = strokeT
                         fullBoxStroke.Transparency = strokeTrans
                         dirty.lastBoxT = strokeT
@@ -1682,30 +1723,32 @@ local function createRegistryVisualBundle()
                 else
                     local t, barTrans = VisualHelper.resolveFrameThickness(state.BoxThickness)
                     if fullBoxFrame.Visible then fullBoxFrame.Visible = false end
-                    local cw = math.max(math.clamp(w * 0.25, 4, 24), t + 2)
-                    local ch = math.max(math.clamp(h * 0.22, 4, 24), t + 2)
-
-                    cornerSegs[1].Position = UDim2.fromOffset(x, y)
-                    cornerSegs[1].Size = UDim2.fromOffset(cw, t)
-                    cornerSegs[2].Position = UDim2.fromOffset(x, y)
-                    cornerSegs[2].Size = UDim2.fromOffset(t, ch)
-
-                    cornerSegs[3].Position = UDim2.fromOffset(x + w - cw, y)
-                    cornerSegs[3].Size = UDim2.fromOffset(cw, t)
-                    cornerSegs[4].Position = UDim2.fromOffset(x + w - t, y)
-                    cornerSegs[4].Size = UDim2.fromOffset(t, ch)
-
-                    cornerSegs[5].Position = UDim2.fromOffset(x, y + h - t)
-                    cornerSegs[5].Size = UDim2.fromOffset(cw, t)
-                    cornerSegs[6].Position = UDim2.fromOffset(x, y + h - ch)
-                    cornerSegs[6].Size = UDim2.fromOffset(t, ch)
-
-                    cornerSegs[7].Position = UDim2.fromOffset(x + w - cw, y + h - t)
-                    cornerSegs[7].Size = UDim2.fromOffset(cw, t)
-                    cornerSegs[8].Position = UDim2.fromOffset(x + w - t, y + h - ch)
-                    cornerSegs[8].Size = UDim2.fromOffset(t, ch)
-
                     local needStyleUpdate = wasGuiHidden or dirty.lastBoxCol ~= col or dirty.lastBoxT ~= t or dirty.lastBoxStyle ~= "Corner"
+                    if boxGeomChanged or needStyleUpdate then
+                        local cw = math.max(math.clamp(w * 0.25, 4, 24), t + 2)
+                        local ch = math.max(math.clamp(h * 0.22, 4, 24), t + 2)
+
+                        cornerSegs[1].Position = UDim2.fromOffset(x, y)
+                        cornerSegs[1].Size = UDim2.fromOffset(cw, t)
+                        cornerSegs[2].Position = UDim2.fromOffset(x, y)
+                        cornerSegs[2].Size = UDim2.fromOffset(t, ch)
+
+                        cornerSegs[3].Position = UDim2.fromOffset(x + w - cw, y)
+                        cornerSegs[3].Size = UDim2.fromOffset(cw, t)
+                        cornerSegs[4].Position = UDim2.fromOffset(x + w - t, y)
+                        cornerSegs[4].Size = UDim2.fromOffset(t, ch)
+
+                        cornerSegs[5].Position = UDim2.fromOffset(x, y + h - t)
+                        cornerSegs[5].Size = UDim2.fromOffset(cw, t)
+                        cornerSegs[6].Position = UDim2.fromOffset(x, y + h - ch)
+                        cornerSegs[6].Size = UDim2.fromOffset(t, ch)
+
+                        cornerSegs[7].Position = UDim2.fromOffset(x + w - cw, y + h - t)
+                        cornerSegs[7].Size = UDim2.fromOffset(cw, t)
+                        cornerSegs[8].Position = UDim2.fromOffset(x + w - t, y + h - ch)
+                        cornerSegs[8].Size = UDim2.fromOffset(t, ch)
+                    end
+
                     for i = 1, 8 do
                         local seg = cornerSegs[i]
                         if needStyleUpdate then
@@ -1718,6 +1761,10 @@ local function createRegistryVisualBundle()
                     end
                     dirty.lastBoxT = t
                 end
+                dirty.lastBX = x
+                dirty.lastBY = y
+                dirty.lastBW = w
+                dirty.lastBH = h
                 dirty.lastBoxStyle = state.BoxStyle
             else
                 if fullBoxFrame.Visible then fullBoxFrame.Visible = false end
@@ -1727,24 +1774,38 @@ local function createRegistryVisualBundle()
             end
 
             if state.ShowHealth then
-                local barH = math.max(state.BH, 2)
-                if not hpBack.Visible then hpBack.Visible = true end
-                hpBack.Position = UDim2.fromOffset(state.BX - 6, state.BY)
-                hpBack.Size = UDim2.fromOffset(3, barH)
-                hpFill.Size = UDim2.fromScale(1, state.HealthRatio)
+                local bx = math.round(state.BX)
+                local by = math.round(state.BY)
+                local barH = math.max(math.round(state.BH), 2)
+                local wasHpHidden = not hpBack.Visible
+                if wasHpHidden then hpBack.Visible = true end
+                if wasHpHidden or dirty.lastBX ~= bx or dirty.lastBY ~= by or dirty.lastBH ~= barH then
+                    hpBack.Position = UDim2.fromOffset(bx - 6, by)
+                    hpBack.Size = UDim2.fromOffset(3, barH)
+                end
+                if wasHpHidden or math.abs(state.HealthRatio - dirty.lastHpRatio) > 0.004 then
+                    dirty.lastHpRatio = state.HealthRatio
+                    hpFill.Size = UDim2.fromScale(1, state.HealthRatio)
+                end
                 if wasGuiHidden or dirty.lastHpCol ~= state.HealthColor then
                     hpFill.BackgroundColor3 = state.HealthColor
                 end
 
                 if hpTextStr then
-                    if not hpTextLabel.Visible then hpTextLabel.Visible = true end
-                    if hpTextLabel.Text ~= hpTextStr then
+                    local hpWasHidden = not hpTextLabel.Visible
+                    if hpWasHidden then hpTextLabel.Visible = true end
+                    if dirty.lastRenderedHpText ~= hpTextStr then
+                        dirty.lastRenderedHpText = hpTextStr
                         hpTextLabel.Text = hpTextStr
                     end
                     if wasGuiHidden or dirty.lastHpCol ~= state.HealthColor then
                         hpTextLabel.TextColor3 = state.HealthColor
                     end
-                    hpTextLabel.Position = UDim2.fromOffset(state.BX - 9, math.clamp(state.BY + barH * (1 - state.HealthRatio), state.BY, state.BY + barH))
+                    local hpTxtY = math.round(math.clamp(by + barH * (1 - state.HealthRatio), by, by + barH))
+                    if hpWasHidden or dirty.lastHpTextY ~= hpTxtY or dirty.lastBX ~= bx then
+                        dirty.lastHpTextY = hpTxtY
+                        hpTextLabel.Position = UDim2.fromOffset(bx - 9, hpTxtY)
+                    end
                 elseif hpTextLabel.Visible then
                     hpTextLabel.Visible = false
                 end
@@ -1755,8 +1816,15 @@ local function createRegistryVisualBundle()
             end
 
             if state.ShowName then
-                if not nameLabel.Visible then nameLabel.Visible = true end
-                nameLabel.Position = UDim2.fromOffset(state.BX + state.BW * 0.5, state.BY - 3)
+                local nameWasHidden = not nameLabel.Visible
+                if nameWasHidden then nameLabel.Visible = true end
+                local nx = math.round(state.BX + state.BW * 0.5)
+                local ny = math.round(state.BY - 3)
+                if nameWasHidden or nx ~= dirty.lastNameX or ny ~= dirty.lastNameY then
+                    dirty.lastNameX = nx
+                    dirty.lastNameY = ny
+                    nameLabel.Position = UDim2.fromOffset(nx, ny)
+                end
                 if dirty.lastName ~= state.NameText then
                     dirty.lastName = state.NameText
                     nameLabel.Text = state.NameText
@@ -1769,9 +1837,17 @@ local function createRegistryVisualBundle()
             end
 
             if state.ShowDist and distStr then
-                if not distLabel.Visible then distLabel.Visible = true end
-                distLabel.Position = UDim2.fromOffset(state.FeetX, state.FeetY)
-                if distLabel.Text ~= distStr then
+                local distWasHidden = not distLabel.Visible
+                if distWasHidden then distLabel.Visible = true end
+                local dx = math.round(state.FeetX)
+                local dy = math.round(state.FeetY)
+                if distWasHidden or dx ~= dirty.lastDistX or dy ~= dirty.lastDistY then
+                    dirty.lastDistX = dx
+                    dirty.lastDistY = dy
+                    distLabel.Position = UDim2.fromOffset(dx, dy)
+                end
+                if dirty.lastRenderedDistText ~= distStr then
+                    dirty.lastRenderedDistText = distStr
                     distLabel.Text = distStr
                 end
                 if wasGuiHidden or dirty.lastBoxCol ~= state.BoxColor then
@@ -1785,10 +1861,25 @@ local function createRegistryVisualBundle()
                 local delta = state.TracerTo - state.TracerFrom
                 local mid = (state.TracerFrom + state.TracerTo) * 0.5
                 local lineT, lineTrans = VisualHelper.resolveFrameThickness(state.LineThickness)
-                if not tracerFrame.Visible then tracerFrame.Visible = true end
-                tracerFrame.Position = UDim2.fromOffset(mid.X, mid.Y)
-                tracerFrame.Size = UDim2.fromOffset(math.max(delta.Magnitude, 1), lineT)
-                tracerFrame.Rotation = math.deg(math.atan2(delta.Y, delta.X))
+                local trWasHidden = not tracerFrame.Visible
+                if trWasHidden then tracerFrame.Visible = true end
+                local mx = math.round(mid.X)
+                local my = math.round(mid.Y)
+                local tLen = math.max(math.round(delta.Magnitude), 1)
+                local tRot = math.round(math.deg(math.atan2(delta.Y, delta.X)) * 10) * 0.1
+                if trWasHidden or mx ~= dirty.lastTrMidX or my ~= dirty.lastTrMidY then
+                    dirty.lastTrMidX = mx
+                    dirty.lastTrMidY = my
+                    tracerFrame.Position = UDim2.fromOffset(mx, my)
+                end
+                if trWasHidden or tLen ~= dirty.lastTrLen or dirty.lastLineT ~= lineT then
+                    dirty.lastTrLen = tLen
+                    tracerFrame.Size = UDim2.fromOffset(tLen, lineT)
+                end
+                if trWasHidden or tRot ~= dirty.lastTrRot then
+                    dirty.lastTrRot = tRot
+                    tracerFrame.Rotation = tRot
+                end
                 if wasGuiHidden or dirty.lastTracerCol ~= state.TracerColor then
                     dirty.lastTracerCol = state.TracerColor
                     tracerFrame.BackgroundColor3 = state.TracerColor
@@ -1805,11 +1896,23 @@ local function createRegistryVisualBundle()
                 local rawArrowT = math.clamp(state.Alert360Thickness or 1.5, 0.1, 10.0)
                 local arrowT, arrowTrans = VisualHelper.resolveFrameThickness(rawArrowT)
                 local wingLen = math.clamp(10 + math.max(rawArrowT - 1, 0) * 0.7, 10, 17)
-                if not arrowHolder.Visible then arrowHolder.Visible = true end
-                arrowHolder.Position = UDim2.fromOffset(state.ArrowPos.X, state.ArrowPos.Y)
-                arrowHolder.Rotation = math.deg(state.ArrowAngle) + 90
-                if wasGuiHidden or dirty.lastArrowT ~= arrowT then
+                local arrWasHidden = not arrowHolder.Visible
+                if arrWasHidden then arrowHolder.Visible = true end
+                local ax = math.round(state.ArrowPos.X)
+                local ay = math.round(state.ArrowPos.Y)
+                local aRot = math.round((math.deg(state.ArrowAngle) + 90) * 10) * 0.1
+                if arrWasHidden or ax ~= dirty.lastArrX or ay ~= dirty.lastArrY then
+                    dirty.lastArrX = ax
+                    dirty.lastArrY = ay
+                    arrowHolder.Position = UDim2.fromOffset(ax, ay)
+                end
+                if arrWasHidden or aRot ~= dirty.lastArrRot then
+                    dirty.lastArrRot = aRot
+                    arrowHolder.Rotation = aRot
+                end
+                if wasGuiHidden or dirty.lastArrowT ~= arrowT or dirty.lastWingLen ~= wingLen then
                     dirty.lastArrowT = arrowT
+                    dirty.lastWingLen = wingLen
                     arrowLeft.Size = UDim2.fromOffset(wingLen, arrowT)
                     arrowRight.Size = UDim2.fromOffset(wingLen, arrowT)
                     arrowLeft.BackgroundTransparency = arrowTrans
@@ -1881,7 +1984,7 @@ local CUSTOM_CHAR_FOLDERS = {
     "Players", "Characters", "Entities", "ActivePlayers", "Rigs",
     "GamePlayers", "Living", "Bots", "Units", "Models", "WorkspacePlayers", "Targets",
 }
-local SAFETY_SYNC_INTERVAL = 3.0
+local SAFETY_SYNC_INTERVAL = 4.0
 
 local ScheduleReload
 local ReloadAllSystems
@@ -2083,6 +2186,9 @@ local function resolveCharacterForPlayer(player, allowDeepScan, entry)
     end
     local directChar = player.Character
     if directChar and directChar.Parent then
+        if entry and entry.Character == directChar and entry.RootPart and entry.RootPart.Parent then
+            return directChar
+        end
         if directChar:IsDescendantOf(Workspace) and hasInstanceParts(directChar) then
             return directChar
         end
@@ -2320,8 +2426,66 @@ local function cacheCharacterParts(entry, character)
     entry.LastScanTime = os.clock()
 end
 
--- Deep arbitrary-depth Workspace descendant scan used for players whose Character isn't bound yet
-local function deepWorkspaceScanForMissingPlayers(missingPlayers)
+function VisualHelper.scheduleAsyncMissingPlayerScan(missingPlayers)
+    local now = os.clock()
+    if State.AsyncMissingScanActive or State.Unloaded or (now - (State.LastAsyncMissingScan or 0)) < 10.0 then
+        return
+    end
+    local snapshot = {}
+    for _, plr in ipairs(missingPlayers) do
+        if plr and plr ~= LocalPlayer and plr.Parent == Players then
+            snapshot[plr] = true
+        end
+    end
+    if next(snapshot) == nil then
+        return
+    end
+    State.AsyncMissingScanActive = true
+    State.LastAsyncMissingScan = now
+    task.spawn(function()
+        local count = 0
+        for _, desc in ipairs(Workspace:GetDescendants()) do
+            if State.Unloaded or next(snapshot) == nil then
+                break
+            end
+            if (desc:IsA("Model") or desc:IsA("BasePart")) and not VisualHelper.isLocalTargetOrOwned(desc) then
+                local directOwner = desc:IsA("Model") and Players:GetPlayerFromCharacter(desc) or nil
+                if directOwner and snapshot[directOwner] and hasInstanceParts(desc) then
+                    State.WorkspaceBotCandidates[desc] = true
+                    local entry = Registry[directOwner]
+                    if entry and entry.Character ~= desc then
+                        pcall(function()
+                            -- Bound directly on next reload/sync pass without touching render mid-yield
+                            entry.PendingRecoveredChar = desc
+                        end)
+                    end
+                    snapshot[directOwner] = nil
+                else
+                    for plr in pairs(snapshot) do
+                        local ok, alive = isCandidateModelForPlayer(desc, plr)
+                        if ok and alive then
+                            State.WorkspaceBotCandidates[desc] = true
+                            local entry = Registry[plr]
+                            if entry and entry.Character ~= desc then
+                                entry.PendingRecoveredChar = desc
+                            end
+                            snapshot[plr] = nil
+                            break
+                        end
+                    end
+                end
+            end
+            count = count + 1
+            if count % 250 == 0 then
+                task.wait()
+            end
+        end
+        State.AsyncMissingScanActive = false
+    end)
+end
+
+-- Deep arbitrary-depth Workspace scan (instant over event-tracked pool; async chunked fallback avoids render freezes)
+local function deepWorkspaceScanForMissingPlayers(missingPlayers, allowSyncFallback)
     local foundMap = {}
     if not missingPlayers or #missingPlayers == 0 or not Config.Resolver.CustomContainerScan then
         return foundMap
@@ -2335,8 +2499,14 @@ local function deepWorkspaceScanForMissingPlayers(missingPlayers)
             if direct and direct.Parent and direct:IsDescendantOf(Workspace) and hasInstanceParts(direct) then
                 foundMap[plr] = direct
             else
-                remaining[plr] = true
-                remainingCount = remainingCount + 1
+                local entry = Registry[plr]
+                if entry and entry.PendingRecoveredChar and entry.PendingRecoveredChar.Parent and entry.PendingRecoveredChar:IsDescendantOf(Workspace) then
+                    foundMap[plr] = entry.PendingRecoveredChar
+                    entry.PendingRecoveredChar = nil
+                else
+                    remaining[plr] = true
+                    remainingCount = remainingCount + 1
+                end
             end
         end
     end
@@ -2344,7 +2514,6 @@ local function deepWorkspaceScanForMissingPlayers(missingPlayers)
         return foundMap
     end
 
-    -- Check event-tracked workspace candidates & named custom folders before touching full Workspace descendants
     for cand in pairs(State.WorkspaceBotCandidates) do
         if cand and cand.Parent and (cand:IsA("Model") or cand:IsA("BasePart")) and not VisualHelper.isLocalTargetOrOwned(cand) then
             local directOwner = cand:IsA("Model") and Players:GetPlayerFromCharacter(cand) or nil
@@ -2373,32 +2542,40 @@ local function deepWorkspaceScanForMissingPlayers(missingPlayers)
         end
     end
 
-    for _, desc in ipairs(Workspace:GetDescendants()) do
-        if (desc:IsA("Model") or desc:IsA("BasePart")) and not VisualHelper.isLocalTargetOrOwned(desc) then
-            local directOwner = desc:IsA("Model") and Players:GetPlayerFromCharacter(desc) or nil
-            if directOwner and remaining[directOwner] and hasInstanceParts(desc) then
-                foundMap[directOwner] = desc
-                remaining[directOwner] = nil
-                remainingCount = remainingCount - 1
-            else
-                for plr in pairs(remaining) do
-                    local ok, alive = isCandidateModelForPlayer(desc, plr)
-                    if ok then
-                        if alive or not foundMap[plr] then
-                            foundMap[plr] = desc
-                        end
-                        if alive then
-                            remaining[plr] = nil
-                            remainingCount = remainingCount - 1
-                            break
+    if allowSyncFallback then
+        for _, desc in ipairs(Workspace:GetDescendants()) do
+            if (desc:IsA("Model") or desc:IsA("BasePart")) and not VisualHelper.isLocalTargetOrOwned(desc) then
+                local directOwner = desc:IsA("Model") and Players:GetPlayerFromCharacter(desc) or nil
+                if directOwner and remaining[directOwner] and hasInstanceParts(desc) then
+                    foundMap[directOwner] = desc
+                    remaining[directOwner] = nil
+                    remainingCount = remainingCount - 1
+                else
+                    for plr in pairs(remaining) do
+                        local ok, alive = isCandidateModelForPlayer(desc, plr)
+                        if ok then
+                            if alive or not foundMap[plr] then
+                                foundMap[plr] = desc
+                            end
+                            if alive then
+                                remaining[plr] = nil
+                                remainingCount = remainingCount - 1
+                                break
+                            end
                         end
                     end
                 end
-            end
-            if remainingCount == 0 then
-                break
+                if remainingCount == 0 then
+                    break
+                end
             end
         end
+    else
+        local stillMissing = {}
+        for plr in pairs(remaining) do
+            table.insert(stillMissing, plr)
+        end
+        VisualHelper.scheduleAsyncMissingPlayerScan(stillMissing)
     end
 
     return foundMap
@@ -2620,25 +2797,25 @@ local function registerPlayerEntry(player)
     end))
 
     table.insert(entry.PlayerConns, player:GetPropertyChangedSignal("Team"):Connect(function()
-        State.LastTeamScan = -1
+        VisualHelper.incrementTeamEpoch()
     end))
     table.insert(entry.PlayerConns, player:GetPropertyChangedSignal("TeamColor"):Connect(function()
-        State.LastTeamScan = -1
+        VisualHelper.incrementTeamEpoch()
     end))
     table.insert(entry.PlayerConns, player:GetPropertyChangedSignal("Neutral"):Connect(function()
-        State.LastTeamScan = -1
+        VisualHelper.incrementTeamEpoch()
     end))
     table.insert(entry.PlayerConns, player.AttributeChanged:Connect(function()
-        State.LastTeamScan = -1
+        VisualHelper.incrementTeamEpoch()
     end))
     table.insert(entry.PlayerConns, player.ChildAdded:Connect(function(ch)
         if ch:IsA("ValueBase") or ch:IsA("Folder") or ch:IsA("Configuration") then
-            State.LastTeamScan = -1
+            VisualHelper.incrementTeamEpoch()
         end
     end))
     table.insert(entry.PlayerConns, player.ChildRemoved:Connect(function(ch)
         if ch:IsA("ValueBase") or ch:IsA("Folder") or ch:IsA("Configuration") then
-            State.LastTeamScan = -1
+            VisualHelper.incrementTeamEpoch()
         end
     end))
 
@@ -2752,6 +2929,31 @@ local function registerBotEntry(botModel)
 end
 
 local MAX_TRACKED_BOTS = 64
+VisualHelper.PlayerLookupByName = {}
+VisualHelper.PlayerLookupById = {}
+
+function VisualHelper.incrementTeamEpoch()
+    State.LastTeamScan = -1
+    State.TeamEpoch = (State.TeamEpoch or 0) + 1
+    clearTable(State.CustomTeamTagCache)
+end
+
+function VisualHelper.rebuildRemotePlayerCaches()
+    clearTable(State.RemotePlayers)
+    clearTable(VisualHelper.PlayerLookupByName)
+    clearTable(VisualHelper.PlayerLookupById)
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer then
+            table.insert(State.RemotePlayers, plr)
+            VisualHelper.PlayerLookupByName[plr.Name] = plr
+            if plr.DisplayName and plr.DisplayName ~= "" and not VisualHelper.PlayerLookupByName[plr.DisplayName] then
+                VisualHelper.PlayerLookupByName[plr.DisplayName] = plr
+            end
+            VisualHelper.PlayerLookupById[tostring(plr.UserId)] = plr
+            VisualHelper.PlayerLookupById[plr.UserId] = plr
+        end
+    end
+end
 
 function VisualHelper.trackWorkspaceDescendant(desc)
     if not desc or State.Unloaded then
@@ -2772,7 +2974,13 @@ function VisualHelper.trackWorkspaceDescendant(desc)
             State.WorkspaceBotCandidates[parentModel] = true
         end
     elseif (desc:IsA("Model") or desc:IsA("BasePart"))
-        and (desc:GetAttribute("IsBot") == true or desc:GetAttribute("IsNPC") == true or desc:GetAttribute("Enemy") == true)
+        and (
+            desc:GetAttribute("IsBot") == true
+            or desc:GetAttribute("IsNPC") == true
+            or desc:GetAttribute("Enemy") == true
+            or VisualHelper.PlayerLookupByName[desc.Name] ~= nil
+            or VisualHelper.PlayerLookupById[desc.Name] ~= nil
+        )
     then
         State.WorkspaceBotCandidates[desc] = true
     end
@@ -2817,6 +3025,11 @@ local function syncWorkspaceBots(playerCharSet, forceDeepScan)
         return
     end
 
+    if #State.RemotePlayers == 0 then
+        VisualHelper.rebuildRemotePlayerCaches()
+    end
+    local remotePlayers = State.RemotePlayers
+
     local charLookup = playerCharSet or {}
     if not playerCharSet then
         if State.LocalCharacter then
@@ -2825,7 +3038,7 @@ local function syncWorkspaceBots(playerCharSet, forceDeepScan)
         if LocalPlayer.Character then
             charLookup[LocalPlayer.Character] = true
         end
-        for _, plr in ipairs(Players:GetPlayers()) do
+        for _, plr in ipairs(remotePlayers) do
             if plr.Character then
                 charLookup[plr.Character] = true
             end
@@ -2862,7 +3075,8 @@ local function syncWorkspaceBots(playerCharSet, forceDeepScan)
     local camPos = cam and cam.CFrame.Position or nil
     local candidates = {}
     local candidateSeen = {}
-    local playerList = Players:GetPlayers()
+    local nameLookup = VisualHelper.PlayerLookupByName
+    local idLookup = VisualHelper.PlayerLookupById
 
     local localPurge = {}
     for key, entry in pairs(Registry) do
@@ -2884,7 +3098,8 @@ local function syncWorkspaceBots(playerCharSet, forceDeepScan)
         if model == Workspace.Terrain or model == cam or model == HighlightContainer then
             return
         end
-        local realOwner = model:IsA("Model") and Players:GetPlayerFromCharacter(model) or nil
+        local isModelInst = model:IsA("Model")
+        local realOwner = isModelInst and Players:GetPlayerFromCharacter(model) or nil
         if realOwner ~= nil then
             if realOwner ~= LocalPlayer and hasInstanceParts(model) then
                 if not Registry[realOwner] then
@@ -2898,34 +3113,65 @@ local function syncWorkspaceBots(playerCharSet, forceDeepScan)
             charLookup[model] = true
             return
         end
-        if isCandidateModelForPlayer(model, LocalPlayer) then
-            charLookup[model] = true
-            return
-        end
-        for _, plr in ipairs(playerList) do
-            if plr ~= LocalPlayer and isCandidateModelForPlayer(model, plr) then
-                if not Registry[plr] then
-                    registerPlayerEntry(plr)
-                end
-                local pEntry = Registry[plr]
-                if pEntry and pEntry.Character ~= model then
-                    bindCharacterToEntry(pEntry, model)
-                end
+        local mName = model.Name
+        if mName == LocalPlayer.Name or mName == LocalPlayer.DisplayName or mName == tostring(LocalPlayer.UserId) then
+            if isCandidateModelForPlayer(model, LocalPlayer) then
                 charLookup[model] = true
                 return
             end
         end
-        if botsDisabledEverywhere then
+        local quickPlr = nameLookup[mName] or idLookup[mName]
+        if not quickPlr then
+            local uidAttr = model:GetAttribute("UserId") or model:GetAttribute("PlayerId") or model:GetAttribute("OwnerId")
+            if uidAttr ~= nil then
+                quickPlr = idLookup[uidAttr] or idLookup[tostring(uidAttr)]
+            end
+            if not quickPlr then
+                local strAttr = model:GetAttribute("PlayerName") or model:GetAttribute("Owner") or model:GetAttribute("Player") or model:GetAttribute("Username") or model:GetAttribute("CharacterOwner")
+                if type(strAttr) == "string" then
+                    quickPlr = nameLookup[strAttr] or idLookup[strAttr]
+                end
+            end
+        end
+        if quickPlr and quickPlr ~= LocalPlayer and isCandidateModelForPlayer(model, quickPlr) then
+            if not Registry[quickPlr] then
+                registerPlayerEntry(quickPlr)
+            end
+            local pEntry = Registry[quickPlr]
+            if pEntry and pEntry.Character ~= model then
+                bindCharacterToEntry(pEntry, model)
+            end
+            charLookup[model] = true
             return
         end
-        if not VisualHelper.hasBotRigStructure(model, fromBotFolder) then
+
+        local hasRig = VisualHelper.hasBotRigStructure(model, fromBotFolder)
+        if not hasRig then
+            return
+        end
+        if model:GetAttribute("IsBot") ~= true and model:GetAttribute("IsNPC") ~= true and model:GetAttribute("Enemy") ~= true then
+            for _, plr in ipairs(remotePlayers) do
+                if isCandidateModelForPlayer(model, plr) then
+                    if not Registry[plr] then
+                        registerPlayerEntry(plr)
+                    end
+                    local pEntry = Registry[plr]
+                    if pEntry and pEntry.Character ~= model then
+                        bindCharacterToEntry(pEntry, model)
+                    end
+                    charLookup[model] = true
+                    return
+                end
+            end
+        end
+        if botsDisabledEverywhere then
             return
         end
         if not isModelBotAlive(model) then
             return
         end
         candidateSeen[model] = true
-        local root = model:FindFirstChild("HumanoidRootPart") or (model:IsA("Model") and model.PrimaryPart) or model:FindFirstChildWhichIsA("BasePart")
+        local root = model:FindFirstChild("HumanoidRootPart") or (isModelInst and model.PrimaryPart) or model:FindFirstChildWhichIsA("BasePart")
         local dist = (camPos and root and isFiniteVector3(root.Position)) and (root.Position - camPos).Magnitude or 999
         table.insert(candidates, { Model = model, Dist = dist })
     end
@@ -2950,9 +3196,11 @@ local function syncWorkspaceBots(playerCharSet, forceDeepScan)
         end
     end
 
-    for _, child in ipairs(Workspace:GetChildren()) do
-        if child:IsA("Model") then
-            considerModel(child, false)
+    if forceDeepScan == true or not State.BotPoolReady then
+        for _, child in ipairs(Workspace:GetChildren()) do
+            if child:IsA("Model") then
+                considerModel(child, false)
+            end
         end
     end
 
@@ -3184,8 +3432,9 @@ ReloadAllSystems = function(reason, hardReset)
     State.ReloadCount = State.ReloadCount + 1
     State.LastReloadReason = reason or "Event"
     State.Camera = Workspace.CurrentCamera
+    VisualHelper.rebuildRemotePlayerCaches()
     if reason ~= "Periodic1sRenderSync" then
-        State.LastTeamScan = -1
+        VisualHelper.incrementTeamEpoch()
     end
 
     if not OverlayGui.Parent then
@@ -3238,10 +3487,10 @@ ReloadAllSystems = function(reason, hardReset)
         end
     end
 
-    -- Reconcile every active player in Players:GetPlayers() (pcall-guarded per player so none are skipped)
+    -- Reconcile every remote player (pcall-guarded per player so none are skipped)
     local seen = {}
     local missingPlayers = {}
-    for _, player in ipairs(Players:GetPlayers()) do
+    for _, player in ipairs(State.RemotePlayers) do
         if player ~= LocalPlayer then
             seen[player] = true
             pcall(function()
@@ -3262,6 +3511,14 @@ ReloadAllSystems = function(reason, hardReset)
                         entry.HealthBg = rebuilt.HealthBg
                         entry.HealthFill = rebuilt.HealthFill
                         entry.AlertArrow = rebuilt.AlertArrow
+                    end
+
+                    if entry.PendingRecoveredChar and entry.PendingRecoveredChar.Parent and entry.PendingRecoveredChar:IsDescendantOf(Workspace) then
+                        local pending = entry.PendingRecoveredChar
+                        entry.PendingRecoveredChar = nil
+                        if entry.Character ~= pending then
+                            bindCharacterToEntry(entry, pending)
+                        end
                     end
 
                     local liveChar = resolveCharacterForPlayer(player, reason ~= "Periodic1sRenderSync", entry)
@@ -3289,9 +3546,9 @@ ReloadAllSystems = function(reason, hardReset)
     end
 
     local nowMissing = os.clock()
-    if #missingPlayers > 0 and (hardReset == true or (nowMissing - (State.LastWorkspaceDeepScan or 0)) >= 3.5) then
+    if #missingPlayers > 0 and (hardReset == true or (nowMissing - (State.LastWorkspaceDeepScan or 0)) >= 4.0) then
         State.LastWorkspaceDeepScan = nowMissing
-        local recovered = deepWorkspaceScanForMissingPlayers(missingPlayers)
+        local recovered = deepWorkspaceScanForMissingPlayers(missingPlayers, hardReset == true)
         for player, liveChar in pairs(recovered) do
             local entry = Registry[player]
             if entry and liveChar and liveChar.Parent then
@@ -3330,7 +3587,7 @@ ReloadAllSystems = function(reason, hardReset)
 
     syncWorkspaceBots(playerCharSet, hardReset == true)
     if type(State.OnSystemsReloaded) == "function" then
-        pcall(State.OnSystemsReloaded)
+        pcall(State.OnSystemsReloaded, reason)
     end
 end
 
@@ -3354,14 +3611,16 @@ addConnection(Players.PlayerAdded:Connect(function(player)
         return
     end
     if not State.Unloaded then
-        State.LastTeamScan = -1
+        VisualHelper.rebuildRemotePlayerCaches()
+        VisualHelper.incrementTeamEpoch()
         pcall(registerPlayerEntry, player)
         ScheduleReload("PlayerAdded:" .. player.Name, false)
     end
 end))
 
 addConnection(Players.PlayerRemoving:Connect(function(player)
-    State.LastTeamScan = -1
+    VisualHelper.rebuildRemotePlayerCaches()
+    VisualHelper.incrementTeamEpoch()
     pcall(destroyPlayerEntry, player)
     if not State.Unloaded then
         ScheduleReload("PlayerRemoving:" .. player.Name, false)
@@ -3369,52 +3628,51 @@ addConnection(Players.PlayerRemoving:Connect(function(player)
 end))
 
 -- Immediately register every player already connected at script injection time
-for _, existingPlayer in ipairs(Players:GetPlayers()) do
-    if existingPlayer ~= LocalPlayer then
-        pcall(registerPlayerEntry, existingPlayer)
-    end
+VisualHelper.rebuildRemotePlayerCaches()
+for _, existingPlayer in ipairs(State.RemotePlayers) do
+    pcall(registerPlayerEntry, existingPlayer)
 end
 
 addConnection(LocalPlayer:GetPropertyChangedSignal("Team"):Connect(function()
-    State.LastTeamScan = -1
+    VisualHelper.incrementTeamEpoch()
 end))
 
 addConnection(LocalPlayer:GetPropertyChangedSignal("TeamColor"):Connect(function()
-    State.LastTeamScan = -1
+    VisualHelper.incrementTeamEpoch()
 end))
 
 addConnection(LocalPlayer:GetPropertyChangedSignal("Neutral"):Connect(function()
-    State.LastTeamScan = -1
+    VisualHelper.incrementTeamEpoch()
 end))
 
 addConnection(LocalPlayer.AttributeChanged:Connect(function()
-    State.LastTeamScan = -1
+    VisualHelper.incrementTeamEpoch()
 end))
 
 addConnection(LocalPlayer.ChildAdded:Connect(function(ch)
     if ch:IsA("ValueBase") or ch:IsA("Folder") or ch:IsA("Configuration") then
-        State.LastTeamScan = -1
+        VisualHelper.incrementTeamEpoch()
     end
 end))
 
 addConnection(LocalPlayer.ChildRemoved:Connect(function(ch)
     if ch:IsA("ValueBase") or ch:IsA("Folder") or ch:IsA("Configuration") then
-        State.LastTeamScan = -1
+        VisualHelper.incrementTeamEpoch()
     end
 end))
 
 if Teams then
     addConnection(Teams.ChildAdded:Connect(function()
-        State.LastTeamScan = -1
+        VisualHelper.incrementTeamEpoch()
     end))
     addConnection(Teams.ChildRemoved:Connect(function()
-        State.LastTeamScan = -1
+        VisualHelper.incrementTeamEpoch()
     end))
 end
 
 addConnection(LocalPlayer.CharacterAdded:Connect(function(char)
     if not State.Unloaded then
-        State.LastTeamScan = -1
+        VisualHelper.incrementTeamEpoch()
         bindLocalCharacter(char)
         ScheduleReload("LocalPlayerRespawned", false)
     end
@@ -3762,12 +4020,33 @@ local function readCustomTeamTag(player, character)
         return State.ExternalCharTeams[character], false
     end
 
+    local cacheKey = player or character
+    if cacheKey then
+        local cached = State.CustomTeamTagCache[cacheKey]
+        if cached and cached.epoch == State.TeamEpoch and cached.char == character and (os.clock() - cached.t) < 1.5 then
+            return cached.tag, cached.isSq
+        end
+    end
+
+    local function storeTagCache(tag, isSq)
+        if cacheKey then
+            State.CustomTeamTagCache[cacheKey] = {
+                tag = tag,
+                isSq = isSq,
+                epoch = State.TeamEpoch,
+                char = character,
+                t = os.clock(),
+            }
+        end
+        return tag, isSq
+    end
+
     local squadFallback = nil
     if player then
         local directTag, isSq = readTeamTagFromContainer(player)
         if directTag ~= nil then
             if not isSq then
-                return directTag, false
+                return storeTagCache(directTag, false)
             end
             squadFallback = directTag
         end
@@ -3778,7 +4057,7 @@ local function readCustomTeamTag(player, character)
                 local subTag, subSq = readTeamTagFromContainer(child)
                 if subTag ~= nil then
                     if not subSq then
-                        return subTag, false
+                        return storeTagCache(subTag, false)
                     elseif not squadFallback then
                         squadFallback = subTag
                     end
@@ -3788,7 +4067,7 @@ local function readCustomTeamTag(player, character)
                         local gTag, gSq = readTeamTagFromContainer(grand)
                         if gTag ~= nil then
                             if not gSq then
-                                return gTag, false
+                                return storeTagCache(gTag, false)
                             elseif not squadFallback then
                                 squadFallback = gTag
                             end
@@ -3803,7 +4082,7 @@ local function readCustomTeamTag(player, character)
         local charTag, cSq = readTeamTagFromContainer(character)
         if charTag ~= nil then
             if not cSq then
-                return charTag, false
+                return storeTagCache(charTag, false)
             elseif not squadFallback then
                 squadFallback = charTag
             end
@@ -3813,7 +4092,7 @@ local function readCustomTeamTag(player, character)
             local humTag, hSq = readTeamTagFromContainer(hum)
             if humTag ~= nil then
                 if not hSq then
-                    return humTag, false
+                    return storeTagCache(humTag, false)
                 elseif not squadFallback then
                     squadFallback = humTag
                 end
@@ -3824,7 +4103,7 @@ local function readCustomTeamTag(player, character)
                 local cfTag, cfSq = readTeamTagFromContainer(child)
                 if cfTag ~= nil then
                     if not cfSq then
-                        return cfTag, false
+                        return storeTagCache(cfTag, false)
                     elseif not squadFallback then
                         squadFallback = cfTag
                     end
@@ -3834,13 +4113,13 @@ local function readCustomTeamTag(player, character)
     end
 
     if player and State.CollectionTeamTags and State.CollectionTeamTags[player] then
-        return State.CollectionTeamTags[player], false
+        return storeTagCache(State.CollectionTeamTags[player], false)
     end
     if character and State.CollectionTeamTags and State.CollectionTeamTags[character] then
-        return State.CollectionTeamTags[character], false
+        return storeTagCache(State.CollectionTeamTags[character], false)
     end
 
-    return squadFallback, (squadFallback ~= nil)
+    return storeTagCache(squadFallback, (squadFallback ~= nil))
 end
 
 VisualHelper.GenericWorkspaceFolders = {
@@ -4111,92 +4390,120 @@ function VisualHelper.scanVisualTeamCues(allPlrs)
 
     local rawColors = {}
     local rawPolarities = {}
-    local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-    if pg then
-        for _, desc in ipairs(pg:GetDescendants()) do
-            if desc:IsA("BillboardGui") and desc.Enabled and desc.Adornee then
-                local ad = desc.Adornee
-                local targetModel = ad:IsA("Model") and ad or ad:FindFirstAncestorOfClass("Model")
-                if targetModel and charToPlr[targetModel] then
-                    if VisualHelper.isAllyMarkerName(desc.Name) then
-                        State.VisualAllyFlags[targetModel] = true
-                    end
-                    for _, sub in ipairs(desc:GetDescendants()) do
-                        local sn = string.lower(sub.Name)
-                        if not (string.find(sn, "health", 1, true) or string.find(sn, "hp", 1, true) or string.find(sn, "shield", 1, true) or string.find(sn, "level", 1, true)) then
-                            local col = nil
-                            if sub:IsA("TextLabel") and sub.Visible and sub.Text ~= "" then
-                                col = sub.TextColor3
-                            elseif sub:IsA("ImageLabel") and sub.Visible and sub.ImageTransparency < 0.9 then
-                                col = sub.ImageColor3
-                            end
-                            local ck, pol = VisualHelper.classifyVisualColor(col)
-                            if ck and not rawColors[targetModel] then
-                                rawColors[targetModel] = ck
-                                rawPolarities[targetModel] = pol
-                                break
-                            end
-                        end
+
+    local function extractVisualCueColor(guiInst, depth)
+        for _, sub in ipairs(guiInst:GetChildren()) do
+            local sn = string.lower(sub.Name)
+            if not (string.find(sn, "health", 1, true) or string.find(sn, "hp", 1, true) or string.find(sn, "shield", 1, true) or string.find(sn, "level", 1, true)) then
+                local col = nil
+                if sub:IsA("TextLabel") and sub.Visible and sub.Text ~= "" then
+                    col = sub.TextColor3
+                elseif sub:IsA("ImageLabel") and sub.Visible and sub.ImageTransparency < 0.9 then
+                    col = sub.ImageColor3
+                end
+                if col then
+                    local ck, pol = VisualHelper.classifyVisualColor(col)
+                    if ck then
+                        return ck, pol
                     end
                 end
-            elseif desc:IsA("Highlight") and desc.Enabled and desc.Adornee and not desc:IsDescendantOf(HighlightContainer) then
-                local ad = desc.Adornee
-                local targetModel = ad:IsA("Model") and ad or ad:FindFirstAncestorOfClass("Model")
-                if targetModel and charToPlr[targetModel] then
-                    local ck, pol = VisualHelper.classifyVisualColor(desc.OutlineColor or desc.FillColor)
-                    if VisualHelper.isAllyMarkerName(desc.Name) or pol == "ally" then
-                        State.VisualAllyFlags[targetModel] = true
+                if depth < 2 and (sub:IsA("Frame") or sub:IsA("CanvasGroup")) then
+                    local ck2, pol2 = extractVisualCueColor(sub, depth + 1)
+                    if ck2 then
+                        return ck2, pol2
                     end
-                    if ck and not rawColors[targetModel] then
+                end
+            end
+        end
+        return nil, nil
+    end
+
+    local function inspectVisualContainer(obj, depth)
+        if obj:IsA("BillboardGui") and obj.Enabled and obj.Adornee then
+            local ad = obj.Adornee
+            local targetModel = ad:IsA("Model") and ad or ad:FindFirstAncestorOfClass("Model")
+            if targetModel and charToPlr[targetModel] then
+                if VisualHelper.isAllyMarkerName(obj.Name) then
+                    State.VisualAllyFlags[targetModel] = true
+                end
+                if not rawColors[targetModel] then
+                    local ck, pol = extractVisualCueColor(obj, 1)
+                    if ck then
                         rawColors[targetModel] = ck
                         rawPolarities[targetModel] = pol
                     end
+                end
+            end
+        elseif obj:IsA("Highlight") and obj.Enabled and obj.Adornee and not obj:IsDescendantOf(HighlightContainer) then
+            local ad = obj.Adornee
+            local targetModel = ad:IsA("Model") and ad or ad:FindFirstAncestorOfClass("Model")
+            if targetModel and charToPlr[targetModel] then
+                local ck, pol = VisualHelper.classifyVisualColor(obj.OutlineColor or obj.FillColor)
+                if VisualHelper.isAllyMarkerName(obj.Name) or pol == "ally" then
+                    State.VisualAllyFlags[targetModel] = true
+                end
+                if ck and not rawColors[targetModel] then
+                    rawColors[targetModel] = ck
+                    rawPolarities[targetModel] = pol
+                end
+            end
+        elseif depth < 2 and (obj:IsA("ScreenGui") or obj:IsA("Folder")) then
+            if obj:IsA("ScreenGui") and not obj.Enabled then
+                return
+            end
+            for _, sub in ipairs(obj:GetChildren()) do
+                inspectVisualContainer(sub, depth + 1)
+            end
+        end
+    end
+
+    local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if pg then
+        for _, child in ipairs(pg:GetChildren()) do
+            inspectVisualContainer(child, 1)
+        end
+    end
+
+    local function scanCharCueChild(ch, obj)
+        if obj:IsA("BillboardGui") and obj.Enabled and obj.PlayerToHideFrom ~= LocalPlayer then
+            if VisualHelper.isAllyMarkerName(obj.Name) then
+                State.VisualAllyFlags[ch] = true
+            end
+            if not rawColors[ch] then
+                local ck, pol = extractVisualCueColor(obj, 1)
+                if ck then
+                    rawColors[ch] = ck
+                    rawPolarities[ch] = pol
+                end
+            end
+        elseif obj:IsA("Highlight") and obj.Enabled and not obj:IsDescendantOf(HighlightContainer) then
+            local ck, pol = VisualHelper.classifyVisualColor(obj.OutlineColor or obj.FillColor)
+            if VisualHelper.isAllyMarkerName(obj.Name) or pol == "ally" then
+                State.VisualAllyFlags[ch] = true
+            end
+            if ck and not rawColors[ch] then
+                rawColors[ch] = ck
+                rawPolarities[ch] = pol
+            end
+        elseif obj:IsA("BasePart") or obj:IsA("Light") then
+            local dn = string.lower(obj.Name)
+            if dn == "teamcolor" or dn == "teamband" or dn == "armband" or dn == "teamvest" or dn == "teamindicator" or dn == "teamlight" then
+                local ck, pol = VisualHelper.classifyVisualColor(obj.Color)
+                if ck and not rawColors[ch] then
+                    rawColors[ch] = ck
+                    rawPolarities[ch] = pol
                 end
             end
         end
     end
 
     for ch, _ in pairs(charToPlr) do
-        for _, desc in ipairs(ch:GetDescendants()) do
-            if desc:IsA("BillboardGui") and desc.Enabled and desc.PlayerToHideFrom ~= LocalPlayer then
-                if VisualHelper.isAllyMarkerName(desc.Name) then
-                    State.VisualAllyFlags[ch] = true
-                end
-                if not rawColors[ch] then
-                    for _, sub in ipairs(desc:GetDescendants()) do
-                        local sn = string.lower(sub.Name)
-                        if not (string.find(sn, "health", 1, true) or string.find(sn, "hp", 1, true) or string.find(sn, "shield", 1, true) or string.find(sn, "level", 1, true)) then
-                            local col = nil
-                            if sub:IsA("TextLabel") and sub.Visible and sub.Text ~= "" then
-                                col = sub.TextColor3
-                            elseif sub:IsA("ImageLabel") and sub.Visible and sub.ImageTransparency < 0.9 then
-                                col = sub.ImageColor3
-                            end
-                            local ck, pol = VisualHelper.classifyVisualColor(col)
-                            if ck then
-                                rawColors[ch] = ck
-                                rawPolarities[ch] = pol
-                                break
-                            end
-                        end
-                    end
-                end
-            elseif desc:IsA("Highlight") and desc.Enabled and not desc:IsDescendantOf(HighlightContainer) then
-                local ck, pol = VisualHelper.classifyVisualColor(desc.OutlineColor or desc.FillColor)
-                if VisualHelper.isAllyMarkerName(desc.Name) or pol == "ally" then
-                    State.VisualAllyFlags[ch] = true
-                end
-                if ck and not rawColors[ch] then
-                    rawColors[ch] = ck
-                    rawPolarities[ch] = pol
-                end
-            elseif (desc:IsA("BasePart") or desc:IsA("Light")) then
-                local dn = string.lower(desc.Name)
-                if dn == "teamcolor" or dn == "teamband" or dn == "armband" or dn == "teamvest" or dn == "teamindicator" or dn == "teamlight" then
-                    local ck, pol = VisualHelper.classifyVisualColor(desc.Color)
-                    if ck and not rawColors[ch] then
-                        rawColors[ch] = ck
-                        rawPolarities[ch] = pol
+        for _, child in ipairs(ch:GetChildren()) do
+            scanCharCueChild(ch, child)
+            if child.Name == "Head" or child.Name == "UpperTorso" or child.Name == "Torso" or child.Name == "HumanoidRootPart" then
+                for _, sub in ipairs(child:GetChildren()) do
+                    if sub:IsA("BillboardGui") or sub:IsA("Highlight") or sub:IsA("Light") then
+                        scanCharCueChild(ch, sub)
                     end
                 end
             end
@@ -4246,22 +4553,36 @@ function VisualHelper.hasFriendlyOverheadMarker(character)
     end
     local now = os.clock()
     local cached = VisualHelper.VisualAllyScanCache[character]
-    if cached and (now - cached.t) < 1.5 then
+    if cached and (now - cached.t) < 2.5 then
         return cached.v
     end
     local found = false
-    for _, desc in ipairs(character:GetDescendants()) do
+    local function checkObj(desc)
         if desc:IsA("BillboardGui") and desc.Enabled and desc.PlayerToHideFrom ~= LocalPlayer then
             if VisualHelper.isAllyMarkerName(desc.Name) then
-                found = true
-                break
+                return true
             end
         elseif desc:IsA("Highlight") and desc.Enabled and not desc:IsDescendantOf(HighlightContainer) then
             local _, pol = VisualHelper.classifyVisualColor(desc.OutlineColor or desc.FillColor)
             if VisualHelper.isAllyMarkerName(desc.Name) or pol == "ally" then
-                found = true
-                break
+                return true
             end
+        end
+        return false
+    end
+    for _, child in ipairs(character:GetChildren()) do
+        if checkObj(child) then
+            found = true
+            break
+        end
+        if child.Name == "Head" or child.Name == "UpperTorso" or child.Name == "Torso" or child.Name == "HumanoidRootPart" then
+            for _, sub in ipairs(child:GetChildren()) do
+                if checkObj(sub) then
+                    found = true
+                    break
+                end
+            end
+            if found then break end
         end
     end
     VisualHelper.VisualAllyScanCache[character] = { v = found, t = now }
@@ -4309,7 +4630,7 @@ end
 -- Detects all active team schemes across standard Team, Neutral-tolerant TeamColor, 0/1-indexed & letter CustomTag, CollectionService, FolderTag, and visual AllyMarkers
 local function refreshDetectedTeamScheme()
     local now = os.clock()
-    if State.LastTeamScan >= 0 and (now - State.LastTeamScan) < 0.45 then
+    if State.LastTeamScan >= 0 and (now - State.LastTeamScan) < 2.0 then
         return State.DetectedTeamScheme
     end
     local hardTeamRefresh = (State.LastTeamScan < 0)
@@ -4321,8 +4642,8 @@ local function refreshDetectedTeamScheme()
 
     local prevSignals = State.TeamSignals
     local hasPrimaryTeamSignal = prevSignals and (prevSignals.Team or prevSignals.TeamColor or prevSignals.CustomTag)
-    local visualCueInterval = hasPrimaryTeamSignal and 5.0 or 2.0
-    if (State.LastVisualCueScan or 0) == 0 or hardTeamRefresh or (now - (State.LastVisualCueScan or 0)) >= visualCueInterval then
+    local visualCueInterval = hasPrimaryTeamSignal and 6.0 or 2.5
+    if (State.LastVisualCueScan or 0) == 0 or (hardTeamRefresh and not hasPrimaryTeamSignal) or (now - (State.LastVisualCueScan or 0)) >= visualCueInterval then
         State.LastVisualCueScan = now
         clearTable(VisualHelper.VisualAllyScanCache)
         VisualHelper.scanVisualTeamCues(allPlrs)
@@ -4562,8 +4883,11 @@ local function IsTeammate(player, entry)
     if mode == "Off" then
         return false
     end
-    if resolvedEntry and resolvedEntry.FrameTeamId == State.FrameIndex and resolvedEntry.FrameTeamMode == mode then
-        return resolvedEntry.FrameTeamVal
+    if resolvedEntry then
+        local nowT = os.clock()
+        if resolvedEntry.FrameTeamMode == mode and resolvedEntry.TeamCacheEpoch == State.TeamEpoch and (resolvedEntry.FrameTeamId == State.FrameIndex or (nowT - (resolvedEntry.TeamCacheTime or 0)) < 0.40) then
+            return resolvedEntry.FrameTeamVal
+        end
     end
 
     local function cacheTeam(res)
@@ -4571,6 +4895,8 @@ local function IsTeammate(player, entry)
             resolvedEntry.FrameTeamId = State.FrameIndex
             resolvedEntry.FrameTeamMode = mode
             resolvedEntry.FrameTeamVal = res
+            resolvedEntry.TeamCacheEpoch = State.TeamEpoch
+            resolvedEntry.TeamCacheTime = os.clock()
         end
         return res
     end
@@ -5031,58 +5357,62 @@ end
 -- [SECTION 6] REBUILT ESP RENDERER (WITH PROPORTIONAL DISTANCE BOX FALLBACK)
 -- ============================================================================
 VisualHelper.BoxSampleParts = {}
+VisualHelper.BoxSampleSeen = {}
 
 local function computeScreenBox(camera, entry, rootVP, worldDist)
+    local dist = worldDist or 0
+    local cands = entry.TargetCandidates
+    local headPart = entry.Head
+    local rootPart = entry.RootPart
+    local footPart = cands and cands.Foot
+
+    -- Fast 2-point height projection for far targets (2 WorldToViewportPoint calls instead of 48)
+    if dist > 85 and headPart and headPart.Parent and (footPart and footPart.Parent or (rootPart and rootPart.Parent)) then
+        local topWorld = headPart.Position + Vector3.new(0, headPart.Size.Y * 0.55, 0)
+        local botWorld = (footPart and footPart.Parent)
+            and (footPart.Position - Vector3.new(0, footPart.Size.Y * 0.52, 0))
+            or (rootPart.Position - Vector3.new(0, 2.8, 0))
+        local topVP = camera:WorldToViewportPoint(topWorld)
+        local botVP = camera:WorldToViewportPoint(botWorld)
+        if topVP.Z > 0 and botVP.Z > 0 then
+            local rawH = math.abs(botVP.Y - topVP.Y) + 6
+            if rawH >= 10 then
+                local vpSize = camera.ViewportSize
+                local h = math.clamp(rawH, 12, vpSize.Y * 1.3)
+                local w = math.max(8, h * 0.56)
+                local cx = (topVP.X + botVP.X) * 0.5
+                local cy = (topVP.Y + botVP.Y) * 0.5
+                return true, cx - w * 0.5, cy - h * 0.5, w, h
+            end
+        end
+    end
+
     local minX, minY = math.huge, math.huge
     local maxX, maxY = -math.huge, -math.huge
     local anyInFront = false
-    local rootPos = entry.RootPart and entry.RootPart.Position
+    local rootPos = rootPart and rootPart.Position
     local maxSpread = math.max(24, (entry.Humanoid and entry.Humanoid.HipHeight or 2) * 8)
 
-    local sampleParts = VisualHelper.BoxSampleParts
-    clearTable(sampleParts)
-    local sampleSeen = {}
-    local function pushSamplePart(p, maxCount)
-        if p and p.Parent and not sampleSeen[p] and #sampleParts < maxCount then
-            if not rootPos or (p.Position - rootPos).Magnitude <= maxSpread then
-                sampleSeen[p] = true
-                table.insert(sampleParts, p)
+    -- Oriented 8-corner character hull for close standard rigs (8 WorldToViewportPoint calls instead of 48)
+    if rootPart and rootPart.Parent and headPart and headPart.Parent and (not entry.Bones or #entry.Bones == 0) then
+        local rcf = rootPart.CFrame
+        local localHead = rcf:PointToObjectSpace(headPart.Position + Vector3.new(0, headPart.Size.Y * 0.55, 0))
+        local localFootY = -2.85
+        if footPart and footPart.Parent then
+            local lf = rcf:PointToObjectSpace(footPart.Position - Vector3.new(0, footPart.Size.Y * 0.5, 0))
+            if lf.Y < localHead.Y and math.abs(lf.Y) <= maxSpread then
+                localFootY = lf.Y
             end
         end
-    end
-
-    local farTarget = (worldDist or 0) > 95
-    local maxSampleCount = farTarget and 4 or 6
-    local cands = entry.TargetCandidates
-    pushSamplePart(entry.Head, maxSampleCount)
-    pushSamplePart(entry.Torso, maxSampleCount)
-    pushSamplePart(entry.RootPart, maxSampleCount)
-    pushSamplePart(cands and cands.Foot, maxSampleCount)
-
-    if not farTarget and #sampleParts < maxSampleCount then
-        local parts = entry.RigParts
-        for i = 1, #parts do
-            pushSamplePart(parts[i], maxSampleCount)
-            if #sampleParts >= maxSampleCount then
-                break
-            end
-        end
-    elseif #sampleParts == 0 then
-        local parts = entry.RigParts
-        for i = 1, math.min(#parts, maxSampleCount) do
-            pushSamplePart(parts[i], maxSampleCount)
-        end
-    end
-
-    local validParts = #sampleParts
-    for i = 1, validParts do
-        local part = sampleParts[i]
-        local cf = part.CFrame
-        local half = part.Size * 0.5
+        local topY = math.clamp(localHead.Y, 0.5, maxSpread)
+        local botY = math.clamp(localFootY, -maxSpread, topY - 1.0)
+        local torsoHalfX = (entry.Torso and entry.Torso.Parent) and math.clamp(entry.Torso.Size.X * 0.92, 1.5, 4.2) or 1.85
+        local halfZ = math.clamp(torsoHalfX * 0.68, 1.0, 2.8)
         for sx = -1, 1, 2 do
-            for sy = -1, 1, 2 do
+            for sy = 0, 1 do
+                local py = (sy == 1) and topY or botY
                 for sz = -1, 1, 2 do
-                    local corner = cf:PointToWorldSpace(Vector3.new(half.X * sx, half.Y * sy, half.Z * sz))
+                    local corner = rcf:PointToWorldSpace(Vector3.new(torsoHalfX * sx, py, halfZ * sz))
                     local vp = camera:WorldToViewportPoint(corner)
                     if vp.Z > 0 then
                         anyInFront = true
@@ -5094,57 +5424,107 @@ local function computeScreenBox(camera, entry, rootVP, worldDist)
                 end
             end
         end
-    end
-
-    -- Support skinned-mesh custom rigs deformed via Bone instances (capped to keep mobile frame time fast)
-    if entry.Bones and #entry.Bones > 0 then
-        local boneCount = #entry.Bones
-        local step = (boneCount > 8) and math.ceil(boneCount / 8) or 1
-        for i = 1, boneCount, step do
-            local bone = entry.Bones[i]
-            if bone and bone.Parent then
-                local okBone, bPos = pcall(function()
-                    return bone.TransformedWorldCFrame.Position
-                end)
-                if okBone and bPos and (not rootPos or (bPos - rootPos).Magnitude <= maxSpread) then
-                    local vp = camera:WorldToViewportPoint(bPos)
-                    if vp.Z > 0 then
-                        anyInFront = true
-                        if vp.X < minX then minX = vp.X end
-                        if vp.Y < minY then minY = vp.Y end
-                        if vp.X > maxX then maxX = vp.X end
-                        if vp.Y > maxY then maxY = vp.Y end
-                    end
+    else
+        local sampleParts = VisualHelper.BoxSampleParts
+        clearTable(sampleParts)
+        local sampleSeen = VisualHelper.BoxSampleSeen
+        clearTable(sampleSeen)
+        local function pushSamplePart(p, maxCount)
+            if p and p.Parent and not sampleSeen[p] and #sampleParts < maxCount then
+                if not rootPos or (p.Position - rootPos).Magnitude <= maxSpread then
+                    sampleSeen[p] = true
+                    table.insert(sampleParts, p)
                 end
             end
         end
-    end
 
-    if validParts == 0 and entry.Character then
-        local cf, size
-        if entry.Character:IsA("BasePart") then
-            cf = entry.Character.CFrame
-            size = entry.Character.Size
-        elseif entry.Character:IsA("Model") then
-            local ok, mcf, msize = pcall(entry.Character.GetBoundingBox, entry.Character)
-            if ok then
-                cf = mcf
-                size = msize
+        local maxSampleCount = 3
+        pushSamplePart(headPart, maxSampleCount)
+        pushSamplePart(entry.Torso, maxSampleCount)
+        pushSamplePart(rootPart, maxSampleCount)
+        pushSamplePart(footPart, maxSampleCount)
+
+        if #sampleParts < maxSampleCount then
+            local parts = entry.RigParts
+            for i = 1, #parts do
+                pushSamplePart(parts[i], maxSampleCount)
+                if #sampleParts >= maxSampleCount then
+                    break
+                end
             end
         end
-        if cf and size then
-            local half = Vector3.new(math.min(size.X, 18), math.min(size.Y, 20), math.min(size.Z, 18)) * 0.5
-            for sx = -1, 1, 2 do
-                for sy = -1, 1, 2 do
-                    for sz = -1, 1, 2 do
-                        local corner = cf:PointToWorldSpace(Vector3.new(half.X * sx, half.Y * sy, half.Z * sz))
-                        local vp = camera:WorldToViewportPoint(corner)
+
+        local validParts = #sampleParts
+        for i = 1, validParts do
+            local part = sampleParts[i]
+            local cf = part.CFrame
+            local half = part.Size * 0.5
+            for k = 1, 4 do
+                local sx = (k == 1 or k == 3) and -1 or 1
+                local sy = (k <= 2) and -1 or 1
+                local sz = (k == 1 or k == 4) and -1 or 1
+                local corner = cf:PointToWorldSpace(Vector3.new(half.X * sx, half.Y * sy, half.Z * sz))
+                local vp = camera:WorldToViewportPoint(corner)
+                if vp.Z > 0 then
+                    anyInFront = true
+                    if vp.X < minX then minX = vp.X end
+                    if vp.Y < minY then minY = vp.Y end
+                    if vp.X > maxX then maxX = vp.X end
+                    if vp.Y > maxY then maxY = vp.Y end
+                end
+            end
+        end
+
+        -- Support skinned-mesh custom rigs deformed via Bone instances (capped to keep mobile frame time fast)
+        if entry.Bones and #entry.Bones > 0 then
+            local boneCount = #entry.Bones
+            local step = (boneCount > 6) and math.ceil(boneCount / 6) or 1
+            for i = 1, boneCount, step do
+                local bone = entry.Bones[i]
+                if bone and bone.Parent then
+                    local okBone, bPos = pcall(function()
+                        return bone.TransformedWorldCFrame.Position
+                    end)
+                    if okBone and bPos and (not rootPos or (bPos - rootPos).Magnitude <= maxSpread) then
+                        local vp = camera:WorldToViewportPoint(bPos)
                         if vp.Z > 0 then
                             anyInFront = true
                             if vp.X < minX then minX = vp.X end
                             if vp.Y < minY then minY = vp.Y end
                             if vp.X > maxX then maxX = vp.X end
                             if vp.Y > maxY then maxY = vp.Y end
+                        end
+                    end
+                end
+            end
+        end
+
+        if validParts == 0 and entry.Character then
+            local cf, size
+            if entry.Character:IsA("BasePart") then
+                cf = entry.Character.CFrame
+                size = entry.Character.Size
+            elseif entry.Character:IsA("Model") then
+                local ok, mcf, msize = pcall(entry.Character.GetBoundingBox, entry.Character)
+                if ok then
+                    cf = mcf
+                    size = msize
+                end
+            end
+            if cf and size then
+                local half = Vector3.new(math.min(size.X, 18), math.min(size.Y, 20), math.min(size.Z, 18)) * 0.5
+                for sx = -1, 1, 2 do
+                    for sy = -1, 1, 2 do
+                        for sz = -1, 1, 2 do
+                            local corner = cf:PointToWorldSpace(Vector3.new(half.X * sx, half.Y * sy, half.Z * sz))
+                            local vp = camera:WorldToViewportPoint(corner)
+                            if vp.Z > 0 then
+                                anyInFront = true
+                                if vp.X < minX then minX = vp.X end
+                                if vp.Y < minY then minY = vp.Y end
+                                if vp.X > maxX then maxX = vp.X end
+                                if vp.Y > maxY then maxY = vp.Y end
+                            end
                         end
                     end
                 end
@@ -5170,7 +5550,7 @@ local function computeScreenBox(camera, entry, rootVP, worldDist)
 
     -- Fallback proportional 2D box anchored around RootPart (or Head if close) projection
     if rootVP and rootVP.Z > 0 then
-        local h = math.clamp(2100 / math.max(worldDist, 4), 14, 320)
+        local h = math.clamp(2100 / math.max(dist, 4), 14, 320)
         local w = h * 0.58
         return true, rootVP.X - w * 0.5, rootVP.Y - h * 0.5, w, h
     end
@@ -5193,17 +5573,25 @@ function VisualHelper.resolveHighlightAdornee(entry)
     if not char or not char.Parent then
         return nil
     end
-    if char:IsA("Model") or char:IsA("BasePart") then
-        return char
+    if entry.CachedHighlightChar == char and entry.CachedHighlightAdornee and entry.CachedHighlightAdornee.Parent then
+        return entry.CachedHighlightAdornee
     end
-    if entry.RootPart and entry.RootPart.Parent then
+    local resolved = nil
+    if char:IsA("Model") or char:IsA("BasePart") then
+        resolved = char
+    elseif entry.RootPart and entry.RootPart.Parent then
         local modelAncestor = entry.RootPart:FindFirstAncestorOfClass("Model")
         if modelAncestor and modelAncestor:IsDescendantOf(char) then
-            return modelAncestor
+            resolved = modelAncestor
+        else
+            resolved = entry.RootPart
         end
-        return entry.RootPart
+    else
+        resolved = char:FindFirstChildWhichIsA("Model") or char:FindFirstChildWhichIsA("BasePart", true)
     end
-    return char:FindFirstChildWhichIsA("Model") or char:FindFirstChildWhichIsA("BasePart", true)
+    entry.CachedHighlightChar = char
+    entry.CachedHighlightAdornee = resolved
+    return resolved
 end
 
 function VisualHelper.refreshExternalHighlightCount(now)
@@ -5238,7 +5626,7 @@ function VisualHelper.updateSingleEspEntry(targetKey, entry, camera, viewportSiz
 
     if not Config.ESP.Enabled then
         if entry.Visuals then entry.Visuals:HideAll() end
-        if entry.Highlight then entry.Highlight.Enabled = false end
+        if entry.Highlight and entry.Highlight.Enabled then entry.Highlight.Enabled = false end
         return
     end
 
@@ -5259,7 +5647,7 @@ function VisualHelper.updateSingleEspEntry(targetKey, entry, camera, viewportSiz
 
     if not valid then
         if entry.Visuals then entry.Visuals:HideAll() end
-        if entry.Highlight then entry.Highlight.Enabled = false end
+        if entry.Highlight and entry.Highlight.Enabled then entry.Highlight.Enabled = false end
         return
     end
 
@@ -5283,14 +5671,14 @@ function VisualHelper.updateSingleEspEntry(targetKey, entry, camera, viewportSiz
 
     local visState
     if needVis and ((not isBehind) or mustEvalBehind) then
-        local throttleSec = (isBehind or worldDist > 220) and 0.10 or (Config.ESP.VisibleCheck and 0.02 or 0.045)
+        local throttleSec = (isBehind or worldDist > 220) and 0.12 or (Config.ESP.VisibleCheck and 0.03 or 0.06)
         visState = GetTargetVisualState(targetKey, nil, {
             allowThrottle = true,
             throttleSeconds = throttleSec,
         })
         if Config.ESP.VisibleCheck and not visState.isVisible then
             if entry.Visuals then entry.Visuals:HideAll() end
-            if entry.Highlight then entry.Highlight.Enabled = false end
+            if entry.Highlight and entry.Highlight.Enabled then entry.Highlight.Enabled = false end
             return
         end
     else
@@ -5479,11 +5867,23 @@ function VisualHelper.updateSingleEspEntry(targetKey, entry, camera, viewportSiz
 end
 
 local function updateAllESP(camera, viewportSize, screenCenter)
+    if not Config.ESP.Enabled then
+        if not State.EspAllHidden then
+            State.EspAllHidden = true
+            for _, entry in pairs(Registry) do
+                if entry.Visuals then entry.Visuals:HideAll() end
+                if entry.Highlight and entry.Highlight.Enabled then entry.Highlight.Enabled = false end
+            end
+        end
+        return
+    end
+    State.EspAllHidden = false
+
     local now = os.clock()
     local highlightCandidates = State.HighlightCandidatePool
     clearTable(highlightCandidates)
 
-    if Config.ESP.Enabled and Config.ESP.HighlightESP then
+    if Config.ESP.HighlightESP then
         if not HighlightContainer.Parent then
             local okHL = pcall(function()
                 HighlightContainer.Parent = getHighlightParent()
@@ -5505,16 +5905,18 @@ local function updateAllESP(camera, viewportSize, screenCenter)
         end
     end
 
-    if Config.ESP.Enabled and Config.ESP.HighlightESP and #highlightCandidates > 0 then
+    if Config.ESP.HighlightESP and #highlightCandidates > 0 then
         local activeBudget = math.clamp(MAX_ACTIVE_HIGHLIGHTS - (State.ExternalHighlightCount or 0), 8, MAX_ACTIVE_HIGHLIGHTS)
-        table.sort(highlightCandidates, function(a, b)
-            if a.OnScreen ~= b.OnScreen then
-                return a.OnScreen
-            end
-            local aScore = a.Dist * (a.IsBot and 1.2 or 1.0)
-            local bScore = b.Dist * (b.IsBot and 1.2 or 1.0)
-            return aScore < bScore
-        end)
+        if #highlightCandidates > activeBudget then
+            table.sort(highlightCandidates, function(a, b)
+                if a.OnScreen ~= b.OnScreen then
+                    return a.OnScreen
+                end
+                local aScore = a.Dist * (a.IsBot and 1.2 or 1.0)
+                local bScore = b.Dist * (b.IsBot and 1.2 or 1.0)
+                return aScore < bScore
+            end)
+        end
 
         for idx, item in ipairs(highlightCandidates) do
             local entry = item.Entry
@@ -5651,6 +6053,9 @@ local function findMatchingBonePosition(entry, mode, camera, screenCenter, maxAn
     return bestPos
 end
 
+VisualHelper.AimPartScratch = {}
+VisualHelper.AimPartSeen = {}
+
 local function getAimPartForEntry(entry, camera, screenCenter)
     local mode = Config.Aimbot.TargetPart
     if mode == "Head" then
@@ -5665,17 +6070,19 @@ local function getAimPartForEntry(entry, camera, screenCenter)
         local bestDist = math.huge
         local bestVisPart = nil
         local bestVisDist = math.huge
-        local partsToCheck = {
-            entry.Head,
-            entry.Torso,
-            cands.HumanoidRootPart,
-            entry.RootPart,
-        }
+        local partsToCheck = VisualHelper.AimPartScratch
+        clearTable(partsToCheck)
+        partsToCheck[1] = entry.Head
+        partsToCheck[2] = entry.Torso
+        partsToCheck[3] = cands and cands.HumanoidRootPart or nil
+        partsToCheck[4] = entry.RootPart
         for _, rp in ipairs(entry.RigParts) do
             table.insert(partsToCheck, rp)
         end
-        local seenParts = {}
-        for _, part in ipairs(partsToCheck) do
+        local seenParts = VisualHelper.AimPartSeen
+        clearTable(seenParts)
+        for i = 1, #partsToCheck do
+            local part = partsToCheck[i]
             if part and part.Parent and not seenParts[part] and isFiniteVector3(part.Position) then
                 seenParts[part] = true
                 local vp, onScreen = camera:WorldToViewportPoint(part.Position)
@@ -5728,13 +6135,20 @@ local function getOneWayPingSeconds()
     if not StatsService then
         return 0.032
     end
+    local now = os.clock()
+    if (now - (State.LastPingRead or 0)) < 0.5 then
+        return State.CachedPingSeconds or 0.032
+    end
+    State.LastPingRead = now
     local ok, pingMs = pcall(function()
         return StatsService.Network.ServerStatsItem["Data Ping"]:GetValue()
     end)
     if ok and isFiniteNumber(pingMs) and pingMs > 0 then
-        return math.clamp(pingMs / 2000, 0.005, 0.14)
+        State.CachedPingSeconds = math.clamp(pingMs / 2000, 0.005, 0.14)
+    else
+        State.CachedPingSeconds = 0.032
     end
-    return 0.032
+    return State.CachedPingSeconds
 end
 
 local function getLocalPingSeconds()
@@ -5841,9 +6255,26 @@ local function evaluateAimCandidate(targetKey, camera, screenCenter)
     if not targetKey or targetKey == LocalPlayer then
         return false, nil, nil, math.huge, math.huge
     end
-    local entry = Registry[targetKey]
-    if not entry or VisualHelper.isLocalTargetOrOwned(targetKey, entry) then
+    local preValid, entry, _, rootDist = IsValidTarget(targetKey, {
+        checkTeam = Config.Aimbot.TeamCheck,
+        checkVisible = false,
+        ignoreBots = Config.Aimbot.IgnoreBots,
+        maxDistance = Config.Aimbot.MaxDistance,
+        camera = camera,
+        deferVisCheck = true,
+    })
+    if not preValid or not entry or not entry.RootPart then
         return false, nil, nil, math.huge, math.huge
+    end
+
+    if rootDist > 16 then
+        local rootVP = camera:WorldToViewportPoint(entry.RootPart.Position)
+        if rootVP.Z <= -6 then
+            return false, nil, nil, math.huge, math.huge
+        end
+        if rootVP.Z > 0 and (Vector2.new(rootVP.X, rootVP.Y) - screenCenter).Magnitude > (Config.Aimbot.FOVRadius + 140) then
+            return false, nil, nil, math.huge, math.huge
+        end
     end
 
     local aimPart = getAimPartForEntry(entry, camera, screenCenter)
@@ -5862,17 +6293,15 @@ local function evaluateAimCandidate(targetKey, camera, screenCenter)
         return false, nil, nil, math.huge, math.huge
     end
 
-    local valid, _, _, worldDist = IsValidTarget(targetKey, {
-        checkTeam = Config.Aimbot.TeamCheck,
-        checkVisible = Config.Aimbot.VisibleCheck,
-        ignoreBots = Config.Aimbot.IgnoreBots,
-        maxDistance = Config.Aimbot.MaxDistance,
-        camera = camera,
-        targetPart = aimPart,
-    })
-
-    if not valid then
+    local worldDist = (aimWorldPos - camera.CFrame.Position).Magnitude
+    if (not isFiniteNumber(worldDist)) or worldDist > Config.Aimbot.MaxDistance then
         return false, nil, nil, math.huge, math.huge
+    end
+
+    if Config.Aimbot.VisibleCheck then
+        if not raycastPointVisible(camera, entry.Character, aimWorldPos) then
+            return false, nil, nil, math.huge, math.huge
+        end
     end
 
     return true, entry, aimPart, screenDist, worldDist
@@ -7134,16 +7563,30 @@ local function findTriggerTarget(camera, screenCenter, dt)
                 local coarseOkay = (rootVP.Z > -8)
                     and (rootWorldDist <= 14 or (Vector2.new(rootVP.X, rootVP.Y) - screenCenter).Magnitude <= (sweepTol + 160))
                 if coarseOkay then
-                    local checkParts
+                    local checkParts = VisualHelper.TriggerPartScratch
+                    if not checkParts then
+                        checkParts = {}
+                        VisualHelper.TriggerPartScratch = checkParts
+                    end
+                    clearTable(checkParts)
                     if Config.TriggerBot.TargetFilter == "Head Only" then
-                        checkParts = {entry.Head}
+                        checkParts[1] = entry.Head
                     elseif Config.TriggerBot.TargetFilter == "Head & Chest" then
-                        checkParts = {entry.Head, entry.Torso, entry.RootPart}
+                        checkParts[1] = entry.Head
+                        checkParts[2] = entry.Torso
+                        checkParts[3] = entry.RootPart
+                    elseif #entry.RigParts > 0 then
+                        for _, rp in ipairs(entry.RigParts) do
+                            table.insert(checkParts, rp)
+                        end
                     else
-                        checkParts = (#entry.RigParts > 0) and entry.RigParts or {entry.Head, entry.Torso, entry.RootPart}
+                        checkParts[1] = entry.Head
+                        checkParts[2] = entry.Torso
+                        checkParts[3] = entry.RootPart
                     end
 
-                    for _, part in ipairs(checkParts) do
+                    for i = 1, #checkParts do
+                        local part = checkParts[i]
                         if part and part.Parent and isFiniteVector3(part.Position) then
                             local checkPos = part.Position
                             if entry.Bones and #entry.Bones > 0 and #entry.RigParts <= 2 then
@@ -7161,8 +7604,8 @@ local function findTriggerTarget(camera, screenCenter, dt)
                                 sDist = (Vector2.new(vp.X, vp.Y) - screenCenter).Magnitude
                             end
 
+                            local worldDist = (checkPos - origin).Magnitude
                             if usePredSweep then
-                                local worldDist = (checkPos - origin).Magnitude
                                 local predPos = computePredictedTargetPoint(entry, part, checkPos, worldDist, dt or (1 / 60), true, camera, true)
                                 local vpP, onP = camera:WorldToViewportPoint(predPos)
                                 if vpP.Z > 0 and onP then
@@ -7174,15 +7617,11 @@ local function findTriggerTarget(camera, screenCenter, dt)
                                 end
                             end
 
-                            if sDist <= bestScreenDist then
-                                local valid = IsValidTarget(targetKey, {
-                                    checkTeam = Config.TriggerBot.TeamCheck,
-                                    checkVisible = Config.TriggerBot.VisibleCheck,
-                                    ignoreBots = Config.TriggerBot.IgnoreBots,
-                                    maxDistance = maxDist,
-                                    camera = camera,
-                                    targetPart = part,
-                                })
+                            if sDist <= bestScreenDist and worldDist <= maxDist then
+                                local valid = true
+                                if Config.TriggerBot.VisibleCheck then
+                                    valid = raycastPartVisible(camera, entry.Character, part)
+                                end
                                 if valid and usePredSweep and matchedPos ~= checkPos then
                                     local envPos = VisualHelper.clampPredictedToEnvironment(entry, checkPos, matchedPos - checkPos, Config.TriggerBot.VisibleCheck and camera or nil)
                                     local vpEnv, onEnv = camera:WorldToViewportPoint(envPos)
@@ -7221,7 +7660,10 @@ local function updateTriggerBot(camera, screenCenter, now, dt)
         if State.TriggerHolding or State.TriggerVimTouchDown or State.TriggerToolRef ~= nil then
             releaseTriggerFire()
         end
-        TriggerDot.Visible = false
+        if State.LastTriggerDotActive ~= false then
+            State.LastTriggerDotActive = false
+            TriggerDot.Visible = false
+        end
         return
     end
 
@@ -7238,11 +7680,24 @@ local function updateTriggerBot(camera, screenCenter, now, dt)
     local locked = (targetPlayer ~= nil)
 
     if Config.TriggerBot.ShowIndicator then
-        TriggerDot.Visible = true
-        TriggerDot.Position = UDim2.fromOffset(screenCenter.X, screenCenter.Y)
-        TriggerDot.BackgroundColor3 = locked and Color3.fromRGB(56, 232, 198) or Color3.fromRGB(251, 146, 60)
-        TriggerDot.Size = locked and UDim2.fromOffset(9, 9) or UDim2.fromOffset(6, 6)
-    else
+        if State.LastTriggerDotActive ~= true then
+            State.LastTriggerDotActive = true
+            TriggerDot.Visible = true
+        end
+        local dotX = math.round(screenCenter.X)
+        local dotY = math.round(screenCenter.Y)
+        if State.LastTriggerDotX ~= dotX or State.LastTriggerDotY ~= dotY then
+            State.LastTriggerDotX = dotX
+            State.LastTriggerDotY = dotY
+            TriggerDot.Position = UDim2.fromOffset(dotX, dotY)
+        end
+        if State.LastTriggerDotLocked ~= locked then
+            State.LastTriggerDotLocked = locked
+            TriggerDot.BackgroundColor3 = locked and Color3.fromRGB(56, 232, 198) or Color3.fromRGB(251, 146, 60)
+            TriggerDot.Size = locked and UDim2.fromOffset(9, 9) or UDim2.fromOffset(6, 6)
+        end
+    elseif State.LastTriggerDotActive ~= false then
+        State.LastTriggerDotActive = false
         TriggerDot.Visible = false
     end
 
@@ -7396,7 +7851,7 @@ local function onRenderStepFrame(dt)
     VisualHelper.MissingInFramePool = missingInFrame
     clearTable(missingInFrame)
 
-    for _, player in ipairs(Players:GetPlayers()) do
+    for _, player in ipairs(State.RemotePlayers or Players:GetPlayers()) do
         if player ~= LocalPlayer then
             pcall(VisualHelper.syncSinglePlayerInFrame, player, now, missingInFrame)
         end
@@ -7405,7 +7860,7 @@ local function onRenderStepFrame(dt)
     if #missingInFrame > 0 and (now - (State.LastWorkspaceDeepScan or 0)) >= 4.0 then
         State.LastWorkspaceDeepScan = now
         pcall(function()
-            local recovered = deepWorkspaceScanForMissingPlayers(missingInFrame)
+            local recovered = deepWorkspaceScanForMissingPlayers(missingInFrame, false)
             for plr, liveChar in pairs(recovered) do
                 local entry = Registry[plr]
                 if entry and liveChar and liveChar.Parent then
@@ -7415,7 +7870,7 @@ local function onRenderStepFrame(dt)
         end)
     end
 
-    if (now - (State.LastBotScan or 0)) >= 1.0 then
+    if (now - (State.LastBotScan or 0)) >= 1.8 then
         State.LastBotScan = now
         pcall(syncWorkspaceBots, nil, false)
     end
@@ -7433,7 +7888,11 @@ local function onRenderStepFrame(dt)
             end
             if drawVis then
                 local fovT, fovOp = VisualHelper.resolveDrawingThickness(Config.Aimbot.FOVThickness, Config.Aimbot.Enabled and 0.92 or 0.65)
-                DrawingFOV.Position = screenCenter
+                if State.LastDrawingFovX ~= screenCenter.X or State.LastDrawingFovY ~= screenCenter.Y then
+                    State.LastDrawingFovX = screenCenter.X
+                    State.LastDrawingFovY = screenCenter.Y
+                    DrawingFOV.Position = screenCenter
+                end
                 if DrawingFOV.Radius ~= Config.Aimbot.FOVRadius then DrawingFOV.Radius = Config.Aimbot.FOVRadius end
                 if DrawingFOV.Thickness ~= fovT then DrawingFOV.Thickness = fovT end
                 if DrawingFOV.Color ~= Config.Colors.FOV then DrawingFOV.Color = Config.Colors.FOV end
@@ -7447,12 +7906,25 @@ local function onRenderStepFrame(dt)
         FOVRingFrame.Visible = ringVis
     end
     if ringVis then
-        local diameter = Config.Aimbot.FOVRadius * 2
+        local radius = Config.Aimbot.FOVRadius
+        if State.LastFovRadius ~= radius then
+            State.LastFovRadius = radius
+            local diameter = radius * 2
+            FOVRingFrame.Size = UDim2.fromOffset(diameter, diameter)
+        end
         local strokeT, strokeTrans = VisualHelper.resolveStrokeThickness(Config.Aimbot.FOVThickness, Config.Aimbot.Enabled and 0.14 or 0.44)
-        FOVRingFrame.Size = UDim2.fromOffset(diameter, diameter)
-        if FOVStroke.Color ~= Config.Colors.FOV then FOVStroke.Color = Config.Colors.FOV end
-        if FOVStroke.Thickness ~= strokeT then FOVStroke.Thickness = strokeT end
-        if FOVStroke.Transparency ~= strokeTrans then FOVStroke.Transparency = strokeTrans end
+        if State.LastFovColor ~= Config.Colors.FOV then
+            State.LastFovColor = Config.Colors.FOV
+            FOVStroke.Color = Config.Colors.FOV
+        end
+        if State.LastFovThickness ~= strokeT then
+            State.LastFovThickness = strokeT
+            FOVStroke.Thickness = strokeT
+        end
+        if State.LastFovAlpha ~= strokeTrans then
+            State.LastFovAlpha = strokeTrans
+            FOVStroke.Transparency = strokeTrans
+        end
     end
 
     -- Keep LocalAlive synced live every frame (handles revives, respawns & custom rigs cleanly)
@@ -7475,9 +7947,13 @@ local function onRenderStepFrame(dt)
 end
 
 local function isCharacterOrHudDescendant(inst)
+    local localChar = State.LocalCharacter or LocalPlayer.Character
     local cur = inst
     while cur and cur ~= Workspace do
-        if cur:IsA("Model") and (cur:FindFirstChildOfClass("Humanoid") or Players:GetPlayerFromCharacter(cur) ~= nil) then
+        if cur == localChar or Registry[cur] ~= nil then
+            return true
+        end
+        if cur:IsA("Model") and (Players:GetPlayerFromCharacter(cur) ~= nil or cur:FindFirstChildOfClass("Humanoid") ~= nil) then
             return true
         end
         cur = cur.Parent
@@ -7485,10 +7961,7 @@ local function isCharacterOrHudDescendant(inst)
     return false
 end
 
-local function potatoOptimizeInstance(inst, saved)
-    if not inst or not inst.Parent then
-        return
-    end
+local function potatoMutateInstance(inst, saved)
     if inst:IsA("BasePart") and not inst:IsA("Terrain") then
         if not isCharacterOrHudDescendant(inst) then
             if not saved.Parts[inst] then
@@ -7498,50 +7971,36 @@ local function potatoOptimizeInstance(inst, saved)
                     Reflectance = inst.Reflectance,
                 }
             end
-            pcall(function()
-                inst.Material = Enum.Material.SmoothPlastic
-                inst.CastShadow = false
-                inst.Reflectance = 0
-            end)
+            inst.Material = Enum.Material.SmoothPlastic
+            inst.CastShadow = false
+            inst.Reflectance = 0
         else
-            pcall(function()
-                inst.CastShadow = false
-            end)
+            inst.CastShadow = false
         end
     elseif inst:IsA("Decal") or inst:IsA("Texture") then
         if not isCharacterOrHudDescendant(inst) then
             if saved.Decals[inst] == nil then
                 saved.Decals[inst] = inst.Transparency
             end
-            pcall(function()
-                inst.Transparency = 1
-            end)
+            inst.Transparency = 1
         end
     elseif inst:IsA("ParticleEmitter") or inst:IsA("Trail") or inst:IsA("Beam") or inst:IsA("Fire") or inst:IsA("Smoke") or inst:IsA("Sparkles") then
         if saved.Particles[inst] == nil then
             saved.Particles[inst] = inst.Enabled
         end
-        pcall(function()
-            inst.Enabled = false
-        end)
+        inst.Enabled = false
     elseif inst:IsA("PointLight") or inst:IsA("SpotLight") or inst:IsA("SurfaceLight") then
         if saved.Lights[inst] == nil then
             saved.Lights[inst] = inst.Enabled
         end
-        pcall(function()
-            inst.Enabled = false
-        end)
+        inst.Enabled = false
     elseif inst:IsA("Explosion") then
-        pcall(function()
-            inst.Visible = false
-        end)
+        inst.Visible = false
     elseif inst:IsA("PostEffect") or inst:IsA("Clouds") then
         if saved.Effects[inst] == nil then
             saved.Effects[inst] = inst.Enabled
         end
-        pcall(function()
-            inst.Enabled = false
-        end)
+        inst.Enabled = false
     elseif inst:IsA("Atmosphere") then
         if saved.Atmospheres[inst] == nil then
             saved.Atmospheres[inst] = {
@@ -7550,12 +8009,17 @@ local function potatoOptimizeInstance(inst, saved)
                 Haze = inst.Haze,
             }
         end
-        pcall(function()
-            inst.Density = 0
-            inst.Glare = 0
-            inst.Haze = 0
-        end)
+        inst.Density = 0
+        inst.Glare = 0
+        inst.Haze = 0
     end
+end
+
+local function potatoOptimizeInstance(inst, saved)
+    if not inst or not inst.Parent then
+        return
+    end
+    pcall(potatoMutateInstance, inst, saved)
 end
 
 local function applyPotatoGraphics(enabled)
@@ -7662,7 +8126,7 @@ local function applyPotatoGraphics(enabled)
                 end
                 potatoOptimizeInstance(desc, saved)
                 count = count + 1
-                if count % 350 == 0 then
+                if count % 200 == 0 then
                     task.wait()
                 end
             end
@@ -8296,10 +8760,11 @@ function UtilitiesEngine.stepMovement(dt)
     end
 
     -- 2. Infinite Jump held-button fall rescue (lets mobile/PC players hold jump while falling to keep climbing)
+    local cachedSpaceHeld = nil
     local isAirborne = (hum.FloorMaterial == Enum.Material.Air) or (humState == Enum.HumanoidStateType.Freefall) or (humState == Enum.HumanoidStateType.Jumping) or (humState == Enum.HumanoidStateType.FallingDown)
     if Config.Utilities.InfiniteJump and isAirborne then
-        local spaceHeld = safeIsKeyDown(Enum.KeyCode.Space)
-        if (State.JumpButtonHeld or spaceHeld or hum.Jump) and isFiniteVector3(curVel) and curVel.Y < -2.0 and (now - (State.LastJumpTime or 0)) >= 0.24 then
+        cachedSpaceHeld = safeIsKeyDown(Enum.KeyCode.Space)
+        if (State.JumpButtonHeld or cachedSpaceHeld or hum.Jump) and isFiniteVector3(curVel) and curVel.Y < -2.0 and (now - (State.LastJumpTime or 0)) >= 0.24 then
             UtilitiesEngine.performJump("InfiniteJump")
             curVel = root.AssemblyLinearVelocity
         end
@@ -8317,7 +8782,13 @@ function UtilitiesEngine.stepMovement(dt)
 
     if Config.Utilities.BunnyHop then
         local isGrounded = onGroundNow and (isFiniteVector3(curVel) and curVel.Y <= 4.5 and curVel.Y >= -14.0)
-        local wantsJump = isMoving or hum.Jump or State.JumpButtonHeld or safeIsKeyDown(Enum.KeyCode.Space)
+        local wantsJump = isMoving or hum.Jump or State.JumpButtonHeld
+        if not wantsJump then
+            if cachedSpaceHeld == nil then
+                cachedSpaceHeld = safeIsKeyDown(Enum.KeyCode.Space)
+            end
+            wantsJump = cachedSpaceHeld
+        end
         if wantsJump and isGrounded and (now - (State.LastAutoHopTime or 0)) >= 0.11 then
             State.LastAutoHopTime = now
             UtilitiesEngine.performJump("BunnyHop")
@@ -8414,8 +8885,10 @@ State.OnLocalCharacterBound = function()
     UtilitiesEngine.syncAll(false)
 end
 
-State.OnSystemsReloaded = function()
-    UtilitiesEngine.syncAll(true)
+State.OnSystemsReloaded = function(reason)
+    if reason ~= "Periodic1sRenderSync" then
+        UtilitiesEngine.syncAll(true)
+    end
 end
 
 addConnection(RunService.Stepped:Connect(function()
@@ -9322,7 +9795,7 @@ local function SyncDependentSettings(needsFullReload, reason, skipSave)
     end
 end
 
--- Scroll-guarded tap handler so vertical scrolling on mobile never triggers accidental mis-touches
+-- Scroll-guarded tap handler with on-demand gesture connections (zero idle global listeners)
 local function bindSafeTap(btn, scrollParent, callback)
     local isScrollingFrame = scrollParent and scrollParent:IsA("ScrollingFrame")
     local trackedInput = nil
@@ -9330,48 +9803,68 @@ local function bindSafeTap(btn, scrollParent, callback)
     local startCanvasY = 0
     local maxMove = 0
     local hadValidPress = false
+    local changedConn = nil
+    local endedConn = nil
+    local touchEndedConn = nil
+
+    local function disconnectGestureConns()
+        if changedConn then changedConn:Disconnect(); changedConn = nil end
+        if endedConn then endedConn:Disconnect(); endedConn = nil end
+        if touchEndedConn then touchEndedConn:Disconnect(); touchEndedConn = nil end
+        if State.ActiveGestureCleanups then
+            State.ActiveGestureCleanups[disconnectGestureConns] = nil
+        end
+    end
+
+    local function finishTrackedTap(input)
+        if input == trackedInput or (trackedInput and not InputGuard.isActiveState(trackedInput.UserInputState)) then
+            if input == trackedInput and startPos then
+                local dist = (Vector2.new(input.Position.X, input.Position.Y) - Vector2.new(startPos.X, startPos.Y)).Magnitude
+                if dist > maxMove then
+                    maxMove = dist
+                end
+            end
+            trackedInput = nil
+            disconnectGestureConns()
+        end
+    end
 
     btn.InputBegan:Connect(function(input)
         if input.UserInputState ~= Enum.UserInputState.Begin then
             return
         end
         if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            disconnectGestureConns()
             hadValidPress = true
             trackedInput = input
             startPos = input.Position
             startCanvasY = isScrollingFrame and scrollParent.CanvasPosition.Y or 0
             maxMove = 0
+
+            State.ActiveGestureCleanups = State.ActiveGestureCleanups or {}
+            State.ActiveGestureCleanups[disconnectGestureConns] = true
+
+            changedConn = UserInputService.InputChanged:Connect(function(changedInput)
+                if not trackedInput or not startPos then
+                    disconnectGestureConns()
+                    return
+                end
+                if not InputGuard.isActiveState(trackedInput.UserInputState) then
+                    trackedInput = nil
+                    disconnectGestureConns()
+                    return
+                end
+                if changedInput == trackedInput or (trackedInput.UserInputType == Enum.UserInputType.MouseButton1 and changedInput.UserInputType == Enum.UserInputType.MouseMovement) then
+                    local dist = (Vector2.new(changedInput.Position.X, changedInput.Position.Y) - Vector2.new(startPos.X, startPos.Y)).Magnitude
+                    if dist > maxMove then
+                        maxMove = dist
+                    end
+                end
+            end)
+            endedConn = UserInputService.InputEnded:Connect(finishTrackedTap)
+            touchEndedConn = UserInputService.TouchEnded:Connect(finishTrackedTap)
         end
     end)
-
-    addConnection(UserInputService.InputChanged:Connect(function(input)
-        if not trackedInput or not startPos then
-            return
-        end
-        if not InputGuard.isActiveState(trackedInput.UserInputState) then
-            trackedInput = nil
-            return
-        end
-        if input == trackedInput or (trackedInput.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseMovement) then
-            local dist = (Vector2.new(input.Position.X, input.Position.Y) - Vector2.new(startPos.X, startPos.Y)).Magnitude
-            if dist > maxMove then
-                maxMove = dist
-            end
-        end
-    end))
-
-    local function finishTrackedTap(input)
-        if input == trackedInput then
-            local dist = startPos and (Vector2.new(input.Position.X, input.Position.Y) - Vector2.new(startPos.X, startPos.Y)).Magnitude or 0
-            if dist > maxMove then
-                maxMove = dist
-            end
-            trackedInput = nil
-        end
-    end
-
-    addConnection(UserInputService.InputEnded:Connect(finishTrackedTap))
-    addConnection(UserInputService.TouchEnded:Connect(finishTrackedTap))
 
     btn.Activated:Connect(function()
         local canvasDelta = isScrollingFrame and math.abs(scrollParent.CanvasPosition.Y - startCanvasY) or 0
@@ -9380,6 +9873,7 @@ local function bindSafeTap(btn, scrollParent, callback)
         trackedInput = nil
         startPos = nil
         maxMove = 0
+        disconnectGestureConns()
         if wasCleanTap then
             callback()
         end
@@ -9654,11 +10148,24 @@ local function addSlider(parent, order, title, minVal, maxVal, step, formatFn, g
     local dragStartPos = nil
     local startCanvasY = 0
     local dragging = false
+    local changedConn = nil
+    local endedConn = nil
+    local touchEndedConn = nil
+
+    local function disconnectSliderConns()
+        if changedConn then changedConn:Disconnect(); changedConn = nil end
+        if endedConn then endedConn:Disconnect(); endedConn = nil end
+        if touchEndedConn then touchEndedConn:Disconnect(); touchEndedConn = nil end
+        if State.ActiveGestureCleanups then
+            State.ActiveGestureCleanups[disconnectSliderConns] = nil
+        end
+    end
 
     local function clearSliderDrag()
         pendingInput = nil
         dragStartPos = nil
         dragging = false
+        disconnectSliderConns()
         if isScrollableParent then
             parent.ScrollingEnabled = true
         end
@@ -9670,52 +10177,6 @@ local function addSlider(parent, order, title, minVal, maxVal, step, formatFn, g
         local ratio = math.clamp((posX - absPos) / absSize, 0, 1)
         applyValue(minVal + (maxVal - minVal) * ratio)
     end
-
-    trackHitbox.InputBegan:Connect(function(input)
-        if not pendingInput and input.UserInputState == Enum.UserInputState.Begin and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
-            pendingInput = input
-            dragStartPos = input.Position
-            startCanvasY = isScrollableParent and parent.CanvasPosition.Y or 0
-            dragging = false
-            if input.UserInputType == Enum.UserInputType.MouseButton1 then
-                dragging = true
-                if isScrollableParent then
-                    parent.ScrollingEnabled = false
-                end
-                updateFromInput(input.Position.X)
-            end
-        end
-    end)
-
-    addConnection(UserInputService.InputChanged:Connect(function(input)
-        if not pendingInput or not dragStartPos then
-            return
-        end
-        if not InputGuard.isActiveState(pendingInput.UserInputState) then
-            clearSliderDrag()
-            return
-        end
-        if input == pendingInput or (pendingInput.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseMovement) then
-            local dx = math.abs(input.Position.X - dragStartPos.X)
-            local dy = math.abs(input.Position.Y - dragStartPos.Y)
-            local canvasDelta = isScrollableParent and math.abs(parent.CanvasPosition.Y - startCanvasY) or 0
-
-            if not dragging then
-                if canvasDelta > 4 or (dy > 7 and dy > dx) then
-                    clearSliderDrag()
-                    return
-                elseif dx > 7 and dx >= dy then
-                    dragging = true
-                    if isScrollableParent then
-                        parent.ScrollingEnabled = false
-                    end
-                    updateFromInput(input.Position.X)
-                end
-            else
-                updateFromInput(input.Position.X)
-            end
-        end
-    end))
 
     local function finishSliderInput(input)
         if pendingInput and (input == pendingInput or not InputGuard.isActiveState(pendingInput.UserInputState)) then
@@ -9729,8 +10190,58 @@ local function addSlider(parent, order, title, minVal, maxVal, step, formatFn, g
         end
     end
 
-    addConnection(UserInputService.InputEnded:Connect(finishSliderInput))
-    addConnection(UserInputService.TouchEnded:Connect(finishSliderInput))
+    trackHitbox.InputBegan:Connect(function(input)
+        if not pendingInput and input.UserInputState == Enum.UserInputState.Begin and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+            disconnectSliderConns()
+            pendingInput = input
+            dragStartPos = input.Position
+            startCanvasY = isScrollableParent and parent.CanvasPosition.Y or 0
+            dragging = false
+            if input.UserInputType == Enum.UserInputType.MouseButton1 then
+                dragging = true
+                if isScrollableParent then
+                    parent.ScrollingEnabled = false
+                end
+                updateFromInput(input.Position.X)
+            end
+
+            State.ActiveGestureCleanups = State.ActiveGestureCleanups or {}
+            State.ActiveGestureCleanups[disconnectSliderConns] = true
+
+            changedConn = UserInputService.InputChanged:Connect(function(changedInput)
+                if not pendingInput or not dragStartPos then
+                    clearSliderDrag()
+                    return
+                end
+                if not InputGuard.isActiveState(pendingInput.UserInputState) then
+                    clearSliderDrag()
+                    return
+                end
+                if changedInput == pendingInput or (pendingInput.UserInputType == Enum.UserInputType.MouseButton1 and changedInput.UserInputType == Enum.UserInputType.MouseMovement) then
+                    local dx = math.abs(changedInput.Position.X - dragStartPos.X)
+                    local dy = math.abs(changedInput.Position.Y - dragStartPos.Y)
+                    local canvasDelta = isScrollableParent and math.abs(parent.CanvasPosition.Y - startCanvasY) or 0
+
+                    if not dragging then
+                        if canvasDelta > 4 or (dy > 7 and dy > dx) then
+                            clearSliderDrag()
+                            return
+                        elseif dx > 7 and dx >= dy then
+                            dragging = true
+                            if isScrollableParent then
+                                parent.ScrollingEnabled = false
+                            end
+                            updateFromInput(changedInput.Position.X)
+                        end
+                    else
+                        updateFromInput(changedInput.Position.X)
+                    end
+                end
+            end)
+            endedConn = UserInputService.InputEnded:Connect(finishSliderInput)
+            touchEndedConn = UserInputService.TouchEnded:Connect(finishSliderInput)
+        end
+    end)
 
     return sync
 end
@@ -11284,6 +11795,10 @@ AimBtnStroke.Thickness = 1.4
 local function refreshMobileAimStyle()
     local locked = Config.Aimbot.Enabled
     Config.UI.MobileAimLocked = locked
+    if State.LastUiAimStyle == locked then
+        return
+    end
+    State.LastUiAimStyle = locked
     MobileAimBtn.Text = locked and "AIM LOCK: ON" or "AIM LOCK: OFF"
     tween(MobileAimBtn, 0.15, {
         TextColor3 = locked and Palette.ActiveGlow or Palette.TextSilver,
@@ -11325,6 +11840,10 @@ TriggerBtnStroke.Thickness = 1.4
 local function refreshMobileTriggerStyle()
     local on = Config.TriggerBot.Enabled
     Config.UI.MobileTriggerLocked = on
+    if State.LastUiTrigStyle == on then
+        return
+    end
+    State.LastUiTrigStyle = on
     MobileTriggerBtn.Text = on and "TRIGGER: ON" or "TRIGGER: OFF"
     tween(MobileTriggerBtn, 0.15, {
         TextColor3 = on and Palette.Amber or Palette.TextSilver,
@@ -11740,6 +12259,17 @@ local function unloadScript()
 
     clearLocalCharacterState()
 
+    if State.ActiveGestureCleanups then
+        local cleanups = {}
+        for fn in pairs(State.ActiveGestureCleanups) do
+            table.insert(cleanups, fn)
+        end
+        for _, fn in ipairs(cleanups) do
+            pcall(fn)
+        end
+        clearTable(State.ActiveGestureCleanups)
+    end
+
     for _, conn in ipairs(State.Connections) do
         pcall(function()
             conn:Disconnect()
@@ -11755,12 +12285,20 @@ local function unloadScript()
         destroyPlayerEntry(targetKey)
     end
     clearTable(Registry)
+    clearTable(State.RemotePlayers)
+    clearTable(State.CustomTeamTagCache)
     clearTable(State.WorkspaceBotCandidates)
     clearTable(State.TrackedExternalHighlights)
     clearTable(State.HighlightCandidatePool)
+    clearTable(VisualHelper.PlayerLookupByName)
+    clearTable(VisualHelper.PlayerLookupById)
     clearTable(VisualHelper.RayFilterList)
     clearTable(VisualHelper.VisualAllyScanCache)
     clearTable(VisualHelper.BoxSampleParts)
+    clearTable(VisualHelper.BoxSampleSeen)
+    clearTable(VisualHelper.AimPartScratch)
+    clearTable(VisualHelper.AimPartSeen)
+    clearTable(VisualHelper.TriggerPartScratch)
 
     safeDestroyDrawing(DrawingFOV)
     DrawingFOV = nil
